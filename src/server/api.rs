@@ -6,7 +6,7 @@ use super::node::NodePowerOutcome;
 use crate::{
     client,
     types::{
-        HostNetworkGroup, SamplingPolicy, TrafficFilterRule,
+        CustomerDataDeletionRequest, HostNetworkGroup, SamplingPolicy, TrafficFilterRule,
         node::{
             NodeHostnameRequest, NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
             NodeNetworkInterfaceRequest, NodeNetworkInterfaceResponse, NodeObservationRequest,
@@ -96,23 +96,20 @@ impl Connection {
             .await
     }
 
-    /// Sends the customer-data deletion command for `host_fqdn`.
+    /// Sends a customer-data deletion command.
     ///
-    /// `requested_at` identifies the deletion request for later result correlation.
+    /// The request's customer ID, service FQDN, and timestamp identify the
+    /// deletion request for later result correlation.
     ///
     /// # Errors
     ///
     /// Returns an error if serialization failed or communication with the client failed.
     pub async fn send_delete_customer_data_cmd(
         &self,
-        host_fqdn: &str,
-        requested_at: i64,
+        request: &CustomerDataDeletionRequest,
     ) -> anyhow::Result<()> {
-        self.send_request(
-            client::RequestCode::DeleteCustomerData,
-            &(host_fqdn, requested_at),
-        )
-        .await
+        self.send_request(client::RequestCode::DeleteCustomerData, request)
+            .await
     }
 
     /// Sends the traffic filtering rules.
@@ -1099,7 +1096,10 @@ mod tests {
     use {
         crate::{
             test::TEST_ENV,
-            types::{HostNetworkGroup, Process, ResourceUsage, SamplingKind, SamplingPolicy},
+            types::{
+                CustomerDataDeletionRequest, HostNetworkGroup, Process, ResourceUsage,
+                SamplingKind, SamplingPolicy,
+            },
         },
         ipnet::IpNet,
         std::{
@@ -1114,6 +1114,9 @@ mod tests {
 
     #[cfg(all(feature = "client", feature = "server"))]
     const HOST_FQDN: &str = "sensor.example.com";
+
+    #[cfg(all(feature = "client", feature = "server"))]
+    const CUSTOMER_ID: u32 = 42;
 
     #[cfg(all(feature = "client", feature = "server"))]
     const REQUESTED_AT: i64 = 1_753_174_800;
@@ -1242,10 +1245,14 @@ mod tests {
 
         async fn delete_customer_data(
             &mut self,
-            host_fqdn: String,
-            requested_at: i64,
+            request: &CustomerDataDeletionRequest,
         ) -> Result<(), String> {
-            if host_fqdn == HOST_FQDN && requested_at == REQUESTED_AT {
+            let expected = CustomerDataDeletionRequest {
+                customer_id: CUSTOMER_ID,
+                host_fqdn: HOST_FQDN.to_string(),
+                requested_at: REQUESTED_AT,
+            };
+            if request == &expected {
                 Ok(())
             } else {
                 Err("unexpected customer-data deletion request".to_string())
@@ -1395,9 +1402,12 @@ mod tests {
 
             crate::request::handle(&mut handler, &mut send, &mut recv).await
         });
-        let server_res = server_conn
-            .send_delete_customer_data_cmd(HOST_FQDN, REQUESTED_AT)
-            .await;
+        let request = CustomerDataDeletionRequest {
+            customer_id: CUSTOMER_ID,
+            host_fqdn: HOST_FQDN.to_string(),
+            requested_at: REQUESTED_AT,
+        };
+        let server_res = server_conn.send_delete_customer_data_cmd(&request).await;
         assert!(server_res.is_ok());
         let client_res = client_handle.await.unwrap();
         assert!(client_res.is_ok());

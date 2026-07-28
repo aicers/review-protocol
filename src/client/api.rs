@@ -480,6 +480,7 @@ mod tests {
     async fn report_customer_data_deletion_returns_handler_ok() {
         run_test(|client_conn| async move {
             let report = CustomerDataDeletionReport {
+                customer_id: 42,
                 host_fqdn: "sensor.example.test".to_string(),
                 requested_at: 1_700_000_000,
                 completed_at: Some(1_700_000_100),
@@ -500,6 +501,7 @@ mod tests {
     async fn report_customer_data_deletion_converts_handler_error() {
         run_test(|client_conn| async move {
             let report = CustomerDataDeletionReport {
+                customer_id: 43,
                 host_fqdn: "reject.example.test".to_string(),
                 requested_at: 1_700_000_200,
                 completed_at: None,

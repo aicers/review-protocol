@@ -757,6 +757,7 @@ mod tests {
         impl Handler for DefaultHandler {}
 
         let report = CustomerDataDeletionReport {
+            customer_id: 42,
             host_fqdn: "sensor.example.test".to_string(),
             requested_at: 1_700_000_000,
             completed_at: Some(1_700_000_100),
@@ -796,6 +797,7 @@ mod tests {
 
         let expected = vec![
             CustomerDataDeletionReport {
+                customer_id: 42,
                 host_fqdn: "sensor.example.test".to_string(),
                 requested_at: 1_700_000_000,
                 completed_at: Some(1_700_000_123),
@@ -803,6 +805,7 @@ mod tests {
                 outcome: CustomerDataDeletionOutcome::Succeeded,
             },
             CustomerDataDeletionReport {
+                customer_id: 43,
                 host_fqdn: "semi-supervised.example.test".to_string(),
                 requested_at: 1_700_000_456,
                 completed_at: None,
@@ -856,6 +859,7 @@ mod tests {
             .await
         });
         let report = CustomerDataDeletionReport {
+            customer_id: 44,
             host_fqdn: "semi-supervised.example.test".to_string(),
             requested_at: 1_700_001_000,
             completed_at: Some(1_700_001_100),
