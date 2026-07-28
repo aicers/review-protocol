@@ -49,7 +49,8 @@ use thiserror::Error;
 use crate::{
     client::RequestCode,
     types::{
-        HostNetworkGroup, Process, ResourceUsage, SamplingPolicy, TrafficFilterRule,
+        CustomerDataDeletionRequest, HostNetworkGroup, Process, ResourceUsage, SamplingPolicy,
+        TrafficFilterRule,
         node::{
             NodeHostnameRequest, NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
             NodeNetworkInterfaceRequest, NodeNetworkInterfaceResponse, NodeObservationRequest,
@@ -297,8 +298,7 @@ pub trait Handler: Send {
 
     async fn delete_customer_data(
         &mut self,
-        _host_fqdn: String,
-        _requested_at: i64,
+        _request: &CustomerDataDeletionRequest,
     ) -> Result<(), String> {
         return Err("not supported".to_string());
     }
@@ -910,9 +910,9 @@ pub async fn handle<H: Handler>(
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::DeleteCustomerData => {
-                let (host_fqdn, requested_at) =
-                    parse_args::<(String, i64)>(body).map_err(HandlerError::RecvError)?;
-                let result = handler.delete_customer_data(host_fqdn, requested_at).await;
+                let request = parse_args::<CustomerDataDeletionRequest>(body)
+                    .map_err(HandlerError::RecvError)?;
+                let result = handler.delete_customer_data(&request).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
@@ -1105,12 +1105,12 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "server")]
     async fn delete_customer_data_default_not_supported() {
-        let result = super::Handler::delete_customer_data(
-            &mut NoopHandler,
-            "sensor.example.com".to_string(),
-            1_753_174_800,
-        )
-        .await;
+        let request = crate::types::CustomerDataDeletionRequest {
+            customer_id: 42,
+            host_fqdn: "sensor.example.com".to_string(),
+            requested_at: 1_753_174_800,
+        };
+        let result = super::Handler::delete_customer_data(&mut NoopHandler, &request).await;
 
         assert_eq!(result.unwrap_err(), "not supported");
     }

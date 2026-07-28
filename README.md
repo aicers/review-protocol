@@ -95,6 +95,19 @@ Run tests with:
 cargo test --features client,server
 ```
 
+## Customer-data deletion
+
+REview sends `CustomerDataDeletionRequest` values to Sensor or SemiSupervised
+services with `server::Connection::send_delete_customer_data_cmd`. Services
+return a `CustomerDataDeletionReport` with
+`client::Connection::report_customer_data_deletion`. Both payloads carry the
+same `customer_id`, `host_fqdn`, and `requested_at` values so reports can be
+correlated with their original requests.
+
+This is a coordinated wire-format contract: request codes 22 and 40 remain
+unchanged, but both peers must use a `review-protocol` version or commit whose
+deletion payloads include `customer_id`.
+
 ## License
 
 Copyright 2024-2025 Petabi, Inc.
