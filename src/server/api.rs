@@ -98,8 +98,8 @@ impl Connection {
 
     /// Sends a customer-data deletion command.
     ///
-    /// The request's customer ID, service FQDN, and timestamp identify the
-    /// deletion request for later result correlation.
+    /// The request's opaque ID must be returned unchanged in the corresponding
+    /// deletion report.
     ///
     /// # Errors
     ///
@@ -1116,10 +1116,7 @@ mod tests {
     const HOST_FQDN: &str = "sensor.example.com";
 
     #[cfg(all(feature = "client", feature = "server"))]
-    const CUSTOMER_ID: u32 = 42;
-
-    #[cfg(all(feature = "client", feature = "server"))]
-    const REQUESTED_AT: i64 = 1_753_174_800;
+    const DELETION_REQUEST_ID: u32 = 42;
 
     #[cfg(all(feature = "client", feature = "server"))]
     // Shared handler for all tests
@@ -1248,9 +1245,8 @@ mod tests {
             request: &CustomerDataDeletionRequest,
         ) -> Result<(), String> {
             let expected = CustomerDataDeletionRequest {
-                customer_id: CUSTOMER_ID,
+                id: DELETION_REQUEST_ID,
                 host_fqdn: HOST_FQDN.to_string(),
-                requested_at: REQUESTED_AT,
             };
             if request == &expected {
                 Ok(())
@@ -1403,9 +1399,8 @@ mod tests {
             crate::request::handle(&mut handler, &mut send, &mut recv).await
         });
         let request = CustomerDataDeletionRequest {
-            customer_id: CUSTOMER_ID,
+            id: DELETION_REQUEST_ID,
             host_fqdn: HOST_FQDN.to_string(),
-            requested_at: REQUESTED_AT,
         };
         let server_res = server_conn.send_delete_customer_data_cmd(&request).await;
         assert!(server_res.is_ok());

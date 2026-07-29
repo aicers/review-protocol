@@ -1106,9 +1106,8 @@ mod tests {
     #[cfg(feature = "server")]
     async fn delete_customer_data_default_not_supported() {
         let request = crate::types::CustomerDataDeletionRequest {
-            customer_id: 42,
+            id: 42,
             host_fqdn: "sensor.example.com".to_string(),
-            requested_at: 1_753_174_800,
         };
         let result = super::Handler::delete_customer_data(&mut NoopHandler, &request).await;
 

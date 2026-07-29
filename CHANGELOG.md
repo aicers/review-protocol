@@ -11,11 +11,11 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Added the `common.delete_customer_data` (`DeleteCustomerData`) request,
   including the `CustomerDataDeletionRequest` type,
-  `Connection::send_delete_customer_data_cmd` and
-  `Handler::delete_customer_data`, so services can delete customer-owned
-  filesystem data. Its payload contains the customer ID, target service FQDN,
-  and deletion request timestamp for correlation. The service implementation
-  remains responsible for the actual deletion.
+  `server::Connection::send_delete_customer_data_cmd` and
+  `request::Handler::delete_customer_data`, so services can delete
+  customer-owned filesystem data. Its payload contains an opaque ID and
+  target service FQDN. The service implementation remains responsible for
+  the actual deletion.
 - Added customer-data deletion result reporting, including the
   `CustomerDataDeletionReport`, `CustomerDataDeletionReporter`, and
   `CustomerDataDeletionOutcome` types, the
@@ -25,10 +25,10 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Added `customer_id` to customer-data deletion requests and result reports.
-  This changes the wire payloads for request codes 22 and 40 without changing
-  those codes. Senders and receivers must update to the same compatible
-  `review-protocol` version or commit.
+- Changed the customer-data deletion request and result-report wire payloads:
+  both now carry an opaque `id`, and neither carries `requested_at`. Request
+  codes 22 and 40 are unchanged, but senders and receivers must update to the
+  same compatible `review-protocol` version or commit.
 - Renamed handshake metadata fields from `app_name` / `version` to
   `agent_name` / `agent_version` in `ConnectionBuilder` and `AgentInfo`.
 
