@@ -15,25 +15,20 @@ pub use structured::ColumnStatistics;
 /// A request to delete data belonging to a customer from a service.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustomerDataDeletionRequest {
-    /// The customer whose data must be deleted.
-    pub customer_id: u32,
+    /// An opaque identifier that must be returned unchanged in the report.
+    pub id: u32,
     /// The FQDN of the service that must delete the customer data.
     pub host_fqdn: String,
-    /// The deletion-request timestamp.
-    pub requested_at: i64,
 }
 
 /// The final result of processing a customer-data deletion request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustomerDataDeletionReport {
-    /// The customer ID copied from the original deletion request.
-    pub customer_id: u32,
+    /// The opaque identifier copied from the original deletion request.
+    pub id: u32,
     /// The service FQDN copied from the original deletion request.
     pub host_fqdn: String,
-    /// The original deletion-request timestamp.
-    pub requested_at: i64,
-    /// The completion or recorded failure timestamp, in the same unit as
-    /// `requested_at`.
+    /// The completion or recorded failure timestamp.
     pub completed_at: Option<i64>,
     /// The service that processed the deletion request.
     pub reporter: CustomerDataDeletionReporter,
