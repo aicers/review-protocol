@@ -25,10 +25,6 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Changed the customer-data deletion request and result-report wire payloads:
-  both now carry an opaque `id`, and neither carries `requested_at`. Request
-  codes 22 and 40 are unchanged, but senders and receivers must update to the
-  same compatible `review-protocol` version or commit.
 - Renamed handshake metadata fields from `app_name` / `version` to
   `agent_name` / `agent_version` in `ConnectionBuilder` and `AgentInfo`.
 
