@@ -195,6 +195,12 @@ pub enum InstallPreflight {
     // The health condition is deliberate: identity alone would make a
     // Failed-but-installed build permanently un-re-appliable (see §4).
     AlreadyApplied,
+    // the agent cannot fit `size` on the filesystem it would stream into.
+    // Decided from the request alone, so NO bytes move and nothing on the
+    // host is touched; terminal, and NOT retryable until an operator frees
+    // space (see §4). Carries the filesystem, the space required and the
+    // space available so the report names a cause.
+    InsufficientDiskSpace { filesystem: String, required: u64, available: u64 },
 }
 
 pub enum NodePackageResponse {
@@ -238,8 +244,8 @@ pub struct InstalledPackage {
 pub struct PackageState {
     pub version: String,
     pub commit: String,
-    /// Mirrors the persisted lifecycle (RFC-D1): installing / running /
-    /// stopped / failed / removing.
+    /// The instance's install/run state. Defined below rather than
+    /// referenced, because it is a wire type this crate must encode.
     pub lifecycle: Lifecycle,
     /// The addresses this instance ACTUALLY BOUND. Empty for a component
     /// that listens on nothing — which is every module except Giganto: the
@@ -259,6 +265,23 @@ pub struct BoundAddr {
     /// can match it without positional assumptions — e.g. `graphql_srv_addr`.
     pub name: String,
     pub addr: String,  // host:port, as bound
+}
+
+/// Install/run state of one instance, as the agent observes it. The manager
+/// persists the same set (RFC-D1), but the values are enumerated HERE
+/// because they cross this wire and must round-trip: a decoder built from
+/// this family alone has to know every variant, including the two an agent
+/// rarely sends. `Unknown` is the forward-compatible sentinel — a manager
+/// that receives a state a newer agent introduced maps it here instead of
+/// failing the decode.
+pub enum Lifecycle {
+    NotInstalled,
+    Installing,
+    Running,
+    Stopped,
+    Failed,
+    Removing,
+    Unknown,
 }
 ```
 
