@@ -607,6 +607,19 @@ pub enum NodeEnrollResponse {
     from them (RFC-F §5.5), so no caller-supplied name exists to disagree
     with the host — the mismatch that error would have caught cannot be
     expressed.
+  - **[DECISION] `ServiceInstanceMismatch` is a FOURTH typed enroll error,
+    for an `instance` that contradicts the component's multiplicity.**
+    Deriving the `registration_id` picks one of three arms by multiplicity
+    class (RFC-A §4), so the registrar validates that `instance` is
+    **present** for a many-per-host component and **absent** for a
+    one-per-host or one-per-deployment one, refusing otherwise (RFC-F §5.1).
+    That refusal needs its own type for the same reason
+    `ServiceNameCollision` does: it is **deterministic**, so a manager that
+    receives it as a generic error retries it until the apply budget is
+    spent, terminates `Failed` with the teardown still owed, and reports no
+    cause. It is raised **before** any mint, so nothing is created. Like the
+    three above, the manager must **never** retry it, and RFC-E §9 carries
+    its remediation line.
   - **[DECISION] `Register` is idempotent in EFFECT, and always returns FRESH
     material — the `idempotency_key` is NOT a material cache.** These two must
     not be conflated: because the registrar **does not persist** the
