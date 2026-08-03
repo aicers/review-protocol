@@ -223,6 +223,43 @@ pub enum FailurePolicy {
     Rollback,  // restore the previous version (default — favor availability)
     Hold,      // leave the failed version in place, report it (favor diagnosis)
 }
+
+/// One installed instance. `ListInstalled` returns one per instance, so two
+/// instances of one module are distinguishable.
+pub struct InstalledPackage {
+    pub target: String,
+    pub instance: Option<u32>,
+    pub state: PackageState,
+}
+
+/// Install/lifecycle state of ONE instance, as the agent observes it:
+/// `(version, commit)` from the on-disk apply record, run-state recomputed
+/// from systemd (RFC-B §9).
+pub struct PackageState {
+    pub version: String,
+    pub commit: String,
+    /// Mirrors the persisted lifecycle (RFC-D1): installing / running /
+    /// stopped / failed / removing.
+    pub lifecycle: Lifecycle,
+    /// The addresses this instance ACTUALLY BOUND. Empty for a component
+    /// that listens on nothing — which is every module except Giganto: the
+    /// four agents dial out on an ephemeral port and bind no service address
+    /// (RFC-A §4). roxyd CHOOSES these on a first Giganto install, because
+    /// its first bind precedes its first configuration and only the host can
+    /// see what is free (RFC-B §4). They are **reported, never accepted**:
+    /// the manager records them (RFC-D1) so the direct-to-Giganto config
+    /// push has a destination (RFC-D2 §4b) and the UI can offer the real
+    /// values instead of a package default (RFC-E §4) — it never tells the
+    /// agent what to bind.
+    pub bound_addrs: Vec<BoundAddr>,
+}
+
+pub struct BoundAddr {
+    /// The configuration key this address belongs to, so the manager and UI
+    /// can match it without positional assumptions — e.g. `graphql_srv_addr`.
+    pub name: String,
+    pub addr: String,  // host:port, as bound
+}
 ```
 
 - **[DECISION] Streaming state machine with a preflight ACK — exact wire
