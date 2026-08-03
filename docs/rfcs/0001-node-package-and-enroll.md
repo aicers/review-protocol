@@ -136,6 +136,10 @@ pub enum NodePackageRequest {
         /// and the state it writes, which are what keep two instances of
         /// one module from colliding (RFC-B §4). `None` for a component
         /// whose class has no instance dimension (the core components).
+        /// In v1 this is `Some(1)` for a module and `None` for a core
+        /// component: RFC-A §4 pins the number and defers allocating others,
+        /// so the field is carried from the first release and only the range
+        /// of accepted values widens later.
         /// The composed `registration_id` is NOT sent: that belongs to the
         /// enrollment plane and the registrar derives it (RFC-F §5.5).
         instance: Option<u32>,
@@ -247,16 +251,15 @@ pub struct PackageState {
     /// The instance's install/run state. Defined below rather than
     /// referenced, because it is a wire type this crate must encode.
     pub lifecycle: Lifecycle,
-    /// The addresses this instance ACTUALLY BOUND. Empty for a component
-    /// that listens on nothing — which is every module except Giganto: the
+    /// The addresses this instance is ACTUALLY LISTENING ON, read from the
+    /// host's live sockets — not from its configuration file, which can say
+    /// something else until the service restarts. Empty for a component
+    /// that listens on nothing, which is every module except Giganto: the
     /// four agents dial out on an ephemeral port and bind no service address
-    /// (RFC-A §4). roxyd CHOOSES these on a first Giganto install, because
-    /// its first bind precedes its first configuration and only the host can
-    /// see what is free (RFC-B §4). They are **reported, never accepted**:
-    /// the manager records them (RFC-D1) so the direct-to-Giganto config
-    /// push has a destination (RFC-D2 §4b) and the UI can offer the real
-    /// values instead of a package default (RFC-E §4) — it never tells the
-    /// agent what to bind.
+    /// (RFC-A §4). They are **reported, never accepted**: the manager
+    /// records them (RFC-D1) and never tells the agent what to bind. v1
+    /// chooses no addresses (RFC-B §4); the field exists so that when a
+    /// later release does choose them, the wire does not change.
     pub bound_addrs: Vec<BoundAddr>,
 }
 
