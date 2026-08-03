@@ -271,22 +271,58 @@ pub struct BoundAddr {
 }
 
 /// Install/run state of one instance, as the agent observes it. The manager
-/// persists the same set (RFC-D1), but the values are enumerated HERE
-/// because they cross this wire and must round-trip: a decoder built from
-/// this family alone has to know every variant, including the two an agent
-/// rarely sends. `Unknown` is the forward-compatible sentinel — a manager
-/// that receives a state a newer agent introduced maps it here instead of
-/// failing the decode.
+/// persists the same set of VARIANTS (RFC-D1), but the two encodings are
+/// independent: that is a storage type in another crate, and the manager
+/// maps between them. The values are enumerated HERE because they cross
+/// this wire and must round-trip: a decoder built from this family alone
+/// has to know every variant, including the two an agent rarely sends.
+/// `Unknown` is the forward-compatible sentinel — a manager that receives
+/// a state a newer agent introduced maps it here instead of failing the
+/// decode. The derives below are what make that true; a plain derive would
+/// not (see the decision after this block).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(num_enum::FromPrimitive, num_enum::IntoPrimitive)]
+#[serde(from = "u8", into = "u8")]
+#[repr(u8)]
 pub enum Lifecycle {
-    NotInstalled,
-    Installing,
-    Running,
-    Stopped,
-    Failed,
-    Removing,
-    Unknown,
+    NotInstalled = 0,
+    Installing = 1,
+    Running = 2,
+    Stopped = 3,
+    Failed = 4,
+    Removing = 5,
+    /// Any discriminant this build does not know decodes here.
+    #[num_enum(default)]
+    Unknown = u8::MAX,
 }
 ```
+
+- **[DECISION] `Lifecycle` rides the wire as its `u8` discriminant, and an
+  unrecognized value decodes to `Unknown`.** The sentinel is only real if a
+  decoder can reach it, and a plain `#[derive(Deserialize)]` cannot: bincode
+  encodes a derived enum by **variant index**, so a state a newer agent
+  introduced fails the decode outright and `Unknown` is never produced —
+  exactly the forward-compatibility the comment claims. `serde_repr` alone
+  does not close it either: `Deserialize_repr` **errors** on an unmatched
+  discriminant rather than falling back. So the type carries `#[repr(u8)]`
+  with explicit discriminants, `#[serde(from = "u8", into = "u8")]`, and
+  `num_enum::FromPrimitive`/`IntoPrimitive` with `#[num_enum(default)]` on
+  `Unknown`. Both crates are already dependencies (`Cargo.toml`:
+  `num_enum = "0.7"`, `serde_repr = "0.1.19"`) and both idioms already
+  appear here — `#[repr(u8)]` with `Serialize_repr`/`Deserialize_repr` on
+  `LabelDbKind` (`src/types.rs:168`), `#[serde(into = "u16",
+  try_from = "u16")]` (`types.rs:77`), and `FromPrimitive` with
+  `#[num_enum(default)]` (`client.rs:19`/`:121`, `server.rs:247`/`:283`).
+- **[DECISION] These discriminants and review-database's are NOT one
+  encoding.** `Lifecycle` exists in two crates: this wire type, and
+  review-database's storage type (RFC-D1 §4a), which follows that repo's
+  `Status` house style — `#[repr(u8)]` plus num-derive `FromPrimitive`,
+  `Unknown = u8::MAX` (`src/tables/node.rs:9-41`). That type's serde derive
+  is **plain**, so its stored bincode value is the variant index, not the
+  discriminant. The two encodings are independent by design and the manager
+  maps between them; no code may read a number written on one side as
+  meaning the same on the other. Giving both `Unknown` the value `u8::MAX`
+  is a readability convenience, not a contract.
 
 - **[DECISION] Streaming state machine with a preflight ACK — exact wire
   sequence.** On the `Install` bi-stream, frames go in this fixed order, and
