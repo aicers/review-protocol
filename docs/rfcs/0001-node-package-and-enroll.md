@@ -1,7 +1,7 @@
 # RFC-C: review-protocol — `node.package` delivery and `node.enroll` registration
 
-Status: draft. This is an **`aicers/review-protocol`** in-repo RFC (the
-crate moved from `petabi` to `aicers`; there is no external gate). It is
+Status: accepted; implementation is decomposed from §9. This is an
+**`aicers/review-protocol`** in-repo RFC (no external gate). It is
 the ecosystem set's **RFC-C**, referenced by that label from RFC-A/B/D/E;
 its filing home is `aicers/review-protocol` (`docs/rfcs/`, its first RFC).
 All current-state claims below are verified against `aicers/review-protocol`
