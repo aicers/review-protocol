@@ -470,6 +470,29 @@ pub enum Lifecycle {
   activated. With this ACK the manager has a per-apply ground-truth reading and
   `StaleTrustSet`-on-equal becomes an explicit **already-at-this-epoch**
   confirmation rather than an inference from delivery bookkeeping (RFC-D2 §4a).
+- **[DECISION] `UnsupportedManifestFormat` on a `trust` apply carries the
+  agent's epoch and its supported format range, and is TERMINAL for that
+  host.** The manifest `format_version` check (RFC-A §4) can reject a trust
+  generation just as it rejects a module package — but unlike `StaleTrustSet`
+  it reports **no epoch**, and RFC-D2 §4a's authoritative rule is a
+  continuous invariant: *any connected roxyd whose last-confirmed `epoch` is
+  below REView's is sent the missing chain, on every check-in and every
+  periodic reconcile*. An agent too old to decode the new generation's
+  manifest would therefore be re-sent it **forever**, with the rollout
+  permanently incomplete and the host rendered as generically "exposed" with
+  no cause. So this response carries `active_epoch` **and** the agent's
+  supported `format_version` range, and RFC-D2 §4a marks the host with a
+  distinct terminal state — *cannot accept trust updates: manifest format* —
+  and stops re-pushing.
+  **The ordering constraint this implies must be stated, because nothing else
+  states it:** raising the manifest format fleet-wide requires every roxyd
+  binary to be updated **first**, delivered in a package of the *old* format,
+  and the **trust plane held at the minimum format any live host supports** —
+  the trust plane is the channel that carries revocations, so it must stay
+  readable by the laggiest host. `AgentInfo` therefore also reports
+  `manifest_formats` (§6, same conditional-tail discipline), which is how
+  REView discovers that minimum; RFC-A §5 requires a trust-set generation to
+  be minted at it.
 - **[DECISION] Trust generations carry a package identity like any other
   `.pkg`.** The in-package manifest sets `component = "trust"`, `version` =
   the generation's decimal `epoch`, and `commit` = the generation digest, so
@@ -544,9 +567,10 @@ pub enum NodeEnrollRequest {
         idempotency_key: String,
     },
     /// Deregister a service on uninstall: tear down its bootroot AppRole,
-    /// policy, per-service KV, and state entry (bootler runs `bootroot
-    /// service remove`, which bootroot supports), so no orphaned identity
-    /// or cert lingers.
+    /// policy, per-service KV, and state entry. The registrar invokes
+    /// bootroot's restricted deregister verb (RFC-F §5.2), which wraps
+    /// `run_service_remove`; bootler is long gone by then. No orphaned
+    /// identity or cert lingers.'
     Deregister {
         service_name: String,
         host: String,
@@ -621,8 +645,10 @@ pub enum NodeEnrollResponse {
   this family is the
   **manager→registrar** command + result. It carries **`Register`** (mint)
   and **`Deregister`** (tear down on uninstall — bootroot supports
-  `service remove`), so no orphaned identity/cert lingers. The registrar
-  policy gains `delete` for `Deregister` (bootler RFC 0004 §6).
+  `service remove`), so no orphaned identity/cert lingers. The
+  **bootroot-internal authority envelope** gains `delete` for `Deregister`
+  (bootler RFC 0004 §6, RFC-F §5.4) — **not** the registrar credential, which
+  holds no OpenBao authority at all (RFC-F §5.3).
 - **[DECISION] Both verbs are idempotent (crash-safe re-drive).**
   - **`Deregister`** — tearing down an already-absent identity **for the
     matching host** returns `Done`, not an error, so REView can re-drive an owed
@@ -641,8 +667,8 @@ pub enum NodeEnrollResponse {
     requested one**: on a **match** it **does not error and does not
     double-mint** — it **re-issues fresh wrapped material for the same
     identity** (role and policy already exist and are reused; a **new wrapped
-    `secret_id`** is minted and returned); on a **conflict** (same
-    `service_name`, different spec — `cert_group` or `reload`) it
+    `secret_id`** is minted and returned); on a **conflict** (same identity,
+    **same bound host**, different spec — `cert_group` or `reload`) it
     returns **`ServiceSpecConflict`** and mints **nothing**, so a stale or
     wrong-shape service is never silently re-issued fresh material. The
     matching case is what makes a first-install crash between mint and a
@@ -682,6 +708,29 @@ pub enum NodeEnrollResponse {
     cause. It is raised **before** any mint, so nothing is created. Like the
     three above, the manager must **never** retry it, and RFC-E §9 carries
     its remediation line.
+  - **[DECISION] `RegistrarUnavailable { reason }` is a FIFTH typed enroll
+    error, for the registrar's FAIL-CLOSED conditions.** The design added
+    several controls that stop the registrar cold, and every one of them
+    currently reaches the manager as a generic error:
+    - the registrar's **client certificate** has lapsed or is rejected by the
+      endpoint (`CredentialInvalid`, RFC-F §4);
+    - the **bootler-rendered file** carrying the safe-set, multiplicity map
+      and `domain` is missing or unreadable — a deliberate hard failure
+      (`NotProvisioned`, RFC-F §5.1, RFC-A §7);
+    - the **audit intent record cannot be written**, so the verb refuses
+      before creating anything (`AuditUnwritable`, RFC-F §5.6);
+    - the bootroot **daemon endpoint** is down or not listening
+      (`EndpointUnreachable`, RFC-F §4).
+
+    All four are **permanent until an operator acts on the bootroot host**,
+    and all four stop **every** enrollment in the deployment — so retrying
+    them burns the apply budget of every pending install at once and the
+    operator sees N unrelated installs fail with no stated cause. That is
+    exactly the outcome the four errors above were typed to prevent, one hop
+    further out. So it is typed, carries a small closed `reason` set, and is
+    **never retried**: RFC-D2 §4d terminates the attempt, and **does not
+    discharge `cleanup_state`**, because nothing was minted. RFC-E §9 carries
+    the remediation line per reason.
   - **[DECISION] `Register` is idempotent in EFFECT, and always returns FRESH
     material — the `idempotency_key` is NOT a material cache.** These two must
     not be conflated: because the registrar **does not persist** the
@@ -852,3 +901,26 @@ not a question.
   could assert a high epoch, never be sent the chain, and display healthy while
   holding a revoked key — turning "read ground truth from the agent" into a
   bypass in the one direction an attacker wants (RFC-D2 §4a, RFC-B §9).
+- **[DECISION] `AgentInfo` carries two further tail fields, appended in this
+  order and decoded by the same conditional-tail discipline.**
+  - **`manifest_formats`** — the range of manifest `format_version` values
+    this agent can decode. Without it REView cannot discover the fleet
+    minimum, and RFC-A §5's rule that a trust-set generation be minted at
+    that minimum has no input; an omitted field reads as "the launch format
+    only," which is the safe assumption.
+  - **`provisioning_fingerprint`** — the content digest of the
+    bootler-rendered file the registrar reads (RFC-A §7). Only the registrar
+    populates it. REView compares it against its own copy's digest on every
+    connect and surfaces a mismatch beside the trust-`epoch` lag it already
+    renders (RFC-D2 §4a). Without this channel RFC-A §7's "both readers
+    report it and a mismatch is surfaced" has no reader and no comparer, and
+    the second rendered copy's entire safety story — that divergence between
+    the registrar's enforcement and REView's upload check is caught rather
+    than silently tolerated — is unimplementable.
+
+  The capability set (`capabilities`) additionally carries a
+  **`rollback-supervisor`** tag on hosts where the bootler-installed
+  self-update rollback supervisor is present, so REView can refuse to offer
+  `on_failure: Rollback` to a host that would silently get `Hold` instead
+  (RFC-A §8, RFC-B §8). This needs no new field — that is what a
+  `BTreeSet<String>` is for.
