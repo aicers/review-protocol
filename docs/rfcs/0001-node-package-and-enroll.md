@@ -720,17 +720,58 @@ pub enum NodeEnrollResponse {
     - the **audit intent record cannot be written**, so the verb refuses
       before creating anything (`AuditUnwritable`, RFC-F §5.6);
     - the bootroot **daemon endpoint** is down or not listening
-      (`EndpointUnreachable`, RFC-F §4).
+      (`EndpointUnreachable`, RFC-F §4);
+    - the **outcome** audit record could not be written **after** a successful
+      mint (`PostMintUnrecordable`, RFC-F §5.6) — see the split below;
+    - review could not reach the **registrar agent at all**
+      (`RegistrarUnreachable`), synthesized by review rather than returned by
+      the registrar: the other reasons are *responses*, so if the registrar
+      roxyd is not connected, or its `registrar` claim is uncorroborated
+      (RFC-D2 §4c), there is nothing to respond and the failure would
+      otherwise arrive as a transport error → generic → retried, which is the
+      outcome this whole family exists to prevent, one hop further out.
 
-    All four are **permanent until an operator acts on the bootroot host**,
+    **[DECISION] `AuditUnwritable` is INTENT-PHASE ONLY;
+    `PostMintUnrecordable` is its post-mint twin, and they differ on whether a
+    teardown is owed.** RFC-F §5.6 writes the intent record before any OpenBao
+    write and the outcome record after, so "the record could not be written"
+    is two different situations: before, **nothing exists** and nothing is
+    owed; after, the policy, the AppRole, the per-service KV and the durable
+    host binding all exist while the caller is told the call failed. Folding
+    them into one reason and applying "nothing was minted" would leave a live
+    bootroot identity that REView does not know about and has not scheduled to
+    tear down. So `PostMintUnrecordable` **keeps the owed teardown armed** and
+    is re-driven when the audit store recovers (RFC-D2 §4d) — which matters
+    because the compensating `Deregister` needs a writable audit store too and
+    will keep failing until an operator frees space.
+
+    All the reasons except `PostMintUnrecordable` mean **nothing was minted**,
+    and all of them are **permanent until an operator acts on the bootroot
+    host**,
     and all four stop **every** enrollment in the deployment — so retrying
     them burns the apply budget of every pending install at once and the
     operator sees N unrelated installs fail with no stated cause. That is
     exactly the outcome the four errors above were typed to prevent, one hop
     further out. So it is typed, carries a small closed `reason` set, and is
-    **never retried**: RFC-D2 §4d terminates the attempt, and **does not
-    discharge `cleanup_state`**, because nothing was minted. RFC-E §9 carries
-    the remediation line per reason.
+    **never retried**: RFC-D2 §4d terminates the attempt. On the
+    nothing-was-minted reasons it **clears the pre-armed `cleanup_state`** —
+    the obligation was armed before the mint was commanded and there is now
+    nothing to tear down, so leaving it armed would block that hostname from
+    ever being re-onboarded (RFC-D2 §4d). On **`PostMintUnrecordable`** it
+    **leaves it armed**. RFC-E §9 carries a remediation line per reason, and
+    because one cause surfaces on every pending install at once the UI groups
+    them into one deployment-level banner.
+  - **[DECISION] `RegistrarBusy { retry_after }` is a SIXTH typed enroll
+    error, and unlike every other one it is RETRYABLE.** The registrar
+    rate-limits both verbs (RFC-F §5.6), and there is exactly **one** registrar
+    identity in the deployment, so that limiter is effectively global: an
+    ordinary bring-up — an onboarding wave plus five modules per host — is a
+    legitimate burst against it. A throttle is the opposite of
+    `RegistrarUnavailable`'s reasons: it clears on its own. Without its own
+    type it arrives generic, review classifies generic as transient and retries
+    at once (RFC-D2 §4b), and the retry storm feeds the limiter. So it is
+    typed, carries `retry_after`, and review **honors that delay without
+    consuming the apply budget**; RFC-E §9 carries its line.
   - **[DECISION] `Register` is idempotent in EFFECT, and always returns FRESH
     material — the `idempotency_key` is NOT a material cache.** These two must
     not be conflated: because the registrar **does not persist** the
@@ -908,15 +949,28 @@ not a question.
     minimum, and RFC-A §5's rule that a trust-set generation be minted at
     that minimum has no input; an omitted field reads as "the launch format
     only," which is the safe assumption.
-  - **`provisioning_fingerprint`** — the content digest of the
-    bootler-rendered file the registrar reads (RFC-A §7). Only the registrar
-    populates it. REView compares it against its own copy's digest on every
-    connect and surfaces a mismatch beside the trust-`epoch` lag it already
-    renders (RFC-D2 §4a). Without this channel RFC-A §7's "both readers
-    report it and a mismatch is surfaced" has no reader and no comparer, and
-    the second rendered copy's entire safety story — that divergence between
-    the registrar's enforcement and REView's upload check is caught rather
-    than silently tolerated — is unimplementable.
+  - **`audit_health`** — the registrar's audit-store low-water state and its
+    intent-without-outcome count, read from the bootroot endpoint and relayed.
+    bootrootd is **not** a review-protocol peer and has no channel to review at
+    all, so without this relay RFC-F §5.6's capacity alarm and its
+    crash-mid-mint anomaly have no path to an operator — and a fail-closed
+    control whose capacity nobody watches is a scheduled outage. Only the
+    registrar populates it.
+  - **`provisioning_fingerprint`** — digests of the bootler-rendered file
+    (RFC-A §7). Only the registrar populates it, and two properties matter:
+    it is the **enforcer's** digest, taken by the bootroot daemon (the mint
+    verb is what actually reads that file, RFC-F §5.1) and relayed by roxyd,
+    not a digest roxyd computes from its own read — otherwise the comparison
+    can be green while bootrootd enforces something else. And it is
+    **structured**, not one opaque hash: a per-component digest map plus a
+    separately compared `domain`, so review can name what diverged and scope
+    its response. A single whole-file hash would flip identically for a benign
+    new component entry and for a changed `network.domain`, and only the latter
+    is fatal (it mints certificates no peer will verify). REView compares on
+    every connect and acts per RFC-D2 §4a. Without this channel RFC-A §7's
+    "both readers report it and a mismatch is surfaced" has no reader and no
+    comparer, and the second rendered copy's entire safety story is
+    unimplementable.
 
   The capability set (`capabilities`) additionally carries a
   **`rollback-supervisor`** tag on hosts where the bootler-installed
@@ -924,3 +978,91 @@ not a question.
   `on_failure: Rollback` to a host that would silently get `Hold` instead
   (RFC-A §8, RFC-B §8). This needs no new field — that is what a
   `BTreeSet<String>` is for.
+
+## 8. Acceptance criteria
+
+This crate owns wire types several other documents depend on by name, so each
+gets a criterion here rather than only a prose mention.
+
+- **Codes 109/110 are added additively.** Codes 100–108 are untouched, the
+  round-trip tests that pin the numeric mapping (`request.rs:1069`, `:1056`)
+  still pass, and an agent that does not implement the new codes still falls
+  through to the "unknown request code" arm.
+- **`node.package` `Install` streaming.** The framed request goes first, the
+  agent answers exactly one `InstallPreflight`, and each branch has exactly
+  one terminal frame, so neither side ever blocks on a frame that will not
+  come. A test drives each preflight verdict and asserts the frame sequence.
+- **The `.pkg` is verified from inside, never from the wire.** The request
+  carries neither manifest nor signature; a test asserts an agent rejects a
+  package whose in-container manifest disagrees with the request
+  `(target, version, commit)` (`TargetMismatch`) and that no wire field can
+  substitute for the container's own manifest (RFC-A §4/§5).
+- **`instance` rides both families as `Option<u32>`.** A test asserts the wire
+  round-trips `None` and `Some(n)` and that v1's `Some(1)` needs no wire change
+  to become `Some(2)`.
+- **Six typed enroll errors exist and are distinguishable:**
+  `ServiceSpecConflict`, `ServiceNameCollision`, `ServiceInstanceMismatch`,
+  `ServiceHostMismatch`, `RegistrarUnavailable { reason }`, and
+  `RegistrarBusy { retry_after }`. Tests assert each is a distinct wire variant
+  and — the property they exist for — that the first five are **not**
+  classifiable as transient while `RegistrarBusy` **is**, carrying a delay.
+  `RegistrarUnavailable`'s reason set is closed:
+  `CredentialInvalid`, `NotProvisioned`, `AuditUnwritable`,
+  `EndpointUnreachable`, `PostMintUnrecordable`, `RegistrarUnreachable`. A test
+  asserts `PostMintUnrecordable` is the only reason that leaves a teardown
+  owed, and that `RegistrarUnreachable` is synthesizable by the manager (no
+  registrar response is required to produce it).
+- **`Register` returns fresh material every time and never double-mints.** A
+  test re-drives a `Register` with a new `idempotency_key` against a
+  matching-spec identity and asserts one identity, fresh wrapped material, and
+  a single `operation_attempt` correlation — the key is not a response cache.
+- **`Lifecycle` is encoded as its `u8` discriminant with an unknown-value
+  fallback.** A test decodes an unrecognized discriminant and asserts
+  `Unknown`, **not** a decode error — an implementation using a plain derive
+  fails this, which is the whole point of the derive combination in §4.
+- **`AgentInfo` tail fields decode conditionally, in order.** The tail is
+  `capabilities`, `active_trust_epoch`, `manifest_formats`,
+  `provisioning_fingerprint`, `audit_health`. Tests cover: an agent sending
+  none of them; an agent sending a prefix of them; and each field consuming
+  exactly its own bytes, so a decoder that asserts full-slice consumption does
+  not break a later field. A missing field decodes to "unknown", never to a
+  confident default (RFC-D2 §4a treats unknown as un-confirmed).
+- **A `trust` apply ACKs the agent's epoch on every outcome.** `TrustActive`,
+  `StaleTrustSet` **and** `UnsupportedManifestFormat` all carry the agent's
+  `active_epoch`; the last additionally carries its supported
+  `format_version` range. A test asserts the manager can compute a host's
+  true epoch from any of the three without consulting its own delivery
+  bookkeeping.
+- **Wire version bump.** The advertised protocol version rises and the
+  manager's `VersionReq` is raised in step, so an agent without 109/110 is
+  refused at handshake rather than discovering it per request.
+
+## 9. Issue decomposition (AgentCoop)
+
+Self-contained issues; dependency order. This crate is the keystone — RFC-B
+and RFC-D2 both consume its types — so it lands first.
+
+1. **`node.package` family + code 109** (§4) — the request/response enums,
+   `PackageState`, `BoundAddr`, `Lifecycle` with its `#[repr(u8)]` /
+   `#[serde(from/into = "u8")]` / `num_enum(default)` combination, the
+   `service_id` entry, and the dispatch arm. Includes the streaming state
+   machine and its preflight ACK.
+2. **`node.enroll` family + code 110** (§5) — `ServiceSpec`, `DeliveryMode`,
+   `BootstrapMaterial`, `Register`/`Deregister`, and the **six** typed enroll
+   errors with `RegistrarUnavailable`'s closed reason set and
+   `RegistrarBusy { retry_after }`. Depends on 1 only for the shared
+   `service_id`/dispatch scaffolding.
+3. **The reserved `trust` target's response types** (§4) — `TrustActive`,
+   `StaleTrustSet` and `UnsupportedManifestFormat`, each carrying
+   `active_epoch`, the last also the supported format range. Depends on 1.
+4. **`AgentInfo` tail extension** (§6) — `capabilities` (including the
+   `rollback-supervisor` tag), `active_trust_epoch`, `manifest_formats`,
+   `provisioning_fingerprint`, `audit_health`, appended in that order with the
+   conditional-tail decode and its round-trip tests. Independent of 1–3.
+5. **Version negotiation bump** (§6) — raise the advertised version and the
+   server-side `VersionReq`. Depends on 1–4.
+
+Cross-repo: RFC-B implements the agent side of 1–3 and populates 4; RFC-D2
+implements the manager side and consumes every type here. Nothing in this
+crate derives an identity — RFC-A §4 owns that rule and this crate carries
+only the parts.
