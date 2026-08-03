@@ -30,13 +30,14 @@ repo's RFC: every wire type it defines (`ServiceSpec`, `DeliveryMode`,
 spelled out here, and the behaviour attributed to the agent (RFC-B) or the
 manager (RFC-D2) is counterparty context, not work this crate does.
 
-**One deliberate exception:** the host→label **flattening rule** is
-single-sourced in **RFC-A §4** and is intentionally *not* restated here or
-anywhere else (two subtly different implementations would fail every
-`Register` in the fleet, and only after deployment). This crate does not
-perform the flattening — REView derives the label and the registrar
-re-derives it — but any issue that does must inline RFC-A §4's rule rather
-than paraphrase it.
+**One deliberate exception:** the **identity derivation** — how
+`(service_name, host, instance)` becomes bootroot's namespace key, and how
+instance numbers are scoped — is single-sourced in **RFC-A §4** and is
+intentionally *not* restated here or anywhere else (two subtly different
+implementations would fail every `Register` in the fleet, and only after
+deployment). This crate carries the parts, not the composed name, so it
+performs no derivation of its own; any issue that does must inline
+RFC-A §4's rule rather than paraphrase it.
 
 ## 1. Summary
 
@@ -128,6 +129,16 @@ pub enum NodePackageRequest {
     Install {
         // host-agnostic package id (= manifest component); RFC-A §4 registry
         target: String,
+        /// Which instance of `target` on this host to place: a number
+        /// scoped by `{target}.{host}`, allocated by the manager
+        /// (RFC-A §4). The agent CANNOT derive it — the allocation is the
+        /// manager's — and it needs it to pick the unit name, the paths,
+        /// and the state it writes, which are what keep two instances of
+        /// one module from colliding (RFC-B §4). `None` for a component
+        /// whose class has no instance dimension (the core components).
+        /// The composed `registration_id` is NOT sent: that belongs to the
+        /// enrollment plane and the registrar derives it (RFC-F §5.5).
+        instance: Option<u32>,
         // expected version (opaque display token, RFC-A §4); MUST match the manifest
         version: String,
         // expected git commit SHA; MUST match the manifest (exact build id)
@@ -157,12 +168,19 @@ pub enum NodePackageRequest {
         /// `Rollback`.
         on_failure: FailurePolicy,
     },
-    /// Remove an installed package (stop unit, remove artifacts).
-    Remove { target: String, idempotency_key: String },
+    /// Remove one installed instance (stop unit, remove artifacts).
+    /// `instance` selects which, exactly as on `Install`.
+    Remove {
+        target: String,
+        instance: Option<u32>,
+        idempotency_key: String,
+    },
     /// List installed packages and their `(version, commit)` build ids.
+    /// Each entry carries its `instance`, so two instances of one module
+    /// are distinguishable.
     ListInstalled,
-    /// Report install/lifecycle state of one package.
-    Status { target: String },
+    /// Report install/lifecycle state of one installed instance.
+    Status { target: String, instance: Option<u32> },
 }
 
 /// `Install` preflight — the agent's FIRST reply, sent AFTER the framed
@@ -379,11 +397,27 @@ streaming.
 pub enum NodeEnrollRequest {
     /// Register a new service in bootroot and return its bootstrap
     /// material. Used for BOTH per-service install and new-host
-    /// onboarding (host self-join; service = "roxyd-<newhost>").
+    /// onboarding (host self-join; the new host's own roxyd).
+    ///
+    /// The request carries the identity's PARTS, never a composed name:
+    /// the registrar derives both the certificate name and bootroot's
+    /// namespace key from them (RFC-F §5.1/§5.5), so there is no
+    /// caller-supplied composed value for the two sides to disagree on.
     Register {
-        service_name: String,       // single DNS label, RFC 0004 §4
+        /// The component's PLAIN keyword — `piglet`, `roxyd` — a single
+        /// DNS label, never host- or instance-qualified. It is the SAN's
+        /// service segment (RFC-A §4).
+        service_name: String,
         delivery_mode: DeliveryMode, // local-file | remote-bootstrap
+        /// The target host's single DNS label — the SAN's host segment.
         host: String,
+        /// Which instance of `service_name` on `host` this is: a number
+        /// scoped by `{service_name}.{hostname}`, allocated by the manager
+        /// (RFC-A §4, RFC-D2 §4d). `None` for a component whose
+        /// multiplicity class has no instance dimension — the core
+        /// components — which take the default `001`. Only the five
+        /// modules are multi-instance (RFC-A §4).
+        instance: Option<u32>,
         /// The registration spec the registrar applies on a first mint AND
         /// compares against the existing one on a re-register (the spec-match
         /// / `ServiceSpecConflict` rule below). It mirrors the **bootler**
@@ -398,8 +432,8 @@ pub enum NodeEnrollRequest {
         /// Manager (REView) derives it from the component's package-declared
         /// `ServiceRegistration` (RFC-A §4) and carries it here, so the
         /// registrar has a concrete spec to compare — it is NOT re-derived by
-        /// the registrar. `service_name` is the identity; `spec` is what that
-        /// identity is registered *as*.
+        /// the registrar. The identity is `(service_name, host, instance)`;
+        /// `spec` is what that identity is registered *as*.
         spec: ServiceSpec,
         /// Requested lifetime of the wrapped material. The registrar MAY
         /// clamp it to its own maximum; the GRANTED absolute deadline comes
@@ -417,6 +451,10 @@ pub enum NodeEnrollRequest {
     Deregister {
         service_name: String,
         host: String,
+        /// Same meaning as on `Register` — the registrar derives the same
+        /// namespace key from it and refuses a teardown whose host does
+        /// not match the one bound to that key (RFC-F §5.2).
+        instance: Option<u32>,
         idempotency_key: String,
     },
 }
@@ -430,7 +468,7 @@ pub enum NodeEnrollRequest {
 /// `reload` (RFC-F §5.1).
 pub struct ServiceSpec {
     component: String,      // canonical package-id (RFC-A §4)
-    service_name: String,   // <component>-<flatten(host)>
+    service_name: String,   // the component's plain keyword (RFC-A §4)
     reload: ReloadHook,
     cert_group: Option<CertGroup>,
 }
