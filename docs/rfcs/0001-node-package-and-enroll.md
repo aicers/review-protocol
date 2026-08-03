@@ -555,18 +555,21 @@ pub enum NodeEnrollResponse {
     restricted mint verb, not in roxyd (RFC-F §4–§5, RFC-B §6).
   - **[DECISION] `ServiceNameCollision` is a THIRD typed enroll error, defined
     here.** Two other documents already depend on it by name — RFC-F §5.1
-    rejects a label bound to a *different* host with it, and RFC-E §6 shows it
-    as an actionable error with remediation — but this family owns the wire
+    rejects a derived `registration_id` already bound to a *different* host
+    with it, and RFC-E §6 shows it as an actionable error with remediation —
+    but this family owns the wire
     types, so it must exist here or the rejection arrives at the manager as a
     **generic** error and review **retries it as transient**: exactly the
     failure mode `ServiceHostMismatch` was made distinct to avoid, and RFC-E's
     "show the remediation" criterion becomes unmeetable. Like
     `ServiceSpecConflict` and `ServiceHostMismatch`, it is **distinct from a
     transient failure** — the manager must never retry it — and it is raised
-    **before** the spec-match (RFC-F §5.1's ordering requirement). A
-    label/`host` mismatch, where `service_name` is not
-    `<component>-<flatten(host)>` for the supplied `host`, is likewise a
-    distinct, non-transient rejection raised before the collision check.
+    **before** the spec-match (RFC-F §5.1's ordering requirement). There is
+    **no** companion "name does not match the host" error: this family
+    carries the identity's parts and the registrar derives the composed name
+    from them (RFC-F §5.5), so no caller-supplied name exists to disagree
+    with the host — the mismatch that error would have caught cannot be
+    expressed.
   - **[DECISION] `Register` is idempotent in EFFECT, and always returns FRESH
     material — the `idempotency_key` is NOT a material cache.** These two must
     not be conflated: because the registrar **does not persist** the
