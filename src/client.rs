@@ -4,7 +4,10 @@
 mod api;
 
 #[cfg(feature = "client")]
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::{
+    collections::BTreeSet,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 #[cfg(any(feature = "client", feature = "server"))]
 use num_enum::{FromPrimitive, IntoPrimitive};
@@ -12,7 +15,10 @@ use num_enum::{FromPrimitive, IntoPrimitive};
 use oinq::frame;
 
 #[cfg(feature = "client")]
-use crate::AgentInfo;
+use crate::{
+    AgentInfo,
+    types::{AuditHealth, ManifestFormatRange, ProvisioningFingerprint},
+};
 
 /// Numeric representation of the message types that a client should handle.
 #[cfg(any(feature = "client", feature = "server"))]
@@ -136,6 +142,11 @@ pub struct ConnectionBuilder {
     agent_version: String,
     protocol_version: String,
     status: crate::Status,
+    capabilities: BTreeSet<String>,
+    active_trust_epoch: Option<u64>,
+    manifest_formats: Option<ManifestFormatRange>,
+    provisioning_fingerprint: Option<ProvisioningFingerprint>,
+    audit_health: Option<AuditHealth>,
     roots: rustls::RootCertStore,
     certs: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
@@ -145,6 +156,14 @@ pub struct ConnectionBuilder {
 impl ConnectionBuilder {
     /// Creates a new builder with the remote address, certificate chain,
     /// and key.
+    ///
+    /// The handshake's conditional-tail fields start out advertising nothing:
+    /// an empty capability set and an unknown reading for every optional field.
+    /// Use [`capabilities`](Self::capabilities),
+    /// [`active_trust_epoch`](Self::active_trust_epoch),
+    /// [`manifest_formats`](Self::manifest_formats),
+    /// [`provisioning_fingerprint`](Self::provisioning_fingerprint) and
+    /// [`audit_health`](Self::audit_health) to report them.
     ///
     /// # Errors
     ///
@@ -186,10 +205,73 @@ impl ConnectionBuilder {
             agent_version: agent_version.to_string(),
             protocol_version: protocol_version.to_string(),
             status,
+            capabilities: BTreeSet::new(),
+            active_trust_epoch: None,
+            manifest_formats: None,
+            provisioning_fingerprint: None,
+            audit_health: None,
             roots: rustls::RootCertStore::empty(),
             certs,
             key,
         })
+    }
+
+    /// Sets the capability tags this agent advertises in the handshake.
+    ///
+    /// The tags are namespaced strings; [`types::capability`] lists the ones
+    /// this crate knows about, but the set is open and an unknown tag is
+    /// carried through untouched. Replaces any previously set tags; the
+    /// default is an empty set, which advertises nothing.
+    ///
+    /// Security-sensitive tags such as `registrar` and `colocated:*` are
+    /// claims that the manager corroborates elsewhere. Advertising one grants
+    /// nothing by itself.
+    ///
+    /// [`types::capability`]: crate::types::capability
+    pub fn capabilities<I, S>(&mut self, capabilities: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.capabilities = capabilities.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Sets the release-signing trust-set generation this agent is active on.
+    ///
+    /// Left unset, the agent reports the epoch as unknown, which a manager
+    /// reads as un-confirmed rather than as epoch 0.
+    pub fn active_trust_epoch(&mut self, epoch: u64) -> &mut Self {
+        self.active_trust_epoch = Some(epoch);
+        self
+    }
+
+    /// Sets the range of package-manifest `format_version` values this agent
+    /// can decode.
+    ///
+    /// Left unset, the agent reports no range, and a manager assumes the launch
+    /// format only.
+    pub fn manifest_formats(&mut self, formats: ManifestFormatRange) -> &mut Self {
+        self.manifest_formats = Some(formats);
+        self
+    }
+
+    /// Sets the provisioning-file digests this agent relays.
+    ///
+    /// The digests are the enforcing daemon's reading, relayed unchanged; an
+    /// agent must not substitute digests it computed from its own read of the
+    /// file.
+    pub fn provisioning_fingerprint(&mut self, fingerprint: ProvisioningFingerprint) -> &mut Self {
+        self.provisioning_fingerprint = Some(fingerprint);
+        self
+    }
+
+    /// Sets the audit-store health this agent relays from its local endpoint.
+    ///
+    /// Only a registrar reports this.
+    pub fn audit_health(&mut self, health: AuditHealth) -> &mut Self {
+        self.audit_health = Some(health);
+        self
     }
 
     /// Sets the client certificate chain for the connection.
@@ -340,6 +422,11 @@ impl ConnectionBuilder {
             protocol_version: self.protocol_version.clone(),
             status: self.status,
             addr,
+            capabilities: self.capabilities.clone(),
+            active_trust_epoch: self.active_trust_epoch,
+            manifest_formats: self.manifest_formats,
+            provisioning_fingerprint: self.provisioning_fingerprint.clone(),
+            audit_health: self.audit_health,
         };
 
         let (mut send, mut recv) = connection.open_bi().await?;
@@ -478,7 +565,6 @@ pub(crate) async fn handshake(
     // TODO: This is unnecessary in handshake, and thus should be removed in the
     // future.
 
-    use crate::{handle_handshake_recv_io_error, handle_handshake_send_io_error};
     let addr = if conn.remote_address().is_ipv6() {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
     } else {
@@ -491,18 +577,42 @@ pub(crate) async fn handshake(
         protocol_version: protocol_version.to_string(),
         status,
         addr,
+        capabilities: BTreeSet::new(),
+        active_trust_epoch: None,
+        manifest_formats: None,
+        provisioning_fingerprint: None,
+        audit_health: None,
     };
+
+    handshake_with(conn, &agent_info).await
+}
+
+/// Sends the given agent information as a handshake request and processes the
+/// response.
+///
+/// The whole struct is sent in one frame, base fields first and the conditional
+/// tail after them, which is what the derived `Serialize` produces.
+///
+/// # Errors
+///
+/// Returns `HandshakeError` if the handshake failed.
+#[cfg(all(test, feature = "client", feature = "server"))]
+pub(crate) async fn handshake_with(
+    conn: &quinn::Connection,
+    agent_info: &AgentInfo,
+) -> Result<(), super::HandshakeError> {
+    use crate::{handle_handshake_recv_io_error, handle_handshake_send_io_error};
 
     let (mut send, mut recv) = conn.open_bi().await?;
     let mut buf = Vec::new();
-    frame::send(&mut send, &mut buf, &agent_info)
+    frame::send(&mut send, &mut buf, agent_info)
         .await
         .map_err(handle_handshake_send_io_error)?;
 
     match frame::recv::<Result<&str, &str>>(&mut recv, &mut buf).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(super::HandshakeError::IncompatibleProtocol(
-            protocol_version.to_string(),
+            agent_info.protocol_version.clone(),
             e.to_string(),
         )),
         Err(e) => Err(handle_handshake_recv_io_error(e)),
@@ -665,5 +775,132 @@ mod tests {
             "build_endpoint() must succeed with a full certificate chain: {}",
             endpoint.unwrap_err()
         );
+    }
+
+    #[test]
+    fn tail_fields_default_to_advertising_nothing() {
+        let (chain_pem, key_pem, _root_pem, _) = generate_chain();
+
+        let builder = ConnectionBuilder::new(
+            "test-server",
+            "127.0.0.1:443".parse().unwrap(),
+            "test-agent",
+            "1.0",
+            "1.0",
+            crate::Status::Ready,
+            chain_pem.as_bytes(),
+            key_pem.as_bytes(),
+        )
+        .unwrap();
+
+        assert!(builder.capabilities.is_empty());
+        assert_eq!(builder.active_trust_epoch, None);
+        assert_eq!(builder.manifest_formats, None);
+        assert_eq!(builder.provisioning_fingerprint, None);
+        assert_eq!(builder.audit_health, None);
+    }
+
+    /// `capabilities` replaces the set rather than adding to it, so a caller
+    /// that recomputes its roles cannot leave a stale tag advertised.
+    #[test]
+    fn capabilities_replaces_rather_than_accumulates() {
+        use std::collections::BTreeSet;
+
+        use crate::types::capability;
+
+        let (chain_pem, key_pem, _root_pem, _) = generate_chain();
+
+        let mut builder = ConnectionBuilder::new(
+            "test-server",
+            "127.0.0.1:443".parse().unwrap(),
+            "test-agent",
+            "1.0",
+            "1.0",
+            crate::Status::Ready,
+            chain_pem.as_bytes(),
+            key_pem.as_bytes(),
+        )
+        .unwrap();
+
+        builder.capabilities([capability::REGISTRAR, capability::NODE_ENROLL]);
+        builder.capabilities([capability::NODE_PACKAGE]);
+
+        assert_eq!(
+            builder.capabilities,
+            BTreeSet::from([capability::NODE_PACKAGE.to_string()])
+        );
+
+        builder.capabilities(Vec::<String>::new());
+
+        assert!(builder.capabilities.is_empty());
+    }
+
+    /// What the builder is told to advertise is what the manager receives.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn connect_sends_the_configured_tail() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use crate::{
+            test::TEST_ENV,
+            types::{AuditHealth, ManifestFormatRange, ProvisioningFingerprint, capability},
+        };
+
+        let fingerprint = ProvisioningFingerprint {
+            components: BTreeMap::from([("review".to_string(), "sha256:def".to_string())]),
+            domain: "example.test".to_string(),
+        };
+        let health = AuditHealth {
+            below_low_water: false,
+            intent_without_outcome: 11,
+        };
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, _client_conn, agent_info) = test_env
+            .setup_with(|builder| {
+                builder
+                    .capabilities([capability::REGISTRAR, "future:thing"])
+                    .active_trust_epoch(9)
+                    .manifest_formats(ManifestFormatRange { min: 1, max: 3 })
+                    .provisioning_fingerprint(fingerprint.clone())
+                    .audit_health(health);
+            })
+            .await;
+
+        assert_eq!(
+            agent_info.capabilities,
+            BTreeSet::from(["future:thing".to_string(), "registrar".to_string()])
+        );
+        assert_eq!(agent_info.active_trust_epoch, Some(9));
+        assert_eq!(
+            agent_info.manifest_formats,
+            Some(ManifestFormatRange { min: 1, max: 3 })
+        );
+        assert_eq!(agent_info.provisioning_fingerprint, Some(fingerprint));
+        assert_eq!(agent_info.audit_health, Some(health));
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// A builder left at its defaults connects and hands the manager the
+    /// unknown readings. This is the other wire shape that reads as "advertises
+    /// nothing": the tail is present, but every field carries the empty or
+    /// absent value, so it must be indistinguishable from the base-only frame
+    /// an agent predating the tail sends.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn connect_without_a_configured_tail_advertises_nothing() {
+        use crate::test::TEST_ENV;
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, _client_conn, agent_info) = test_env.setup_with(|_builder| {}).await;
+
+        assert!(agent_info.capabilities.is_empty());
+        assert_eq!(agent_info.active_trust_epoch, None);
+        assert_eq!(agent_info.manifest_formats, None);
+        assert_eq!(agent_info.provisioning_fingerprint, None);
+        assert_eq!(agent_info.audit_health, None);
+
+        test_env.teardown(&server_conn);
     }
 }

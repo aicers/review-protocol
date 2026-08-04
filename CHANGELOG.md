@@ -38,11 +38,41 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   `Debug` output, so logging a request that relays it cannot leak it. The
   request family is not dispatched yet: an agent answers a `node.package`
   request as an unknown request code.
+- Added five conditionally decoded tail fields to `AgentInfo`, appended in this
+  order: `capabilities`, `active_trust_epoch`, `manifest_formats`,
+  `provisioning_fingerprint` and `audit_health`. An agent uses them to advertise
+  the optional request families and roles it carries, plus readings a manager
+  cannot obtain any other way. The order is contractual and the fields decode
+  conditionally: a decoder reads the base struct and then each tail field from
+  whatever bytes are left over, each field consuming exactly its own bytes, so
+  it may stop at any field boundary. A peer that sends no tail is decoded with
+  an empty capability set and an unknown reading for the rest, and a peer that
+  sends the full tail is decoded by an older base-only peer that ignores the
+  trailing bytes. A tail that is present but does not decode fails the
+  handshake rather than being read as an absent tail, so a missing-but-expected
+  claim cannot pass unnoticed. Future fields follow the same discipline.
+- Added the `ManifestFormatRange`, `ProvisioningFingerprint` and `AuditHealth`
+  types in `types`, carried by the new `AgentInfo` fields.
+- Added `types::capability`, naming the capability tags this crate knows about:
+  `registrar`, `colocated:review`, `colocated:aice-web-next`, `node.package`,
+  `node.enroll` and `rollback-supervisor`. These are known values, not a closed
+  set — a decoder validates the tags it knows and preserves the rest untouched.
+  This is unrelated to `auth::ProtocolMetadata::capabilities`, which stays a
+  separate field on a separate type.
+- Added `ConnectionBuilder::capabilities`,
+  `ConnectionBuilder::active_trust_epoch`,
+  `ConnectionBuilder::manifest_formats`,
+  `ConnectionBuilder::provisioning_fingerprint` and
+  `ConnectionBuilder::audit_health` to report the new fields. They default to
+  advertising nothing, so a caller that sets none of them is unaffected.
 
 ### Changed
 
 - Renamed handshake metadata fields from `app_name` / `version` to
   `agent_name` / `agent_version` in `ConnectionBuilder` and `AgentInfo`.
+- `AgentInfo` now has five more public fields, so code that builds one with a
+  struct literal must initialize them.
+- `AgentInfo` and `Status` now implement `PartialEq` and `Eq`.
 
 ### Removed
 

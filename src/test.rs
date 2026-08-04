@@ -146,6 +146,24 @@ impl TestEnvironment {
     }
 
     pub async fn setup(&self) -> (crate::server::Connection, crate::client::Connection) {
+        let (server_conn, client_conn, _agent_info) = self.setup_with(|_builder| {}).await;
+        (server_conn, client_conn)
+    }
+
+    /// Establishes a connection like [`setup`](Self::setup), letting the caller
+    /// configure the client's `ConnectionBuilder` first, and additionally
+    /// returning the `AgentInfo` the manager received at the handshake.
+    pub async fn setup_with<F>(
+        &self,
+        configure: F,
+    ) -> (
+        crate::server::Connection,
+        crate::client::Connection,
+        crate::AgentInfo,
+    )
+    where
+        F: FnOnce(&mut crate::client::ConnectionBuilder),
+    {
         use crate::Status;
 
         // client configuration
@@ -205,6 +223,7 @@ impl TestEnvironment {
         .unwrap();
         let mut server_cert_pem_buf = std::io::Cursor::new(self.server_cert_pem.as_bytes());
         builder.add_root_certs(&mut server_cert_pem_buf).unwrap();
+        configure(&mut builder);
 
         // Connect to the server
         let client_conn = builder.connect().await.unwrap();
@@ -215,6 +234,7 @@ impl TestEnvironment {
         (
             crate::server::Connection::from_quinn(server_conn),
             client_conn,
+            agent_info,
         )
     }
 
