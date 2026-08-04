@@ -947,20 +947,26 @@ pub mod node {
     ///     NodePackageError, NodePackageResponse, PackageIdentity,
     /// };
     ///
-    /// let resp = NodePackageResponse::Failed(
-    ///     NodePackageError::MissingBootstrapMaterial,
-    /// );
-    /// assert!(matches!(
-    ///     resp,
-    ///     NodePackageResponse::Failed(
-    ///         NodePackageError::MissingBootstrapMaterial,
-    ///     ),
-    /// ));
-    /// let _ = PackageIdentity {
-    ///     target: "sensor".into(),
-    ///     version: "1.2.3".into(),
-    ///     commit: "0123456789abcdef".into(),
+    /// let resp = NodePackageResponse::Failed(NodePackageError::TargetMismatch {
+    ///     expected: PackageIdentity {
+    ///         target: "sensor".into(),
+    ///         version: "1.2.3".into(),
+    ///         commit: "0123456789abcdef".into(),
+    ///     },
+    ///     found: PackageIdentity {
+    ///         target: "collector".into(),
+    ///         version: "1.2.3".into(),
+    ///         commit: "0123456789abcdef".into(),
+    ///     },
+    /// });
+    ///
+    /// // A typed failure is classified by matching on it, not by
+    /// // parsing a string.
+    /// let NodePackageResponse::Failed(NodePackageError::TargetMismatch { found, .. }) = &resp
+    /// else {
+    ///     panic!("expected a target mismatch");
     /// };
+    /// assert_eq!(found.target, "collector");
     /// ```
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub enum NodePackageResponse {
