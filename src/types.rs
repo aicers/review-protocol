@@ -342,6 +342,7 @@ pub struct EventMessage {
 pub mod node {
     use std::time::Duration;
 
+    use num_enum::{FromPrimitive, IntoPrimitive};
     use serde::{Deserialize, Serialize};
 
     use super::{Process, ResourceUsage};
@@ -814,6 +815,328 @@ pub mod node {
         Done,
     }
 
+    // ── package management ──────────────────────────────────────
+
+    /// Request for installing, removing, listing or inspecting
+    /// packages on a node.
+    ///
+    /// [`Install`](Self::Install) carries the routing and sizing
+    /// information for a package whose signed `.pkg` bytes follow on
+    /// the same bi-stream.  It deliberately carries neither the
+    /// manifest nor the signature: the single source of trust is the
+    /// manifest and signature *inside* the `.pkg`, and the
+    /// `target`/`version`/`commit` fields exist only to be compared
+    /// against it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use review_protocol::types::node::{FailurePolicy, NodePackageRequest};
+    ///
+    /// let req = NodePackageRequest::Install {
+    ///     target: "sensor".into(),
+    ///     instance: Some(1),
+    ///     version: "1.2.3".into(),
+    ///     commit: "0123456789abcdef".into(),
+    ///     size: 4_194_304,
+    ///     idempotency_key: "b6f0…".into(),
+    ///     bootstrap_material: None,
+    ///     on_failure: FailurePolicy::Rollback,
+    /// };
+    /// assert!(matches!(req, NodePackageRequest::Install { .. }));
+    /// ```
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub enum NodePackageRequest {
+        /// Install or update a package.  The signed `.pkg` bytes
+        /// follow on the same bi-stream; the request carries
+        /// routing, size and — on a first install — the enrollment
+        /// material, but deliberately NOT the manifest or signature.
+        Install {
+            /// The component this package places on the host.
+            target: String,
+            /// Which instance of `target` to place, or `None` when
+            /// the component's class has no instance dimension.
+            /// The number is allocated by the manager; this crate
+            /// carries it and never derives, defaults or validates
+            /// it.
+            instance: Option<u32>,
+            /// The package version, to be compared against the
+            /// in-package manifest.
+            version: String,
+            /// The package build commit, to be compared against the
+            /// in-package manifest.
+            commit: String,
+            /// The size in bytes of the `.pkg` payload that follows.
+            size: u64,
+            /// An opaque key that makes a repeated request a no-op.
+            idempotency_key: String,
+            /// The enrollment material for a first install, or
+            /// `None` when the package already has an identity on
+            /// this host.
+            bootstrap_material: Option<BootstrapMaterial>,
+            /// What the agent does when the apply fails.
+            on_failure: FailurePolicy,
+        },
+        /// Remove one installed instance.
+        Remove {
+            /// The component to remove.
+            target: String,
+            /// Which instance of `target` to remove, or `None` when
+            /// the component's class has no instance dimension.
+            instance: Option<u32>,
+            /// An opaque key that makes a repeated request a no-op.
+            idempotency_key: String,
+        },
+        /// List installed packages and their build ids.
+        ListInstalled,
+        /// Report install/lifecycle state of one installed instance.
+        Status {
+            /// The component to report on.
+            target: String,
+            /// Which instance of `target` to report on, or `None`
+            /// when the component's class has no instance dimension.
+            instance: Option<u32>,
+        },
+    }
+
+    /// What the agent does when an apply fails.
+    #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub enum FailurePolicy {
+        /// Restore the previous installation.
+        Rollback,
+        /// Leave the failed installation in place for inspection.
+        Hold,
+    }
+
+    /// The outcome of the checks an agent runs before it accepts
+    /// package bytes.
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub enum InstallPreflight {
+        /// The agent is ready to receive the package bytes.
+        Proceed,
+        /// The requested package is already installed; nothing to do.
+        AlreadyApplied,
+        /// The target filesystem cannot hold the package.
+        InsufficientDiskSpace {
+            /// The filesystem that is short of space.
+            filesystem: String,
+            /// The space in bytes the install needs.
+            required: u64,
+            /// The space in bytes currently available.
+            available: u64,
+        },
+    }
+
+    /// Response from a package-management operation.
+    ///
+    /// [`Installed`](Self::Installed) answers
+    /// [`NodePackageRequest::ListInstalled`], [`State`](Self::State)
+    /// answers [`NodePackageRequest::Status`], and
+    /// [`Failed`](Self::Failed) carries a typed apply failure.
+    ///
+    /// # Wire compatibility
+    ///
+    /// bincode encodes enum variants by declaration order, so any
+    /// later variant must be **appended** at the end.  Never insert
+    /// a variant in the middle or reorder the existing ones.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use review_protocol::types::node::{
+    ///     NodePackageError, NodePackageResponse, PackageIdentity,
+    /// };
+    ///
+    /// let resp = NodePackageResponse::Failed(
+    ///     NodePackageError::MissingBootstrapMaterial,
+    /// );
+    /// assert!(matches!(
+    ///     resp,
+    ///     NodePackageResponse::Failed(
+    ///         NodePackageError::MissingBootstrapMaterial,
+    ///     ),
+    /// ));
+    /// let _ = PackageIdentity {
+    ///     target: "sensor".into(),
+    ///     version: "1.2.3".into(),
+    ///     commit: "0123456789abcdef".into(),
+    /// };
+    /// ```
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub enum NodePackageResponse {
+        /// The operation completed successfully.
+        Done,
+        /// The agent accepted the request and is applying it.
+        Accepted,
+        /// The packages installed on this host.
+        Installed(Vec<InstalledPackage>),
+        /// The state of the queried instance.
+        State(PackageState),
+        /// A typed apply failure.  Success-shaped on the wire — a
+        /// decode success still means "the agent answered"; the
+        /// `Result<_, String>` channel is left to transport and
+        /// parse failures.
+        Failed(NodePackageError),
+    }
+
+    /// One installed package instance and its state.
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub struct InstalledPackage {
+        /// The installed component.
+        pub target: String,
+        /// Which instance of `target` this is, or `None` when the
+        /// component's class has no instance dimension.
+        pub instance: Option<u32>,
+        /// The state of this instance.
+        pub state: PackageState,
+    }
+
+    /// The install and lifecycle state of one package instance.
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub struct PackageState {
+        /// The installed version.
+        pub version: String,
+        /// The installed build commit.
+        pub commit: String,
+        /// Where the instance is in its lifecycle.
+        pub lifecycle: Lifecycle,
+        /// The addresses the instance is bound to, each named by its
+        /// configuration key.
+        pub bound_addrs: Vec<BoundAddr>,
+    }
+
+    /// An address an instance is bound to, named by the
+    /// configuration key it was read from.
+    ///
+    /// The name is carried alongside the address so that a reader
+    /// matches addresses by name rather than by position.
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub struct BoundAddr {
+        /// The configuration key the address came from.
+        pub name: String,
+        /// The address as configured.
+        pub addr: String,
+    }
+
+    /// Where a package instance is in its lifecycle.
+    ///
+    /// # Wire compatibility
+    ///
+    /// This is encoded as its `u8` discriminant, and a discriminant
+    /// this build does not recognize decodes to
+    /// [`Unknown`](Self::Unknown) rather than failing the decode, so
+    /// a newer agent may report a state an older manager has never
+    /// heard of.
+    ///
+    /// The discriminants are local to this wire.  A consumer
+    /// repository's identically named type is encoded independently
+    /// and the manager maps between the two; no code may read a
+    /// number written on one side as meaning the same on the other.
+    #[derive(
+        Clone, Copy, Debug, Deserialize, Eq, FromPrimitive, IntoPrimitive, PartialEq, Serialize,
+    )]
+    #[serde(from = "u8", into = "u8")]
+    #[repr(u8)]
+    pub enum Lifecycle {
+        /// No installation exists.
+        NotInstalled = 0,
+        /// An install is in progress.
+        Installing = 1,
+        /// The instance is running.
+        Running = 2,
+        /// The instance is installed but not running.
+        Stopped = 3,
+        /// The instance failed.
+        Failed = 4,
+        /// A removal is in progress.
+        Removing = 5,
+        /// The reported discriminant is not one this build knows.
+        #[num_enum(default)]
+        Unknown = u8::MAX,
+    }
+
+    /// The enrollment material a first install needs.
+    ///
+    /// This type is defined once here and shared: the `node.enroll`
+    /// family returns it from its register call and
+    /// [`NodePackageRequest::Install`] relays it.
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub struct BootstrapMaterial {
+        /// The role the wrapped secret authenticates as.
+        pub role_id: String,
+        /// The wrapped one-time secret identifier.
+        pub wrapped_secret_id: String,
+        /// The trust anchor the enrolling package validates against.
+        pub ca_anchor: Vec<u8>,
+        /// The GRANTED absolute deadline of the wrapped secret,
+        /// after the registrar applied any clamp to the requested
+        /// TTL.
+        #[serde(with = "jiff::fmt::serde::timestamp::nanosecond::required")]
+        pub expires_at: jiff::Timestamp,
+    }
+
+    /// The three parts of a package identity, as they appear on this
+    /// wire.
+    ///
+    /// The parts are carried separately and are never composed into
+    /// a single string by this crate.
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub struct PackageIdentity {
+        /// The component name.
+        pub target: String,
+        /// The version.
+        pub version: String,
+        /// The build commit.
+        pub commit: String,
+    }
+
+    /// Typed apply failures, carried by
+    /// [`NodePackageResponse::Failed`].
+    ///
+    /// This is data, not an error type: the manager matches on it
+    /// rather than printing it, so it implements neither
+    /// `std::error::Error` nor `Display`.
+    ///
+    /// # Wire compatibility
+    ///
+    /// bincode encodes enum variants by declaration order, so any
+    /// later variant must be **appended** at the end.  Never insert
+    /// a variant in the middle or reorder the existing ones.
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub enum NodePackageError {
+        /// The in-package manifest's `component`/`version`/`commit`
+        /// disagree with the request's `target`/`version`/`commit`.
+        TargetMismatch {
+            /// The request's identity.
+            expected: PackageIdentity,
+            /// The manifest's identity, with the manifest's
+            /// `component` carried in [`PackageIdentity::target`].
+            found: PackageIdentity,
+        },
+        /// A first install of a package with no existing identity
+        /// arrived with `bootstrap_material: None`.
+        MissingBootstrapMaterial,
+        /// The wrapped credential's TTL lapsed before it was
+        /// consumed.
+        ///
+        /// This is a unit variant on purpose: it means "re-mint and
+        /// resume", and the manager already holds the deadline it
+        /// persisted from [`BootstrapMaterial::expires_at`].  It is
+        /// distinct from a generic enrollment failure — the identity
+        /// is intact and only the wrapped credential lapsed.
+        BootstrapMaterialExpired,
+        /// Raised before the first mutation; not retryable without
+        /// operator action.
+        InsufficientDiskSpace {
+            /// The filesystem that is short of space.
+            filesystem: String,
+            /// The space in bytes the install needs.
+            required: u64,
+            /// The space in bytes currently available.
+            available: u64,
+        },
+    }
+
     #[cfg(all(test, any(feature = "client", feature = "server")))]
     mod tests {
         use std::time::Duration;
@@ -1035,6 +1358,430 @@ pub mod node {
 
             let resp = NodeVersionResponse::Done;
             assert_eq!(resp, roundtrip(&resp));
+        }
+
+        /// Helper: bincode encoding under the crate's configuration.
+        fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+            bincode::serde::encode_to_vec(
+                value,
+                bincode::config::standard().with_fixed_int_encoding(),
+            )
+            .expect("serialization should succeed")
+        }
+
+        /// Helper: decode from raw bytes, returning the bincode error
+        /// so that a test can assert a decode succeeds.
+        fn decode<T: serde::de::DeserializeOwned>(
+            bytes: &[u8],
+        ) -> Result<T, bincode::error::DecodeError> {
+            bincode::serde::decode_from_slice(
+                bytes,
+                bincode::config::standard().with_fixed_int_encoding(),
+            )
+            .map(|(value, _)| value)
+        }
+
+        /// Helper: the enum variant index bincode wrote at the front
+        /// of an encoded enum value.
+        fn variant_index(bytes: &[u8]) -> u32 {
+            let head: [u8; 4] = bytes
+                .get(..4)
+                .expect("an encoded enum starts with a 4-byte variant index")
+                .try_into()
+                .expect("slice of length 4 converts to [u8; 4]");
+            u32::from_le_bytes(head)
+        }
+
+        /// Helper: a `BootstrapMaterial` with a fixed, sub-second
+        /// deadline.
+        fn bootstrap_material() -> BootstrapMaterial {
+            BootstrapMaterial {
+                role_id: "sensor-installer".into(),
+                wrapped_secret_id: "s.9f3c1b".into(),
+                ca_anchor: vec![0x30, 0x82, 0x01, 0x0a],
+                expires_at: "2026-01-02T03:04:05.123456789Z"
+                    .parse()
+                    .expect("literal is a valid timestamp"),
+            }
+        }
+
+        /// Helper: a `PackageState` with the given lifecycle and
+        /// bound addresses.
+        fn package_state(lifecycle: Lifecycle, bound_addrs: Vec<BoundAddr>) -> PackageState {
+            PackageState {
+                version: "1.2.3".into(),
+                commit: "0123456789abcdef".into(),
+                lifecycle,
+                bound_addrs,
+            }
+        }
+
+        #[test]
+        fn serde_roundtrip_node_package_request() {
+            for instance in [None, Some(7)] {
+                for material in [None, Some(bootstrap_material())] {
+                    for on_failure in [FailurePolicy::Rollback, FailurePolicy::Hold] {
+                        let req = NodePackageRequest::Install {
+                            target: "sensor".into(),
+                            instance,
+                            version: "1.2.3".into(),
+                            commit: "0123456789abcdef".into(),
+                            size: 4_194_304,
+                            idempotency_key: "b6f0".into(),
+                            bootstrap_material: material.clone(),
+                            on_failure,
+                        };
+                        assert_eq!(req, roundtrip(&req));
+                    }
+                }
+
+                let req = NodePackageRequest::Remove {
+                    target: "sensor".into(),
+                    instance,
+                    idempotency_key: "b6f0".into(),
+                };
+                assert_eq!(req, roundtrip(&req));
+
+                let req = NodePackageRequest::Status {
+                    target: "sensor".into(),
+                    instance,
+                };
+                assert_eq!(req, roundtrip(&req));
+            }
+
+            let req = NodePackageRequest::ListInstalled;
+            assert_eq!(req, roundtrip(&req));
+        }
+
+        /// Widening the accepted instance range later needs no wire
+        /// change: distinct instances differ only in payload.
+        #[test]
+        fn node_package_install_instance_is_payload_only() {
+            let install = |instance| NodePackageRequest::Install {
+                target: "sensor".into(),
+                instance: Some(instance),
+                version: "1.2.3".into(),
+                commit: "0123456789abcdef".into(),
+                size: 4_194_304,
+                idempotency_key: "b6f0".into(),
+                bootstrap_material: None,
+                on_failure: FailurePolicy::Rollback,
+            };
+
+            let one = install(1);
+            let two = install(2);
+            assert_eq!(one, roundtrip(&one));
+            assert_eq!(two, roundtrip(&two));
+
+            let (encoded_one, encoded_two) = (encode(&one), encode(&two));
+            assert_eq!(
+                encoded_one.len(),
+                encoded_two.len(),
+                "instance value must not change the encoded shape"
+            );
+            assert_ne!(encoded_one, encoded_two);
+        }
+
+        #[test]
+        fn serde_roundtrip_install_preflight() {
+            let preflight = InstallPreflight::Proceed;
+            assert_eq!(preflight, roundtrip(&preflight));
+
+            let preflight = InstallPreflight::AlreadyApplied;
+            assert_eq!(preflight, roundtrip(&preflight));
+
+            let preflight = InstallPreflight::InsufficientDiskSpace {
+                filesystem: "/var".into(),
+                required: 8_388_608,
+                available: 1_048_576,
+            };
+            assert_eq!(preflight, roundtrip(&preflight));
+        }
+
+        #[test]
+        fn serde_roundtrip_node_package_response() {
+            let resp = NodePackageResponse::Done;
+            assert_eq!(resp, roundtrip(&resp));
+
+            let resp = NodePackageResponse::Accepted;
+            assert_eq!(resp, roundtrip(&resp));
+
+            let resp = NodePackageResponse::Installed(vec![InstalledPackage {
+                target: "sensor".into(),
+                instance: Some(1),
+                state: package_state(
+                    Lifecycle::Running,
+                    vec![BoundAddr {
+                        name: "ingest_address".into(),
+                        addr: "0.0.0.0:38370".into(),
+                    }],
+                ),
+            }]);
+            assert_eq!(resp, roundtrip(&resp));
+
+            let resp = NodePackageResponse::Installed(Vec::new());
+            assert_eq!(resp, roundtrip(&resp));
+
+            let resp = NodePackageResponse::State(package_state(Lifecycle::Stopped, Vec::new()));
+            assert_eq!(resp, roundtrip(&resp));
+
+            let resp = NodePackageResponse::Failed(NodePackageError::MissingBootstrapMaterial);
+            assert_eq!(resp, roundtrip(&resp));
+        }
+
+        #[test]
+        fn serde_roundtrip_node_package_payload_types() {
+            let addr = BoundAddr {
+                name: "ingest_address".into(),
+                addr: "0.0.0.0:38370".into(),
+            };
+            assert_eq!(addr, roundtrip(&addr));
+
+            // `bound_addrs` survives both empty and populated.
+            let state = package_state(Lifecycle::Running, Vec::new());
+            assert_eq!(state, roundtrip(&state));
+
+            let state = package_state(
+                Lifecycle::Running,
+                vec![
+                    addr.clone(),
+                    BoundAddr {
+                        name: "publish_address".into(),
+                        addr: "0.0.0.0:38371".into(),
+                    },
+                ],
+            );
+            let decoded = roundtrip(&state);
+            assert_eq!(state, decoded);
+            assert_eq!(
+                decoded
+                    .bound_addrs
+                    .iter()
+                    .find(|a| a.name == "publish_address")
+                    .map(|a| a.addr.as_str()),
+                Some("0.0.0.0:38371"),
+                "an address is found by name, not by position"
+            );
+
+            let installed = InstalledPackage {
+                target: "sensor".into(),
+                instance: None,
+                state,
+            };
+            assert_eq!(installed, roundtrip(&installed));
+
+            let material = bootstrap_material();
+            assert_eq!(material, roundtrip(&material));
+
+            let identity = PackageIdentity {
+                target: "sensor".into(),
+                version: "1.2.3".into(),
+                commit: "0123456789abcdef".into(),
+            };
+            assert_eq!(identity, roundtrip(&identity));
+        }
+
+        /// `expires_at` keeps nanosecond precision across the wire.
+        #[test]
+        fn bootstrap_material_subsecond_precision_survives() {
+            let material = bootstrap_material();
+            let decoded = roundtrip(&material);
+            assert_eq!(material, decoded);
+            assert_eq!(
+                decoded.expires_at.as_nanosecond(),
+                material.expires_at.as_nanosecond()
+            );
+            assert_eq!(decoded.expires_at.subsec_nanosecond(), 123_456_789);
+        }
+
+        #[test]
+        fn serde_roundtrip_node_package_error() {
+            let identities = || {
+                (
+                    PackageIdentity {
+                        target: "sensor".into(),
+                        version: "1.2.3".into(),
+                        commit: "0123456789abcdef".into(),
+                    },
+                    PackageIdentity {
+                        target: "collector".into(),
+                        version: "9.8.7".into(),
+                        commit: "fedcba9876543210".into(),
+                    },
+                )
+            };
+            let (expected, found) = identities();
+            let err = NodePackageError::TargetMismatch { expected, found };
+            assert_eq!(err, roundtrip(&err));
+
+            let err = NodePackageError::MissingBootstrapMaterial;
+            assert_eq!(err, roundtrip(&err));
+
+            let err = NodePackageError::BootstrapMaterialExpired;
+            assert_eq!(err, roundtrip(&err));
+
+            let err = NodePackageError::InsufficientDiskSpace {
+                filesystem: "/var".into(),
+                required: 8_388_608,
+                available: 1_048_576,
+            };
+            assert_eq!(err, roundtrip(&err));
+        }
+
+        /// A typed failure is reached through a *successful* decode,
+        /// and the two identities of a `TargetMismatch` survive
+        /// independently and unswapped.
+        #[test]
+        fn node_package_failed_carries_distinguishable_errors() {
+            let (expected, found) = (
+                PackageIdentity {
+                    target: "sensor".into(),
+                    version: "1.2.3".into(),
+                    commit: "0123456789abcdef".into(),
+                },
+                PackageIdentity {
+                    target: "collector".into(),
+                    version: "9.8.7".into(),
+                    commit: "fedcba9876543210".into(),
+                },
+            );
+            let resp = NodePackageResponse::Failed(NodePackageError::TargetMismatch {
+                expected: expected.clone(),
+                found: found.clone(),
+            });
+            let decoded = roundtrip(&resp);
+            assert_eq!(resp, decoded);
+
+            let NodePackageResponse::Failed(NodePackageError::TargetMismatch {
+                expected: decoded_expected,
+                found: decoded_found,
+            }) = decoded
+            else {
+                panic!("expected a TargetMismatch failure");
+            };
+            assert_eq!(decoded_expected, expected);
+            assert_eq!(decoded_found, found);
+            assert_ne!(decoded_expected, decoded_found);
+
+            let disk = NodePackageResponse::Failed(NodePackageError::InsufficientDiskSpace {
+                filesystem: "/var".into(),
+                required: 8_388_608,
+                available: 1_048_576,
+            });
+            let decoded_disk = roundtrip(&disk);
+            assert!(matches!(
+                decoded_disk,
+                NodePackageResponse::Failed(NodePackageError::InsufficientDiskSpace { .. })
+            ));
+            assert!(!matches!(
+                decoded_disk,
+                NodePackageResponse::Failed(NodePackageError::TargetMismatch { .. })
+            ));
+
+            for err in [
+                NodePackageError::MissingBootstrapMaterial,
+                NodePackageError::BootstrapMaterialExpired,
+            ] {
+                let resp = NodePackageResponse::Failed(err.clone());
+                assert_eq!(roundtrip(&resp), NodePackageResponse::Failed(err));
+            }
+        }
+
+        /// Declaration order is the wire order: a later insertion,
+        /// rather than an append, breaks this test.
+        #[test]
+        fn node_package_response_variant_order_is_pinned() {
+            assert_eq!(variant_index(&encode(&NodePackageResponse::Done)), 0);
+            assert_eq!(variant_index(&encode(&NodePackageResponse::Accepted)), 1);
+            assert_eq!(
+                variant_index(&encode(&NodePackageResponse::Installed(Vec::new()))),
+                2
+            );
+            assert_eq!(
+                variant_index(&encode(&NodePackageResponse::State(package_state(
+                    Lifecycle::Running,
+                    Vec::new()
+                )))),
+                3
+            );
+            assert_eq!(
+                variant_index(&encode(&NodePackageResponse::Failed(
+                    NodePackageError::MissingBootstrapMaterial
+                ))),
+                4
+            );
+        }
+
+        /// Declaration order is the wire order: a later insertion,
+        /// rather than an append, breaks this test.
+        #[test]
+        fn node_package_error_variant_order_is_pinned() {
+            let identity = || PackageIdentity {
+                target: "sensor".into(),
+                version: "1.2.3".into(),
+                commit: "0123456789abcdef".into(),
+            };
+            assert_eq!(
+                variant_index(&encode(&NodePackageError::TargetMismatch {
+                    expected: identity(),
+                    found: identity(),
+                })),
+                0
+            );
+            assert_eq!(
+                variant_index(&encode(&NodePackageError::MissingBootstrapMaterial)),
+                1
+            );
+            assert_eq!(
+                variant_index(&encode(&NodePackageError::BootstrapMaterialExpired)),
+                2
+            );
+            assert_eq!(
+                variant_index(&encode(&NodePackageError::InsufficientDiskSpace {
+                    filesystem: "/var".into(),
+                    required: 8_388_608,
+                    available: 1_048_576,
+                })),
+                3
+            );
+        }
+
+        /// `Lifecycle` rides the wire as its `u8` discriminant, and a
+        /// discriminant this build does not know decodes to
+        /// `Unknown` instead of failing.
+        #[test]
+        fn lifecycle_encodes_discriminant_and_tolerates_unknown() {
+            for (lifecycle, discriminant) in [
+                (Lifecycle::NotInstalled, 0u8),
+                (Lifecycle::Installing, 1),
+                (Lifecycle::Running, 2),
+                (Lifecycle::Stopped, 3),
+                (Lifecycle::Failed, 4),
+                (Lifecycle::Removing, 5),
+                (Lifecycle::Unknown, u8::MAX),
+            ] {
+                assert_eq!(encode(&lifecycle), vec![discriminant]);
+                assert_eq!(lifecycle, roundtrip(&lifecycle));
+            }
+
+            let decoded: Lifecycle =
+                decode(&[200]).expect("an unrecognized discriminant must still decode");
+            assert_eq!(decoded, Lifecycle::Unknown);
+
+            // The fallback survives inside an enclosing payload too.
+            // `lifecycle` is the single byte preceding the empty
+            // `bound_addrs`, whose length prefix is a fixed 8 bytes.
+            let mut bytes = encode(&package_state(Lifecycle::Running, Vec::new()));
+            let position = bytes.len() - 9;
+            assert_eq!(
+                bytes.get(position),
+                Some(&2),
+                "the lifecycle discriminant should sit just before the bound_addrs length"
+            );
+            bytes[position] = 200;
+            let decoded: PackageState =
+                decode(&bytes).expect("an unrecognized discriminant must still decode");
+            assert_eq!(decoded.lifecycle, Lifecycle::Unknown);
         }
     }
 }
