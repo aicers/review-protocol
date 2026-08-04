@@ -1067,8 +1067,8 @@ pub mod node {
     /// family returns it from its register call and
     /// [`NodePackageRequest::Install`] relays it.
     ///
-    /// `Debug` is hand-written and prints `wrapped_secret_id` as
-    /// `<redacted>`; see the implementation below.
+    /// [`Debug`] is hand-written rather than derived, so that
+    /// `wrapped_secret_id` cannot reach a log through it.
     #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
     pub struct BootstrapMaterial {
         /// The role the wrapped secret authenticates as.
