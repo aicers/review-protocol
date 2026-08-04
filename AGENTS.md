@@ -1,0 +1,343 @@
+# Instructions for AI coding agents
+
+The marked regions below are generated from
+[aicers/agent-instructions](https://github.com/aicers/agent-instructions).
+Do not edit them here — change the wording upstream, tag a release, and
+re-run its sync. The drift check in CI fails if this copy diverges.
+
+<!-- BEGIN shared:workflow v1 -->
+## Language
+
+- Code, comments, commit messages, PR descriptions, and issues are written
+  in English.
+
+## Commit messages
+
+- Title: preferably under 50 characters, start with an imperative verb
+  (e.g., `Add`, `Fix`, `Remove`).
+- Do NOT use prefixes such as `feat:`, `chore:`, or `fix:`.
+- Do NOT put issue or PR numbers in the title.
+- Body: wrap at 72 characters, free-form, explain *why* not *what*.
+- Separate title and body with a blank line.
+- Reference issues in the body, not the title: `Closes #N` to close an
+  issue, or `Part of #N` when the commit addresses part of one.
+
+## Branching and pushing
+
+- NEVER push directly to `main`. Always create a new branch before
+  pushing.
+- Branch names must follow the format `<github-username>/issue-#` (e.g.,
+  `alice/issue-42`). If there is no related issue, ask the user how to
+  proceed before creating the branch.
+- The sole exception is a branch carrying a synced update to the shared
+  blocks below, which uses `<github-username>/instructions-<label>` and
+  needs no issue.
+
+## GitHub issues and PRs
+
+- Do NOT hard-wrap lines in issue or PR body text. GitHub renders
+  Markdown, so manual line breaks hurt readability. (This applies to the
+  body text only — commit messages still wrap at 72.)
+- Issues and PRs share ONE number namespace, so `gh issue edit N` and
+  `gh issue view N` can silently operate on PR #N when N is a PR. Before
+  ANY `gh` write (edit, close, comment), confirm the target's type and
+  identity with a read first: `gh issue view N --json
+  number,title,state,url`, and check `/pull/` vs `/issues/` in the URL.
+- Never act on failed or garbled command output. Re-verify every create
+  and edit with a structured `--json` re-query before reporting success.
+
+## Attribution
+
+- Do NOT add `Co-Authored-By` lines naming an AI (`Claude`, `Codex`,
+  `Gemini`, or any similar name) to commit messages.
+- Do NOT add "Generated with Claude Code", "Generated with Codex",
+  "Generated with Gemini", or any similar AI attribution to PR
+  descriptions or issue comments.
+<!-- END shared:workflow -->
+
+<!-- BEGIN shared:rust v1 -->
+## Coding standards (Rust)
+
+### Errors and panics
+
+- **Error types**: Use `anyhow::Result` for application code and
+  `thiserror` for library code — that is, use `thiserror` when a caller
+  needs to match on the error kind, `anyhow` otherwise.
+- **Context**: Attach context to every fallible call that crosses a
+  meaningful boundary: `.with_context(|| format!("reading config from
+  {path}"))`. State what was being attempted and on which concrete target
+  (path, host, service name). Start lowercase, no trailing period, and do
+  not repeat what an outer layer will already say.
+- **No `unwrap()`**: Do not use `unwrap()` in production code. Usage in
+  tests is permitted.
+- **`expect("reason")`**: Use when you are certain a panic will NOT occur.
+  The message must explain *why* the condition is invariant. Never
+  `expect()` on a value derived from network input, file contents, or
+  configuration — those are recoverable errors, not invariants.
+- **`panic!("reason")`**: Use when you intentionally need to crash the
+  program to alert the user of a critical, unrecoverable state.
+- **Indexed access**: Prefer methods that return `Option`/`Result`
+  (`.get()`, `.first()`, `.next()`) over `[]` on `&[T]`, `Vec<T>`, and
+  arrays. Indexing is acceptable only when the bound is established
+  immediately above the access and is locally obvious to a reader.
+  Indexing a `HashMap`/`BTreeMap` with `[]` is never acceptable.
+
+### Types and conversions
+
+- **Prefer `enum` over `String`** whenever a finite set of values is
+  expected.
+- **Type casting (`as`)**:
+  - Use `as` only when the conversion is provably lossless (e.g. widening
+    `u32` to `u64`).
+  - **Integer to integer**: use `TryFrom`/`try_into()` and propagate the
+    `TryFromIntError`.
+  - **Float to integer**: `TryFrom` does not exist for this direction,
+    and `as` silently *saturates* (and maps `NaN` to 0). Check that the
+    value is finite and in range before converting, or, in a crate that
+    already depends on `num-traits`, use `ToPrimitive` (`to_u32()`,
+    `to_i64()`, ...) and handle the `None`. Adding `num-traits` for
+    this alone is subject to the dependency rule below — an explicit
+    range check needs nothing.
+  - `num-traits` is also the right tool for code generic over numeric
+    types. Integer/enum conversion derives come from `num-derive`, a
+    separate proc-macro crate.
+
+### Ownership and performance
+
+- **Minimizing `clone`**: Avoid unnecessary `clone()` or similar methods
+  (e.g., `to_string()`, `to_owned()`). Performance-critical code must not
+  harbour hidden copies.
+  - **Prefer references and slices**: Use `&str` over `String` and `&[T]`
+    over `Vec<T>` for function parameters and struct field getters. This
+    avoids copies and increases compatibility via deref coercion.
+  - **Defer cloning**: When cloning is unavoidable, call it at the latest
+    possible stage to minimise the scope of copied data and to make the
+    necessity visible.
+  - **Use clone-avoiding idioms**: Prefer `Iterator::cloned()`,
+    `Option::cloned()`, and `Option::as_deref()` over explicit
+    `.map(Clone::clone)` or manual unwrap-and-clone patterns.
+- **Sorting**: Prefer `sort_unstable`, `sort_unstable_by`, and
+  `sort_unstable_by_key` over their stable counterparts. The unstable
+  variants are faster and allocate no extra memory. Use stable `sort` only
+  when equal elements must preserve their original relative order, and
+  `sort_by_cached_key` when the key is expensive to compute.
+
+### Async
+
+- Use the `tokio` runtime. Avoid blocking operations in async contexts.
+- **No orphan tasks**: Do not discard the `JoinHandle` returned by
+  `tokio::spawn`. Hold it, or use a `JoinSet`, and cancel outstanding
+  tasks on shutdown. A dropped handle turns a task failure into silence.
+- **No locks across `.await`**: Never hold a `std::sync::Mutex`/`RwLock`
+  guard across an `.await` point (`clippy::await_holding_lock`). Use
+  `tokio::sync` primitives, or scope the guard so it is dropped first.
+- **Cancellation safety**: Every branch of `tokio::select!` must be
+  cancel-safe. Where a future is not, spawning it and selecting on the
+  handle is not by itself the fix: a losing branch drops the handle,
+  the task detaches, and it keeps running unobserved — exactly the
+  orphan the rule above forbids. Spawn it once into a `JoinSet` or a
+  field the loop owns, select on that, and join or abort it at
+  shutdown.
+
+### `unsafe`
+
+- Do not introduce new `unsafe`. If FFI or a platform call makes it
+  unavoidable, keep the block as small as possible and precede it with a
+  `// SAFETY:` comment stating the invariant that makes it sound.
+- Note that in edition 2024 `std::env::set_var`/`remove_var` are `unsafe`;
+  the `SAFETY` comment must justify why no other thread can be reading the
+  environment at that point.
+
+### Files and I/O
+
+- **Atomic writes**: Write state, config, and other files that another
+  process may read atomically — write to a temporary file in the same
+  directory, then `fs::rename`. Never truncate-and-write in place.
+- **Restrictive permissions at creation**: Create files that hold secrets
+  with their final mode at open time
+  (`OpenOptions::new().mode(0o600)`), not by calling `set_permissions`
+  after writing — the latter leaves a window in which the file is
+  world-readable.
+
+### Output and logging
+
+- Reserve `stdout` for output the user asked for. All diagnostics,
+  progress, and debugging go through `tracing`.
+
+### Secrets
+
+- Do not carry a secret (token, password, private key material) as a
+  bare `String`. Wrap it in a newtype whose hand-written `Debug` prints
+  `<redacted>`, so a `#[derive(Debug)]` on an enclosing struct cannot
+  leak it.
+- Never interpolate a secret into a `tracing` event, an error message,
+  or a `Display` implementation.
+- A secret read from a file or an environment variable is still a
+  secret. Wrap it at the boundary where it enters the program, not
+  wherever it is eventually used.
+
+### Visibility, imports, and modules
+
+- **Visibility**: Expose the minimum necessary scope.
+  - Prefer `pub(super)` or `pub(crate)` over `pub`. Use `pub` only for
+    library public APIs exported from `lib.rs`.
+  - When adding a new item, start with the most restrictive visibility and
+    widen only when a compiler error or an explicit design decision
+    requires it.
+- **Imports**: Do NOT use wildcard imports (`use module::*`). The only
+  exception is `use super::*` inside `#[cfg(test)]` test modules.
+- **Module files**: Prefer `module_name.rs` over `module_name/mod.rs`. Use
+  the named sibling file style introduced in Rust 2018.
+
+### Constants and comments
+
+- Use `const` for fixed values instead of "magic strings/numbers".
+- Define constants at the top of the file. A `const` used by exactly one
+  function may live inside that function.
+- Keep test-only constants near the tests for readability.
+- Delete redundant or "noisy" comments that just describe code syntax.
+
+### Documentation (rustdoc)
+
+- Every public item opens its doc comment with one concise summary
+  sentence. For functions that sentence starts with a verb in the
+  **third-person singular** ("Creates...", "Returns...",
+  "Calculates..."); types, traits, modules, and constants take a noun
+  phrase instead ("A connection pool that...").
+- Every public function returning `Result` needs an `# Errors` section,
+  and every one that can panic needs a `# Panics` section, describing the
+  conditions rather than restating the type.
+- Mark functions whose return value is the entire point with `#[must_use]`.
+
+### Dependencies
+
+- Adding a dependency requires a stated reason. Prefer the standard
+  library, then an existing dependency of the crate, before adding a new
+  one.
+- Do not add a dependency for functionality that a crate already in
+  `Cargo.toml` provides.
+
+### Testing
+
+- Use `tempfile::tempdir()` for tests that need temporary files or
+  directories. Never write to fixed paths.
+- When tests manipulate environment variables (`env::set_var`), protect
+  them with a shared `Mutex` lock so that parallel test threads do not
+  interfere with each other.
+- Do not synchronise with `sleep`. Await the condition, or use
+  `tokio::time` pause/advance with the `test-util` feature.
+- Do not hard-code port numbers; bind port 0 and read back the assigned
+  address.
+- Tests must not reach the network. Use a local mock server.
+
+### Linting and formatting
+
+- **Linting**: Code MUST pass `cargo clippy` with `-D warnings`, over
+  every target and every feature configuration the crate supports. The
+  repository-specific section below names the exact invocations; they
+  must match what CI runs.
+  - `--all-targets` covers lib, bins, tests, benches, and examples. It
+    does NOT touch features — with it alone, code behind a non-default
+    feature is never linted at all.
+  - `--all-features` is correct only when every feature can be on at
+    once. Where a crate has mutually exclusive features, that
+    combination does not compile; lint each configuration separately
+    with `--no-default-features --features <name>`.
+- **Formatting**: Code MUST be formatted with `rustfmt`. `group_imports`
+  is still nightly-gated, so it cannot live in `rustfmt.toml` — pass it on
+  the command line, exactly as CI does:
+
+  ```sh
+  cargo fmt -- --config group_imports=StdExternalCrate
+  ```
+
+  Plain `cargo fmt`, including editor format-on-save, will NOT group
+  imports and will produce a result CI rejects.
+- **`#[allow(...)]`**:
+  - Avoid `#[allow(...)]` as much as possible.
+  - If `allow` is necessary, you MUST add a comment explaining why.
+  - Exceptions: `clippy::too_many_lines` can be treated loosely.
+<!-- END shared:rust -->
+
+<!-- BEGIN shared:rust-tls v1 -->
+### TLS
+
+- Certificate and hostname verification is never disabled to get a
+  handshake working. If a handshake fails, fix the trust chain, the SANs,
+  or the clock — do not reach for an escape hatch.
+- `rustls`'s `dangerous()` accessors and any hand-written
+  `ServerCertVerifier`/`ClientCertVerifier` live in one dedicated module
+  per crate, named in the repository-specific section below. Do not
+  introduce them anywhere else, and do not add a new verifier without an
+  explicit design decision recorded in the pull request.
+- Never widen a verifier to accept a certificate it would otherwise
+  reject as a temporary measure. There is no such thing as a temporary
+  measure here.
+<!-- END shared:rust-tls -->
+
+<!-- BEGIN shared:changelog v1 -->
+## Changelog
+
+- `CHANGELOG.md` records what changed for a user of the **last release**,
+  not how `main` got there. Before writing an entry, ask whether someone
+  running the last released version could observe it. Work that builds,
+  reworks, or removes something they never had is invisible to them and
+  does not belong.
+- Entries carry NO issue or PR references. `Closes #N` and `Part of #N`
+  are GitHub automation keywords: they close an issue when they appear
+  in a commit message or a pull request body, and do nothing whatever
+  inside `CHANGELOG.md`. All that is left there is a command addressed
+  to a bot, stranded in a record of what already shipped — it cannot
+  act, and the reader has no use for it. Git and the issue tracker
+  already hold that history.
+- Announce a feature once, under `### Added`, describing what it does.
+  If it was reworked or renamed before the release shipped, that is not
+  a separate `### Changed` entry — no user saw the earlier form.
+<!-- END shared:changelog -->
+
+## This crate
+
+- `review-protocol` is a library. There are no binaries, so `pub` on an
+  item re-exported from `lib.rs` is the public API and is deliberate;
+  everything else starts at `pub(crate)`.
+- Errors are `thiserror`, and callers match on the variants. `anyhow` is
+  a dependency of the `server` feature only — do not reach for it in
+  code that builds without that feature.
+- No custom certificate verifier exists here. The TLS rule above is what
+  keeps it that way: this crate carries QUIC with client certificates,
+  where the tempting fix for a failing handshake is the one that must
+  never be taken.
+
+## Features
+
+`client`, `server`, `tokio`, `test-support`, and `rcgen`. They are not
+mutually exclusive — `test-support` deliberately enables both `client`
+and `server` — so `--all-features` builds and is one of the
+configurations CI checks.
+
+Code behind a feature must compile and lint in every configuration that
+enables it, not only under `--all-features`.
+
+## CI requirements
+
+Before pushing, run what `check` runs, in full:
+
+```sh
+cargo fmt -- --check --config group_imports=StdExternalCrate
+cargo clippy --tests -- -D warnings
+cargo clippy --tests --features client -- -D warnings
+cargo clippy --tests --features server -- -D warnings
+cargo clippy --tests --all-features -- -D warnings
+```
+
+Four clippy runs, not one: `--all-features` alone would miss code that
+only compiles in a narrower configuration.
+
+`test` runs `cargo build` and `cargo test` over the same four feature
+sets on both `ubuntu-latest` and `macOS-latest`.
+
+`CI Gate` is the required status check, not the individual jobs. A
+documentation-only change skips the Rust jobs but still runs `Markdown`
+and `Instructions` — the latter because `AGENTS.md` is itself Markdown,
+so a docs-only change is exactly the one that can edit a generated
+region.

@@ -127,6 +127,18 @@ jobs:
           # is the only check it gets.
           globs: "**/*.md"
 
+  # Ungated, like `markdown`, and for the same reason: AGENTS.md is itself
+  # Markdown, so a documentation-only change is exactly the change that can
+  # edit a generated region. Pinned to a release tag rather than a branch —
+  # comparing against a moving branch would turn every upstream edit into a
+  # red build here, on pull requests that have nothing to do with it.
+  instructions:
+    name: Instructions
+    uses: aicers/agent-instructions/.github/workflows/check-drift.yml@main
+    with:
+      blocks: "workflow rust rust-tls changelog"
+      instructions-ref: v1
+
   check:
     runs-on: ubuntu-latest
     needs: changes
@@ -194,7 +206,7 @@ jobs:
   gate:
     name: CI Gate
     runs-on: ubuntu-latest
-    needs: [changes, markdown, check, test, coverage]
+    needs: [changes, markdown, instructions, check, test, coverage]
     if: ${{ always() }}
     steps:
       # A filter that errored is a defect, not a tolerable outcome. The gated
