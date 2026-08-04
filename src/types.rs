@@ -340,7 +340,7 @@ pub struct EventMessage {
 /// serialization encoding are **not** part of the public contract and
 /// may change without notice.
 pub mod node {
-    use std::time::Duration;
+    use std::{fmt, time::Duration};
 
     use num_enum::{FromPrimitive, IntoPrimitive};
     use serde::{Deserialize, Serialize};
@@ -1060,11 +1060,17 @@ pub mod node {
     /// This type is defined once here and shared: the `node.enroll`
     /// family returns it from its register call and
     /// [`NodePackageRequest::Install`] relays it.
-    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    ///
+    /// `Debug` is hand-written and prints `wrapped_secret_id` as
+    /// `<redacted>`; see the implementation below.
+    #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
     pub struct BootstrapMaterial {
         /// The role the wrapped secret authenticates as.
         pub role_id: String,
         /// The wrapped one-time secret identifier.
+        ///
+        /// This is a live one-time credential; it is redacted from
+        /// the [`Debug`] output and must not be logged.
         pub wrapped_secret_id: String,
         /// The trust anchor the enrolling package validates against.
         pub ca_anchor: Vec<u8>,
@@ -1073,6 +1079,21 @@ pub mod node {
         /// TTL.
         #[serde(with = "jiff::fmt::serde::timestamp::nanosecond::required")]
         pub expires_at: jiff::Timestamp,
+    }
+
+    /// `wrapped_secret_id` is a live one-time credential, so it is
+    /// redacted rather than derived: `BootstrapMaterial` travels
+    /// inside [`NodePackageRequest::Install`], whose derived `Debug`
+    /// would otherwise print the secret into a caller's logs.
+    impl fmt::Debug for BootstrapMaterial {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BootstrapMaterial")
+                .field("role_id", &self.role_id)
+                .field("wrapped_secret_id", &"<redacted>")
+                .field("ca_anchor", &self.ca_anchor)
+                .field("expires_at", &self.expires_at)
+                .finish()
+        }
     }
 
     /// The three parts of a package identity, as they appear on this
@@ -1592,6 +1613,31 @@ pub mod node {
                 material.expires_at.as_nanosecond()
             );
             assert_eq!(decoded.expires_at.subsec_nanosecond(), 123_456_789);
+        }
+
+        /// The wrapped credential never reaches a log through a
+        /// `Debug` of the material or of the request carrying it.
+        #[test]
+        fn bootstrap_material_debug_redacts_the_wrapped_secret() {
+            let material = bootstrap_material();
+            let rendered = format!("{material:?}");
+            assert!(!rendered.contains("s.9f3c1b"), "{rendered}");
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+            assert!(rendered.contains("sensor-installer"), "{rendered}");
+
+            let req = NodePackageRequest::Install {
+                target: "sensor".into(),
+                instance: Some(1),
+                version: "1.2.3".into(),
+                commit: "0123456789abcdef".into(),
+                size: 4_194_304,
+                idempotency_key: "b6f0".into(),
+                bootstrap_material: Some(material),
+                on_failure: FailurePolicy::Rollback,
+            };
+            let rendered = format!("{req:?}");
+            assert!(!rendered.contains("s.9f3c1b"), "{rendered}");
+            assert!(rendered.contains("<redacted>"), "{rendered}");
         }
 
         #[test]

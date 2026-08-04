@@ -1229,5 +1229,6 @@ mod tests {
         assert!(!NodeLoggingRequest::Get.service_id().is_family());
         assert!(!NodeRemoteAccessRequest::Get.service_id().is_family());
         assert!(!NodeVersionRequest::Get.service_id().is_family());
+        assert!(!NodePackageRequest::ListInstalled.service_id().is_family());
     }
 }

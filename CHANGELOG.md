@@ -33,7 +33,9 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   `Lifecycle::Unknown`, so a newer agent can report a state an older reader
   has never heard of. Apply failures are carried by
   `NodePackageResponse::Failed` as structured data rather than through the
-  string error channel, so a caller classifies them by pattern-matching. The
+  string error channel, so a caller classifies them by pattern-matching.
+  `BootstrapMaterial` redacts its wrapped one-time credential from its
+  `Debug` output, so logging a request that relays it cannot leak it. The
   request family is not dispatched yet: an agent answers a `node.package`
   request as an unknown request code.
 
