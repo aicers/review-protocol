@@ -22,6 +22,22 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   `server.customer_data_deletion.report` service identifier (request code 40),
   the typed `Connection::report_customer_data_deletion` client API, and the
   `Handler::report_customer_data_deletion` server hook.
+- Added the `node.package` wire vocabulary: the `NodePackageRequest`,
+  `NodePackageResponse`, `NodePackageError`, `InstallPreflight`,
+  `InstalledPackage`, `PackageState`, `PackageIdentity`, `BoundAddr`,
+  `BootstrapMaterial`, `Lifecycle` and `FailurePolicy` types in
+  `types::node`, together with the `node.package`, `node.package.install`,
+  `node.package.remove`, `node.package.list` and `node.package.status`
+  service identifiers and `NodePackageRequest::service_id()`. `Lifecycle`
+  travels as its `u8` discriminant and decodes an unrecognized value to
+  `Lifecycle::Unknown`, so a newer agent can report a state an older reader
+  has never heard of. Apply failures are carried by
+  `NodePackageResponse::Failed` as structured data rather than through the
+  string error channel, so a caller classifies them by pattern-matching.
+  `BootstrapMaterial` redacts its wrapped one-time credential from its
+  `Debug` output, so logging a request that relays it cannot leak it. The
+  request family is not dispatched yet: an agent answers a `node.package`
+  request as an unknown request code.
 
 ### Changed
 

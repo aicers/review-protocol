@@ -1035,7 +1035,12 @@ pub async fn handle<H: Handler>(
                     .map_err(HandlerError::SendError)?;
             }
 
-            RequestCode::Unknown => {
+            // `NodePackage` shares the unknown-code answer on
+            // purpose: the family is declared but not yet served, so
+            // it must not hang or panic here. The handler trait
+            // method and the real dispatch land in the companion
+            // dispatch issue, which gives it an arm of its own.
+            RequestCode::NodePackage | RequestCode::Unknown => {
                 let err_msg = format!("unknown request code: {code}");
                 oinq::message::send_err(send, &mut buf, err_msg)
                     .await
@@ -1077,6 +1082,7 @@ mod tests {
             (RequestCode::NodePower, 106),
             (RequestCode::NodeObservation, 107),
             (RequestCode::NodeVersion, 108),
+            (RequestCode::NodePackage, 109),
         ];
         for &(code, num) in cases {
             assert_eq!(u32::from(code), num);
@@ -1092,7 +1098,13 @@ mod tests {
         // start at 100. Verify that the gap maps to Unknown.
         assert_eq!(RequestCode::from_primitive(50), RequestCode::Unknown);
         assert_eq!(RequestCode::from_primitive(99), RequestCode::Unknown);
-        assert_eq!(RequestCode::from_primitive(109), RequestCode::Unknown);
+        assert_eq!(
+            RequestCode::from_primitive(109),
+            RequestCode::NodePackage,
+            "109 is now assigned to the node.package family"
+        );
+        // The first value past the assigned node codes.
+        assert_eq!(RequestCode::from_primitive(110), RequestCode::Unknown);
     }
 
     #[cfg(feature = "server")]
@@ -2538,6 +2550,87 @@ mod tests {
             res.unwrap_err().contains("unknown request code"),
             "non-node code should be rejected"
         );
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// `handle` answers the not-yet-served `node.package` family as
+    /// an unknown code.
+    ///
+    /// This pins the interim state: code 109 is declared but routes
+    /// nowhere, so neither entry point may hang or panic. The
+    /// companion dispatch issue replaces this expectation.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_package_is_unserved() {
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{NodePackageRequest, NodePackageResponse};
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = NoopHandler;
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let res: Result<NodePackageResponse, String> = crate::unary_request(
+            &mut client_send,
+            &mut client_recv,
+            u32::from(RequestCode::NodePackage),
+            NodePackageRequest::ListInstalled,
+        )
+        .await
+        .expect("wire transport should succeed");
+
+        assert_eq!(res.unwrap_err(), "unknown request code: 109");
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// `handle_node` answers the not-yet-served `node.package`
+    /// family as an unknown code, through its `_` arm.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_node_package_is_unserved() {
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{NodePackageRequest, NodePackageResponse};
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = StandaloneNodeHandler;
+            super::handle_node(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let res: Result<NodePackageResponse, String> = crate::unary_request(
+            &mut client_send,
+            &mut client_recv,
+            u32::from(RequestCode::NodePackage),
+            NodePackageRequest::Status {
+                target: "sensor".into(),
+                instance: Some(1),
+            },
+        )
+        .await
+        .expect("wire transport should succeed");
+
+        assert_eq!(res.unwrap_err(), "unknown request code: 109");
 
         drop(client_send);
         drop(client_recv);

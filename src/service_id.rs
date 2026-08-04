@@ -216,6 +216,7 @@ pub const NODE_REMOTE_ACCESS: ServiceId = ServiceId::new("node.remote_access", "
 pub const NODE_POWER: ServiceId = ServiceId::new("node.power", "");
 pub const NODE_OBSERVATION: ServiceId = ServiceId::new("node.observation", "");
 pub const NODE_VERSION: ServiceId = ServiceId::new("node.version", "");
+pub const NODE_PACKAGE: ServiceId = ServiceId::new("node.package", "");
 
 // ── node.service (method-level) ───────────────────────────────
 
@@ -282,6 +283,13 @@ pub const NODE_VERSION_GET: ServiceId = ServiceId::new("node.version", "get");
 pub const NODE_VERSION_SET_OS: ServiceId = ServiceId::new("node.version", "set_os_version");
 pub const NODE_VERSION_SET_PRODUCT: ServiceId =
     ServiceId::new("node.version", "set_product_version");
+
+// ── node.package ───────────────────────────────────────────────
+
+pub const NODE_PACKAGE_INSTALL: ServiceId = ServiceId::new("node.package", "install");
+pub const NODE_PACKAGE_REMOVE: ServiceId = ServiceId::new("node.package", "remove");
+pub const NODE_PACKAGE_LIST: ServiceId = ServiceId::new("node.package", "list");
+pub const NODE_PACKAGE_STATUS: ServiceId = ServiceId::new("node.package", "status");
 
 // ── common ─────────────────────────────────────────────────────
 //
@@ -399,8 +407,8 @@ pub const SERVER_CUSTOMER_DATA_DELETION_REPORT: ServiceId =
 
 use crate::types::node::{
     NodeHostnameRequest, NodeLoggingRequest, NodeNetworkInterfaceRequest, NodeObservationRequest,
-    NodePowerRequest, NodeRemoteAccessRequest, NodeServiceRequest, NodeTimeSyncRequest,
-    NodeVersionRequest,
+    NodePackageRequest, NodePowerRequest, NodeRemoteAccessRequest, NodeServiceRequest,
+    NodeTimeSyncRequest, NodeVersionRequest,
 };
 
 impl NodeServiceRequest {
@@ -517,6 +525,19 @@ impl NodeVersionRequest {
     }
 }
 
+impl NodePackageRequest {
+    /// Returns the method-level [`ServiceId`] for this request.
+    #[must_use]
+    pub fn service_id(&self) -> ServiceId {
+        match self {
+            Self::Install { .. } => NODE_PACKAGE_INSTALL,
+            Self::Remove { .. } => NODE_PACKAGE_REMOVE,
+            Self::ListInstalled => NODE_PACKAGE_LIST,
+            Self::Status { .. } => NODE_PACKAGE_STATUS,
+        }
+    }
+}
+
 // ── RequestCode → ServiceId mapping ────────────────────────────
 //
 // Maps wire request codes to their logical service identifiers.
@@ -578,6 +599,7 @@ pub(crate) fn from_client_request_code(code: ClientRequestCode) -> Option<Servic
         ClientRequestCode::NodePower => Some(NODE_POWER),
         ClientRequestCode::NodeObservation => Some(NODE_OBSERVATION),
         ClientRequestCode::NodeVersion => Some(NODE_VERSION),
+        ClientRequestCode::NodePackage => Some(NODE_PACKAGE),
 
         ClientRequestCode::Unknown => None,
     }
@@ -655,6 +677,7 @@ pub fn all() -> &'static [ServiceId] {
         NODE_POWER,
         NODE_OBSERVATION,
         NODE_VERSION,
+        NODE_PACKAGE,
         // node.service
         NODE_SERVICE_START,
         NODE_SERVICE_STOP,
@@ -697,6 +720,11 @@ pub fn all() -> &'static [ServiceId] {
         NODE_VERSION_GET,
         NODE_VERSION_SET_OS,
         NODE_VERSION_SET_PRODUCT,
+        // node.package
+        NODE_PACKAGE_INSTALL,
+        NODE_PACKAGE_REMOVE,
+        NODE_PACKAGE_LIST,
+        NODE_PACKAGE_STATUS,
         // common
         COMMON_DNS_START,
         COMMON_DNS_STOP,
@@ -789,6 +817,15 @@ mod tests {
         assert_eq!(NODE_POWER.to_string(), "node.power");
         assert_eq!(NODE_SERVICE.to_string(), "node.service");
         assert_eq!(NODE_OBSERVATION.to_string(), "node.observation");
+        assert_eq!(NODE_PACKAGE.to_string(), "node.package");
+    }
+
+    #[test]
+    fn node_package_display_format() {
+        assert_eq!(NODE_PACKAGE_INSTALL.to_string(), "node.package.install");
+        assert_eq!(NODE_PACKAGE_REMOVE.to_string(), "node.package.remove");
+        assert_eq!(NODE_PACKAGE_LIST.to_string(), "node.package.list");
+        assert_eq!(NODE_PACKAGE_STATUS.to_string(), "node.package.status");
     }
 
     #[test]
@@ -882,6 +919,10 @@ mod tests {
             from_client_request_code(ClientRequestCode::NodeVersion),
             Some(NODE_VERSION)
         );
+        assert_eq!(
+            from_client_request_code(ClientRequestCode::NodePackage),
+            Some(NODE_PACKAGE)
+        );
     }
 
     #[test]
@@ -924,6 +965,7 @@ mod tests {
             ClientRequestCode::NodePower,
             ClientRequestCode::NodeObservation,
             ClientRequestCode::NodeVersion,
+            ClientRequestCode::NodePackage,
         ];
         for &code in codes {
             assert!(
@@ -1114,6 +1156,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn node_package_request_service_ids() {
+        use crate::types::node::{FailurePolicy, NodePackageRequest};
+
+        assert_eq!(
+            NodePackageRequest::Install {
+                target: "sensor".into(),
+                instance: Some(1),
+                version: "1.2.3".into(),
+                commit: "0123456789abcdef".into(),
+                size: 1024,
+                idempotency_key: "k".into(),
+                bootstrap_material: None,
+                on_failure: FailurePolicy::Rollback,
+            }
+            .service_id(),
+            NODE_PACKAGE_INSTALL
+        );
+        assert_eq!(
+            NodePackageRequest::Remove {
+                target: "sensor".into(),
+                instance: None,
+                idempotency_key: "k".into(),
+            }
+            .service_id(),
+            NODE_PACKAGE_REMOVE
+        );
+        assert_eq!(
+            NodePackageRequest::ListInstalled.service_id(),
+            NODE_PACKAGE_LIST
+        );
+        assert_eq!(
+            NodePackageRequest::Status {
+                target: "sensor".into(),
+                instance: Some(2),
+            }
+            .service_id(),
+            NODE_PACKAGE_STATUS
+        );
+
+        for id in [
+            NODE_PACKAGE_INSTALL,
+            NODE_PACKAGE_REMOVE,
+            NODE_PACKAGE_LIST,
+            NODE_PACKAGE_STATUS,
+        ] {
+            assert!(!id.is_family());
+            assert!(all().contains(&id));
+        }
+        assert!(NODE_PACKAGE.is_family());
+        assert!(all().contains(&NODE_PACKAGE));
+    }
+
     /// Every `service_id()` return value should be method-level
     /// (not family-level).
     #[test]
@@ -1134,5 +1229,6 @@ mod tests {
         assert!(!NodeLoggingRequest::Get.service_id().is_family());
         assert!(!NodeRemoteAccessRequest::Get.service_id().is_family());
         assert!(!NodeVersionRequest::Get.service_id().is_family());
+        assert!(!NodePackageRequest::ListInstalled.service_id().is_family());
     }
 }
