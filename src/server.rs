@@ -178,7 +178,7 @@ pub use self::stream::process_event_stream;
 use crate::types::EventMessage;
 #[cfg(feature = "server")]
 use crate::{
-    AgentInfo, HandshakeError, client, handle_handshake_recv_io_error,
+    AgentInfo, HandshakeError, client, decode_agent_info, handle_handshake_recv_io_error,
     handle_handshake_send_io_error, types::LabelDb,
 };
 
@@ -527,9 +527,15 @@ pub async fn handshake(
         .await
         .map_err(HandshakeError::ConnectionLost)?;
     let mut buf = Vec::new();
-    let mut agent_info = frame::recv::<AgentInfo>(&mut recv, &mut buf)
+    // The frame is read raw because `AgentInfo` carries a conditional tail: the
+    // base struct is followed by however many tail fields the peer sent, and
+    // decoding those needs the leftover bytes rather than a decoded value. A
+    // tail that is present but does not decode is rejected here rather than
+    // read as an absent tail.
+    frame::recv_raw(&mut recv, &mut buf)
         .await
         .map_err(handle_handshake_recv_io_error)?;
+    let mut agent_info = decode_agent_info(&buf).map_err(|_| HandshakeError::InvalidMessage)?;
     agent_info.addr = addr;
     let version_req = VersionReq::parse(version_req).expect("valid version requirement");
     let protocol_version = Version::parse(&agent_info.protocol_version).map_err(|_| {

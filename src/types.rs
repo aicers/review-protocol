@@ -1,6 +1,7 @@
 //! Data types used by the protocol.
 
 use std::{
+    collections::BTreeMap,
     net::{IpAddr, SocketAddr},
     ops::RangeInclusive,
     time::Duration,
@@ -212,10 +213,96 @@ pub struct LabelDb {
     pub patterns: Vec<LabelDbRule>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Status {
     Ready,
     Idle,
+}
+
+/// Capability tags that this crate knows about.
+///
+/// The capability set on [`AgentInfo`](crate::AgentInfo) is **open**: these are
+/// known values, not a closed set. A decoder validates the tags it knows and
+/// preserves the rest untouched, so a peer advertising a tag that is not listed
+/// here is neither an error nor a reason to drop the unrecognized tag.
+///
+/// The tags are namespaced strings rather than a struct of booleans so that a
+/// new capability needs no wire change and one agent can hold several roles at
+/// once.
+///
+/// Security-sensitive tags are **advertised, not authoritative**. `REGISTRAR`
+/// and the `colocated:` tags are claims the manager corroborates elsewhere
+/// before granting anything; this crate transports them and must not treat them
+/// as grants.
+pub mod capability {
+    /// The agent runs the registrar.
+    pub const REGISTRAR: &str = "registrar";
+
+    /// The agent is co-located with review.
+    pub const COLOCATED_REVIEW: &str = "colocated:review";
+
+    /// The agent is co-located with aice-web-next.
+    pub const COLOCATED_AICE_WEB_NEXT: &str = "colocated:aice-web-next";
+
+    /// The agent supports the `node.package` request family.
+    pub const NODE_PACKAGE: &str = "node.package";
+
+    /// The agent supports the `node.enroll` request family.
+    pub const NODE_ENROLL: &str = "node.enroll";
+
+    /// The self-update rollback supervisor is present on the host, so a
+    /// rollback-on-failure request is honoured rather than silently downgraded
+    /// to a hold.
+    pub const ROLLBACK_SUPERVISOR: &str = "rollback-supervisor";
+}
+
+/// The inclusive range of package-manifest `format_version` values a peer can
+/// decode.
+///
+/// Both ends are inclusive: a peer reporting `min = 1` and `max = 2` decodes
+/// manifests of format version 1 and 2, and nothing else.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManifestFormatRange {
+    /// The lowest `format_version` the peer can decode.
+    pub min: u32,
+    /// The highest `format_version` the peer can decode.
+    pub max: u32,
+}
+
+impl ManifestFormatRange {
+    /// Returns `true` if `format_version` falls within the inclusive range.
+    #[must_use]
+    pub fn contains(self, format_version: u32) -> bool {
+        self.min <= format_version && format_version <= self.max
+    }
+}
+
+/// Digests of the rendered provisioning file.
+///
+/// The digests are the **enforcing daemon's** reading of the file, relayed by
+/// the agent rather than computed by it, so a comparison cannot come out green
+/// while the enforcer acts on something else.
+///
+/// The reading is structured rather than a single whole-file hash so that a
+/// consumer can name what diverged: a benign new component entry and a changed
+/// domain are different events, and only the latter mints certificates no peer
+/// will verify.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProvisioningFingerprint {
+    /// Per-component digest of the rendered provisioning entry, keyed by
+    /// component.
+    pub components: BTreeMap<String, String>,
+    /// The rendered `domain`, compared separately from the component digests.
+    pub domain: String,
+}
+
+/// The audit store's health, as reported by its local endpoint.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AuditHealth {
+    /// Whether the audit store is at or below its low-water mark.
+    pub below_low_water: bool,
+    /// Count of audit intents recorded with no matching outcome.
+    pub intent_without_outcome: u64,
 }
 
 /// Threat level of a detection event.
@@ -2003,5 +2090,86 @@ mod tests {
         assert_eq!(counts[&ThreatLevel::High], 3);
         assert_eq!(counts[&ThreatLevel::Medium], 1);
         assert_eq!(counts.get(&ThreatLevel::VeryLow), None);
+    }
+
+    #[test]
+    fn manifest_format_range_contains_both_ends() {
+        use super::ManifestFormatRange;
+
+        let range = ManifestFormatRange { min: 2, max: 4 };
+
+        assert!(!range.contains(1));
+        assert!(range.contains(2));
+        assert!(range.contains(3));
+        assert!(range.contains(4));
+        assert!(!range.contains(5));
+
+        let single = ManifestFormatRange { min: 1, max: 1 };
+        assert!(single.contains(1));
+        assert!(!single.contains(0));
+        assert!(!single.contains(2));
+    }
+
+    #[cfg(any(feature = "client", feature = "server"))]
+    #[test]
+    fn manifest_format_range_round_trip() {
+        use super::ManifestFormatRange;
+
+        let range = ManifestFormatRange { min: 1, max: 3 };
+        let config = bincode::config::standard();
+        let encoded = bincode::serde::encode_to_vec(range, config).unwrap();
+        let (decoded, len): (ManifestFormatRange, usize) =
+            bincode::serde::decode_from_slice(&encoded, config).unwrap();
+
+        assert_eq!(decoded, range);
+        assert_eq!(len, encoded.len());
+    }
+
+    #[cfg(any(feature = "client", feature = "server"))]
+    #[test]
+    fn provisioning_fingerprint_round_trip() {
+        use std::collections::BTreeMap;
+
+        use super::ProvisioningFingerprint;
+
+        let config = bincode::config::standard();
+
+        let empty = ProvisioningFingerprint::default();
+        let encoded = bincode::serde::encode_to_vec(&empty, config).unwrap();
+        let (decoded, _len): (ProvisioningFingerprint, usize) =
+            bincode::serde::decode_from_slice(&encoded, config).unwrap();
+        assert_eq!(decoded, empty);
+        assert!(decoded.components.is_empty());
+
+        let multi = ProvisioningFingerprint {
+            components: BTreeMap::from([
+                ("review".to_string(), "sha256:aaa".to_string()),
+                ("roxyd".to_string(), "sha256:bbb".to_string()),
+            ]),
+            domain: "example.test".to_string(),
+        };
+        let encoded = bincode::serde::encode_to_vec(&multi, config).unwrap();
+        let (decoded, _len): (ProvisioningFingerprint, usize) =
+            bincode::serde::decode_from_slice(&encoded, config).unwrap();
+        assert_eq!(decoded, multi);
+    }
+
+    #[cfg(any(feature = "client", feature = "server"))]
+    #[test]
+    fn audit_health_round_trip() {
+        use super::AuditHealth;
+
+        let config = bincode::config::standard();
+        let health = AuditHealth {
+            below_low_water: true,
+            intent_without_outcome: 7,
+        };
+        let encoded = bincode::serde::encode_to_vec(health, config).unwrap();
+        let (decoded, _len): (AuditHealth, usize) =
+            bincode::serde::decode_from_slice(&encoded, config).unwrap();
+
+        assert_eq!(decoded, health);
+        assert_eq!(AuditHealth::default().intent_without_outcome, 0);
+        assert!(!AuditHealth::default().below_low_water);
     }
 }
