@@ -30,6 +30,84 @@
 //! surface for node-centric operations. Item-level docs on the
 //! node-related modules provide concrete guidance and examples.
 //!
+//! ## Package install and node enrollment
+//!
+//! Two request families extend the node API family beyond the nine
+//! configuration-oriented ones.
+//!
+//! **`node.package` (request code 109)** manages the components installed on
+//! a node. `Remove`, `ListInstalled` and `Status` are unary. `Install` is
+//! not: its payload does not travel in the request message but streams
+//! afterwards. The manager sends the framed request, the agent answers with one
+//! `InstallPreflight` verdict, and only on `Proceed` does the manager stream
+//! the `.pkg` bytes as length-prefixed chunks over the request's own
+//! bi-stream, followed by exactly one terminal response. A refusal is
+//! terminal at the verdict, before a single byte of payload is sent. The
+//! agent's handler receives the bytes through a `request::PackageReader`
+//! bounded to the request's declared size, so it cannot over-read into the
+//! next request frame.
+//!
+//! `Install` also carries the reserved `"trust"` target, which delivers a
+//! release-signing trust-set generation rather than an installable component.
+//! It travels the same streaming path and reports `TrustActive`,
+//! `StaleTrustSet` or `UnsupportedManifestFormat`, each carrying the agent's
+//! active trust epoch.
+//!
+//! **`node.enroll` (request code 110)** is unary, and is directed at the
+//! agent that runs the registrar. `Register` returns the bootstrap material
+//! for a service identity; `Deregister` returns `Done`. Registrar failures
+//! are typed values on the response rather than strings, so a caller
+//! classifies them by pattern-matching and reads `retry_after()` and
+//! `leaves_teardown_owed()` off them.
+//!
+//! ## Capability routing is the manager's job
+//!
+//! Not every agent serves these families. An agent advertises what it carries
+//! in [`AgentInfo::capabilities`], whose tags are named by
+//! [`types::capability`] — `node.package` and `node.enroll` among them.
+//!
+//! **This crate transports that set and never inspects it.**
+//! `server::handshake` hands the decoded [`AgentInfo`] back to its caller and
+//! keeps no copy; the manager-side send paths take no capability set and
+//! consult none. A manager that routes codes 109 and 110 therefore reads the
+//! advertised set itself and decides for itself which agents to send them to.
+//! Nothing here withholds a request code from an agent, and the tags are
+//! advertised rather than authoritative — a manager corroborates a
+//! security-sensitive claim elsewhere before granting anything.
+//!
+//! An agent that advertises nothing decodes to an empty set. It stays
+//! connected and is simply not sent those codes by a manager that applies the
+//! rule. If one is sent anyway, the agent still fails closed: a code it does
+//! not know answers `"unknown request code"`, and a family it dispatches but
+//! does not implement answers `"not supported"`.
+//!
+//! ## Protocol version and compatibility
+//!
+//! [`PROTOCOL_VERSION`] and [`MIN_PROTOCOL_VERSION_REQ`] are the wire
+//! protocol version this crate's surface implements and the requirement a
+//! manager that intends to route codes 109 and 110 enforces. They live in the
+//! **protocol** namespace, which is not the crate version and is never
+//! derived from it. They are values a caller may pass to
+//! `client::ConnectionBuilder::new` and `server::handshake`; the crate
+//! itself reads them at no decision point, and a consumer passing its own
+//! strings is unaffected.
+//!
+//! The floor exists so that an agent too old to install anything is refused
+//! **at handshake** rather than one request at a time. It is not a substitute
+//! for capability routing, and capability routing is not a substitute for it:
+//! the two do different jobs. The version window says whether the two peers
+//! speak the same protocol at all; the capability set says which roles this
+//! particular agent fills, which is version-independent and is the durable
+//! half of the pair.
+//!
+//! Version skew does not break the handshake in either direction. The
+//! capability tail decodes tolerantly: an agent predating the tail sends only
+//! the base fields and is decoded with an empty capability set and unknown
+//! readings for the rest, and an agent sending the full tail is read by an
+//! older manager that ignores the trailing bytes. A manager that has not
+//! raised its floor keeps talking to a new agent, and a new manager keeps
+//! talking to an old agent it chooses not to gate.
+//!
 //! ## Compatibility with legacy flat APIs
 //!
 //! Historically some functionality was exposed through legacy, flatter
@@ -123,6 +201,40 @@ use thiserror::Error;
 pub use self::protocol_error::ProtocolErrorKind;
 use crate::types::{AuditHealth, ManifestFormatRange, ProvisioningFingerprint, Status};
 
+/// The wire protocol version this crate's surface implements.
+///
+/// This is the **protocol** version, and it is neither the crate version nor
+/// derived from it. The two namespaces are unrelated in meaning and decades
+/// apart in value, and deriving one from the other breaks a live deployment in
+/// both directions: a requirement built from the crate version is weaker than
+/// the one already in force and admits the agents it was meant to exclude,
+/// while a ceiling built from it refuses every agent in the field.
+///
+/// An agent advertises this as its `protocol_version`; a manager passes it to
+/// `server::handshake` as `highest_protocol_version`.
+///
+/// It is a `&str` rather than a `semver::Version` because that type is not
+/// const-constructible and `semver` is an optional dependency. A caller parses
+/// it, exactly as `server::handshake` parses the strings it is given.
+///
+/// The value is maintained by hand, and nothing in this crate can check it
+/// against the deployed fleet.
+pub const PROTOCOL_VERSION: &str = "0.49.0";
+
+/// The protocol version requirement a manager that intends to route the
+/// `node.package` (code 109) and `node.enroll` (code 110) request families
+/// enforces.
+///
+/// This is a requirement in the **protocol** namespace, not the crate's. See
+/// [`PROTOCOL_VERSION`] for why the two must not be conflated.
+///
+/// A manager passes it to `server::handshake` as `version_req`, which is what
+/// refuses an agent too old to serve those families at the handshake rather
+/// than one request at a time. The crate applies no such policy of its own:
+/// this is a value a caller may pass, and a caller that passes its own
+/// requirement is unaffected.
+pub const MIN_PROTOCOL_VERSION_REQ: &str = ">=0.49.0";
+
 /// The error type for a handshake failure.
 #[cfg(any(feature = "client", feature = "server"))]
 #[derive(Debug, Error)]
@@ -198,17 +310,30 @@ fn handle_handshake_recv_io_error(e: std::io::Error) -> HandshakeError {
 ///
 /// The derived `Deserialize`, by contrast, is **not** the conditional decode: it
 /// is positional like any other bincode decode and so demands the full tail,
-/// failing on the base-only frame an older agent sends. [`server::handshake`] is
+/// failing on the base-only frame an older agent sends. `server::handshake` is
 /// what applies the rule above, and a manager reads `AgentInfo` off the wire
 /// through it rather than through `oinq::frame::recv::<AgentInfo>`.
-///
-/// [`server::handshake`]: crate::server::handshake
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentInfo {
     #[serde(rename = "agent_name", alias = "app_name")]
     pub agent_name: String,
     #[serde(rename = "agent_version", alias = "app_version", alias = "version")]
     pub agent_version: String,
+
+    /// The wire protocol version the agent advertises.
+    ///
+    /// This is the **protocol** version, not the crate version. The value is
+    /// supplied by the caller — an agent passes it to
+    /// `client::ConnectionBuilder::new` — and this crate never fills it in.
+    /// [`PROTOCOL_VERSION`] is the value this crate's surface corresponds to.
+    ///
+    /// `server::handshake` enforces a window on it from both sides: a floor,
+    /// the caller's `version_req`, and a ceiling, the caller's
+    /// `highest_protocol_version`. A version outside either end answers
+    /// `HandshakeError::IncompatibleProtocol`. So a caller that passes a
+    /// crate version into either argument breaks its own handshake — a floor
+    /// in the crate's namespace is vacuous against a protocol version, and a
+    /// ceiling in it refuses every agent.
     pub protocol_version: String,
     pub addr: SocketAddr,
     pub status: Status,
@@ -1116,5 +1241,183 @@ mod tests {
 
         let res = tokio::join!(handle).0.unwrap();
         assert!(res.is_err());
+    }
+
+    /// The two constants sit in the protocol namespace, whose successor to the
+    /// deployed `0.48.0` is `0.49.0`. Gated on the features that pull `semver`
+    /// in.
+    #[test]
+    #[cfg(any(feature = "client", feature = "server"))]
+    fn protocol_version_constants() {
+        let version = semver::Version::parse(crate::PROTOCOL_VERSION).unwrap();
+        assert_eq!(version, semver::Version::new(0, 49, 0));
+
+        let req = semver::VersionReq::parse(crate::MIN_PROTOCOL_VERSION_REQ).unwrap();
+        assert!(req.matches(&version));
+        assert!(!req.matches(&semver::Version::parse("0.48.0").unwrap()));
+    }
+
+    /// An agent advertising [`crate::PROTOCOL_VERSION`] passes both halves of
+    /// the window a manager applies with [`crate::MIN_PROTOCOL_VERSION_REQ`].
+    ///
+    /// The crate constants are used directly here, and no local
+    /// `PROTOCOL_VERSION` shadows them: a local one would put the crate
+    /// version back on the wire, which is the confusion these constants exist
+    /// to end.
+    #[tokio::test]
+    #[cfg(all(feature = "client", feature = "server"))]
+    async fn handshake_at_protocol_version_ok() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        use crate::Status;
+
+        const AGENT_NAME: &str = "test-agent";
+        const AGENT_VERSION: &str = "1.0.0";
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+        let (server, client) = (channel.server, channel.client);
+
+        let handle = tokio::spawn(async move {
+            super::client::handshake(
+                &client.conn,
+                AGENT_NAME,
+                AGENT_VERSION,
+                crate::PROTOCOL_VERSION,
+                Status::Ready,
+            )
+            .await
+        });
+
+        let agent_info = super::server::handshake(
+            &server.conn,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            crate::MIN_PROTOCOL_VERSION_REQ,
+            crate::PROTOCOL_VERSION,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(agent_info.agent_name, AGENT_NAME);
+        assert_eq!(agent_info.agent_version, AGENT_VERSION);
+        assert_eq!(agent_info.protocol_version, crate::PROTOCOL_VERSION);
+
+        assert!(tokio::join!(handle).0.unwrap().is_ok());
+    }
+
+    /// The floor is what this release exists for: an agent still advertising
+    /// the predecessor protocol version, and so unable to serve request codes
+    /// 109 and 110, is refused at the handshake rather than one request at a
+    /// time.
+    #[tokio::test]
+    #[cfg(all(feature = "client", feature = "server"))]
+    async fn handshake_below_min_protocol_version_err() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        use crate::Status;
+
+        const AGENT_NAME: &str = "test-agent";
+        const AGENT_VERSION: &str = "1.0.0";
+        /// The protocol version deployed before this release.
+        const PREVIOUS_PROTOCOL_VERSION: &str = "0.48.0";
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+        let (server, client) = (channel.server, channel.client);
+
+        let handle = tokio::spawn(async move {
+            super::client::handshake(
+                &client.conn,
+                AGENT_NAME,
+                AGENT_VERSION,
+                PREVIOUS_PROTOCOL_VERSION,
+                Status::Ready,
+            )
+            .await
+        });
+
+        let res = super::server::handshake(
+            &server.conn,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            crate::MIN_PROTOCOL_VERSION_REQ,
+            crate::PROTOCOL_VERSION,
+        )
+        .await;
+
+        assert!(matches!(
+            res,
+            Err(crate::HandshakeError::IncompatibleProtocol(ref version, ref req))
+                if version == PREVIOUS_PROTOCOL_VERSION
+                    && req == crate::MIN_PROTOCOL_VERSION_REQ
+        ));
+
+        // Both branches return the same variant with the same payload, so the
+        // server side alone cannot say which one refused. The agent side can:
+        // a floor refusal echoes the requirement back, where the ceiling
+        // refusal below echoes `highest_protocol_version`.
+        let agent_res = tokio::join!(handle).0.unwrap();
+        assert!(matches!(
+            agent_res,
+            Err(crate::HandshakeError::IncompatibleProtocol(ref version, ref echoed))
+                if version == PREVIOUS_PROTOCOL_VERSION
+                    && echoed == crate::MIN_PROTOCOL_VERSION_REQ
+        ));
+    }
+
+    /// The ceiling half of the same window, pinned so that a consumer raising
+    /// its floor without raising `highest_protocol_version` is caught here.
+    #[tokio::test]
+    #[cfg(all(feature = "client", feature = "server"))]
+    async fn handshake_above_highest_protocol_version_err() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        use crate::Status;
+
+        const AGENT_NAME: &str = "test-agent";
+        const AGENT_VERSION: &str = "1.0.0";
+        /// The protocol version deployed before this release.
+        const PREVIOUS_PROTOCOL_VERSION: &str = "0.48.0";
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+        let (server, client) = (channel.server, channel.client);
+
+        let handle = tokio::spawn(async move {
+            super::client::handshake(
+                &client.conn,
+                AGENT_NAME,
+                AGENT_VERSION,
+                crate::PROTOCOL_VERSION,
+                Status::Ready,
+            )
+            .await
+        });
+
+        let res = super::server::handshake(
+            &server.conn,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            crate::MIN_PROTOCOL_VERSION_REQ,
+            PREVIOUS_PROTOCOL_VERSION,
+        )
+        .await;
+
+        assert!(matches!(
+            res,
+            Err(crate::HandshakeError::IncompatibleProtocol(ref version, ref req))
+                if version == crate::PROTOCOL_VERSION
+                    && req == crate::MIN_PROTOCOL_VERSION_REQ
+        ));
+
+        // The agent version clears the floor, so this can only be the ceiling
+        // refusing. What proves it is the string echoed back: the ceiling
+        // branch sends `highest_protocol_version`, where the floor branch
+        // sends the requirement.
+        let agent_res = tokio::join!(handle).0.unwrap();
+        assert!(matches!(
+            agent_res,
+            Err(crate::HandshakeError::IncompatibleProtocol(ref version, ref echoed))
+                if version == crate::PROTOCOL_VERSION
+                    && echoed == PREVIOUS_PROTOCOL_VERSION
+        ));
     }
 }

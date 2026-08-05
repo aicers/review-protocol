@@ -7,8 +7,21 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-08-05
+
 ### Added
 
+- Added the `PROTOCOL_VERSION` and `MIN_PROTOCOL_VERSION_REQ` constants,
+  ungated by feature. `PROTOCOL_VERSION` is the wire protocol version this
+  crate's surface implements, which an agent advertises and a manager passes
+  as `highest_protocol_version`; `MIN_PROTOCOL_VERSION_REQ` is the requirement
+  a manager that intends to route the `node.package` and `node.enroll` request
+  families passes as `version_req`, so an agent too old to serve them is
+  refused at the handshake rather than one request at a time. Both are `&str`
+  literals in the protocol version namespace, which is not the crate version
+  and is not derived from it. They are values a caller may pass;
+  `server::handshake` keeps taking both from its caller and reads neither
+  constant itself.
 - Added the `common.delete_customer_data` (`DeleteCustomerData`) request,
   including the `CustomerDataDeletionRequest` type,
   `server::Connection::send_delete_customer_data_cmd` and
@@ -926,7 +939,9 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - `client::handshake` implements the application-level handshake process for the
   client after a QUIC connection is established.
 
-[Unreleased]: https://github.com/petabi/review-protocol/compare/0.19.0...main
+[Unreleased]: https://github.com/petabi/review-protocol/compare/0.20.0...main
+[0.20.0]: https://github.com/petabi/review-protocol/compare/0.19.0...0.20.0
+[0.19.0]: https://github.com/petabi/review-protocol/compare/0.18.1...0.19.0
 [0.18.1]: https://github.com/petabi/review-protocol/compare/0.18.0...0.18.1
 [0.18.0]: https://github.com/petabi/review-protocol/compare/0.17.0...0.18.0
 [0.17.0]: https://github.com/petabi/review-protocol/compare/0.16.0...0.17.0
