@@ -207,6 +207,9 @@ pub enum InstallPreflight {
     InsufficientDiskSpace { filesystem: String, required: u64, available: u64 },
 }
 
+// DECLARATION ORDER IS THE WIRE ENCODING (bincode encodes a variant as its
+// declaration index), so this block is written in the order the crate
+// declares, not in the order that reads best. A future variant appends.
 pub enum NodePackageResponse {
     // terminal success of an APPLIED install/remove (the Proceed path);
     // NOT sent after AlreadyApplied
@@ -217,14 +220,45 @@ pub enum NodePackageResponse {
     // Done can follow; the true outcome (Running/Failed) is reconciled from
     // REView's operation_attempt on reconnect (RFC-B §8, RFC-D2 §4e)
     Accepted,
+    Installed(Vec<InstalledPackage>),  // for ListInstalled
+    State(PackageState),               // for Status
+    // a typed apply failure. Success-shaped on the wire: a decode success
+    // still means "the agent answered," and the manager classifies the
+    // refusal by matching on the error rather than by parsing a string.
+    Failed(NodePackageError),
     // terminal success of a `trust` target apply. Carries the epoch the agent
     // is ACTIVE ON after activating, so the manager confirms a trust rollout
     // IN-CONNECTION rather than waiting for the next handshake AgentInfo — an
     // agent that stays connected for weeks would otherwise never report its
     // new epoch (RFC-D2 §4a).
     TrustActive { active_epoch: u64 },
-    Installed(Vec<InstalledPackage>),  // for ListInstalled
-    State(PackageState),               // for Status
+}
+
+// Carried by NodePackageResponse::Failed, and reached by matching on a
+// SUCCESSFUL decode. Declaration order is the wire encoding here too.
+pub enum NodePackageError {
+    // the in-package manifest's component/version/commit disagree with the
+    // request's target/version/commit
+    TargetMismatch { expected: PackageIdentity, found: PackageIdentity },
+    // a first install of a package with no existing identity arrived with
+    // bootstrap_material: None
+    MissingBootstrapMaterial,
+    // the wrapped credential's TTL lapsed before it was consumed: re-mint and
+    // resume; the identity is intact and only the credential lapsed (§5)
+    BootstrapMaterialExpired,
+    // raised before the first mutation; not retryable without operator action
+    InsufficientDiskSpace { filesystem: String, required: u64, available: u64 },
+    // trust target: the delivered generation's epoch is not strictly greater
+    // than the active one. Carries the agent's CURRENT epoch, so a rejection
+    // on equal is an explicit already-at-this-epoch confirmation.
+    StaleTrustSet { active_epoch: u64 },
+    // trust target: the agent cannot decode the generation's manifest format.
+    // TERMINAL for this host — carries the epoch AND the range it supports, so
+    // the manager stops re-pushing and names the cause.
+    UnsupportedManifestFormat {
+        active_epoch: u64,
+        supported: ManifestFormatRange,
+    },
 }
 
 /// What the agent does if the newly-applied version fails its health gate
@@ -596,6 +630,24 @@ pub struct ServiceSpec {
     cert_group: Option<CertGroup>,
 }
 
+/// How the service is reloaded after its certificate is rotated, and which
+/// certificate group its material belongs to. Both are OPAQUE TRANSPORT
+/// TYPES: carried verbatim to the registrar, never parsed, normalised,
+/// enumerated or rejected here, and neither may grow a validating
+/// constructor or a fallible `FromStr`. The registrar's safe-set is the only
+/// authority on which values are acceptable and it is not visible from this
+/// crate, so any variant list written here would be a guess that makes
+/// legitimate registrations unrepresentable; an unacceptable value is the
+/// registrar's `ServiceSpecConflict`-class business, not a decode failure.
+/// The public field is the whole API.
+///
+/// serde encodes a newtype struct as its inner value, so each of these is
+/// BYTE-IDENTICAL ON THE WIRE to the bare `String` it wraps. The newtype
+/// costs nothing now, and a later move to a modelled type is a source-level
+/// break rather than a wire break.
+pub struct ReloadHook(pub String);
+pub struct CertGroup(pub String);
+
 /// How the minted material reaches the target. Decided per target kind by
 /// the caller (RFC-B §5): modules and new hosts enroll through bootroot's
 /// on-host agent, so REView sends `RemoteBootstrap` (RFC-D3 §5a).
@@ -767,7 +819,20 @@ classified as transient and retried.
     operator sees N unrelated installs fail with no stated cause. That is
     exactly the outcome the four errors above were typed to prevent, one hop
     further out. So it is typed, carries a small closed `reason` set, and is
-    **never retried**: RFC-D2 §4d terminates the attempt. On the
+    **never retried**: RFC-D2 §4d terminates the attempt.
+
+    **[DECISION] The reason set is its own wire enum, `RegistrarUnavailableReason`,
+    and its declaration order is pinned exactly as `NodeEnrollError`'s is.**
+    It is bincode-encoded, so a variant is its declaration index; "the right
+    six values" is not sufficient, because reordering them silently changes
+    the meaning of already-encoded bytes. The six, in declaration order:
+    `CredentialInvalid`, `NotProvisioned`, `AuditUnwritable`,
+    `EndpointUnreachable`, `PostMintUnrecordable`, `RegistrarUnreachable` —
+    the same six described above, in that order. A test pins each variant's
+    encoded index to its listed position, so a later reordering fails the
+    build rather than remapping the wire. A future reason **appends**;
+    inserting one anywhere but the end is a breaking change.
+ On the
     nothing-was-minted reasons it **clears the pre-armed `cleanup_state`** —
     the obligation was armed before the mint was commanded and there is now
     nothing to tear down, so leaving it armed would block that hostname from
@@ -877,6 +942,47 @@ classified as transient and retried.
   decode in v1.0** (§7), so the capability dimension is **forward-compatible
   from the start** — a peer that omits it decodes to an empty set, and an older
   decoder ignores the trailing bytes.
+- **[DECISION] The capability tail's tolerance does NOT extend to the version
+  window, and the cutover is therefore THREE steps, not two.** Everything
+  above is about the **capability set**, which decodes tolerantly — a peer
+  that omits it decodes to an empty set and stays connected. The **protocol
+  version** is a different mechanism with no tolerance at all:
+  `server::handshake` enforces a **floor** (`version_req.matches(protocol_version)`)
+  **and** a **ceiling** (`protocol_version <= highest_protocol_version`), and
+  answers `IncompatibleProtocol` on either. Reading the tolerance argument as
+  covering the version bump is how a two-step cutover gets planned.
+
+  The deployed window is currently a **single point**, read at
+  `aicers/roxyd` `3e287e4` and `aicers/review` `f98edf3`:
+
+  | side | value | where |
+  | --- | --- | --- |
+  | agent advertises | `"0.48.0"` | `aicers/roxyd` `src/control.rs:26` |
+  | manager floor | `">=0.48.0"` | `aicers/review` `src/agent.rs:47` |
+  | manager ceiling | `"0.48.0"` | `aicers/review` `src/agent.rs:49` |
+
+  With a zero-width window a two-step move to `0.49.0` refuses **every** agent
+  in **either** order — the agent first and the manager's ceiling rejects it;
+  the manager's floor first and the agent sits below the floor. The order is:
+
+  1. **`aicers/review` raises the ceiling only** to `0.49.0`, leaving the floor
+     at `">=0.48.0"`. The window becomes `[0.48.0, 0.49.0]` and both old and
+     new agents connect.
+  2. **`aicers/roxyd` advertises `0.49.0`.**
+  3. **Once every agent advertises `0.49.0`, `aicers/review` raises the floor**
+     to `">=0.49.0"`. Only here is an agent that cannot serve codes 109/110
+     refused at the handshake, which is the property the floor exists for.
+
+  Widen before you move, move, then narrow. Two consequences worth stating.
+  The crate's `PROTOCOL_VERSION` and `MIN_PROTOCOL_VERSION_REQ` constants are
+  values a caller **may** pass and nothing in the crate reads them at a
+  decision point, so **landing them moves no deployment** — the fleet moves
+  only when the two consumers above are edited, in that order. And the
+  fail-closed backstop stays: an agent without the codes still answers
+  "unknown request code" and one without a handler still answers "not
+  supported", so the window is what turns a per-request failure into a
+  handshake-time refusal, not what creates the safety.
+
 - Both `client` (agent) and `server` (manager) feature sides gain the
   new request/handler surface.
 
