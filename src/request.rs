@@ -52,9 +52,10 @@ use crate::{
         CustomerDataDeletionRequest, HostNetworkGroup, Process, ResourceUsage, SamplingPolicy,
         TrafficFilterRule,
         node::{
-            NodeHostnameRequest, NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
-            NodeNetworkInterfaceRequest, NodeNetworkInterfaceResponse, NodeObservationRequest,
-            NodeObservationResponse, NodePowerRequest, NodePowerResponse, NodeRemoteAccessRequest,
+            InstallPreflight, NodeHostnameRequest, NodeHostnameResponse, NodeLoggingRequest,
+            NodeLoggingResponse, NodeNetworkInterfaceRequest, NodeNetworkInterfaceResponse,
+            NodeObservationRequest, NodeObservationResponse, NodePackageRequest,
+            NodePackageResponse, NodePowerRequest, NodePowerResponse, NodeRemoteAccessRequest,
             NodeRemoteAccessResponse, NodeServiceRequest, NodeServiceResponse, NodeTimeSyncRequest,
             NodeTimeSyncResponse, NodeVersionRequest, NodeVersionResponse,
         },
@@ -109,7 +110,109 @@ impl HandlerError {
     }
 }
 
-/// A trait that groups the nine node feature-family methods under
+/// A bounded reader over the package payload that follows a
+/// [`NodePackageRequest::Install`] request on the same bi-stream.
+///
+/// The reader is created by the dispatch loop and handed to
+/// [`NodeHandler::node_package_install`] only after the handler
+/// answered the preflight with [`InstallPreflight::Proceed`].  It
+/// borrows the request's own [`quinn::RecvStream`] and is bounded to
+/// the request's `size`, so it cannot over-read into the next request
+/// frame — which is what keeps the dispatch loop aligned.
+///
+/// The payload arrives as length-prefixed chunks.  How the sender
+/// chunked is not part of the contract: a reader must not depend on
+/// chunk sizes, only on having received exactly `size` bytes in total.
+#[derive(Debug)]
+pub struct PackageReader<'a> {
+    recv: &'a mut quinn::RecvStream,
+    size: u64,
+    remaining: u64,
+}
+
+impl<'a> PackageReader<'a> {
+    fn new(recv: &'a mut quinn::RecvStream, size: u64) -> Self {
+        Self {
+            recv,
+            size,
+            remaining: size,
+        }
+    }
+}
+
+impl PackageReader<'_> {
+    /// Returns the total payload length, taken from the request's
+    /// `size`.
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Returns the number of bytes not yet handed to the caller.
+    #[must_use]
+    pub fn remaining(&self) -> u64 {
+        self.remaining
+    }
+
+    /// Reads the next length-prefixed chunk into `buf`, replacing its
+    /// contents.
+    ///
+    /// Returns `Ok(false)` once exactly [`size`](Self::size) bytes
+    /// have been read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::UnexpectedEof`] if the stream ends or
+    /// resets before the whole payload arrives, and
+    /// [`io::ErrorKind::InvalidData`] if a chunk would carry the
+    /// transfer past the declared `size`.
+    pub async fn next_chunk(&mut self, buf: &mut Vec<u8>) -> io::Result<bool> {
+        if self.remaining == 0 {
+            buf.clear();
+            return Ok(false);
+        }
+        oinq::frame::recv_raw(self.recv, buf)
+            .await
+            .map_err(truncated_payload)?;
+        let len =
+            u64::try_from(buf.len()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if len > self.remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "package chunk of {len} bytes overruns the {} bytes still expected",
+                    self.remaining
+                ),
+            ));
+        }
+        self.remaining -= len;
+        Ok(true)
+    }
+
+    /// Reads whatever the handler left behind, so that the dispatch
+    /// loop resumes on the next request frame.
+    async fn drain(&mut self) -> io::Result<()> {
+        let mut buf = Vec::new();
+        while self.next_chunk(&mut buf).await? {}
+        Ok(())
+    }
+}
+
+/// Reports a payload that stopped short as an end of file.
+///
+/// A bounded read that fails before the declared `size` is a truncated
+/// transfer whatever the transport called it, so a peer reset is
+/// reported the same way a clean early end is, with the original cause
+/// kept as the message.
+fn truncated_payload(e: io::Error) -> io::Error {
+    if e.kind() == io::ErrorKind::UnexpectedEof {
+        e
+    } else {
+        io::Error::new(io::ErrorKind::UnexpectedEof, e)
+    }
+}
+
+/// A trait that groups the node feature-family methods under
 /// their own handler surface.
 ///
 /// This trait can be used independently with [`handle_node()`] to
@@ -254,6 +357,121 @@ pub trait NodeHandler: Send {
         &mut self,
         _req: NodeVersionRequest,
     ) -> Result<NodeVersionResponse, String> {
+        Err("not supported".to_string())
+    }
+
+    /// Handles a unary node package-management request:
+    /// [`Remove`](NodePackageRequest::Remove),
+    /// [`ListInstalled`](NodePackageRequest::ListInstalled) or
+    /// [`Status`](NodePackageRequest::Status).
+    ///
+    /// [`Install`](NodePackageRequest::Install) never reaches this
+    /// method — it carries a payload and is served by
+    /// [`node_package_install_preflight`](Self::node_package_install_preflight)
+    /// and [`node_package_install`](Self::node_package_install).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the underlying operation fails.
+    async fn node_package(
+        &mut self,
+        _req: NodePackageRequest,
+    ) -> Result<NodePackageResponse, String> {
+        Err("not supported".to_string())
+    }
+
+    /// Decides whether the agent will accept the package bytes of an
+    /// [`Install`](NodePackageRequest::Install) request.
+    ///
+    /// This is step 2 of the install exchange and is decided from the
+    /// framed request **alone** — from `idempotency_key` and
+    /// `(target, version, commit)` — before any bytes move.  An `Err`
+    /// returned here is the terminal frame of the exchange: no
+    /// package bytes are requested and
+    /// [`node_package_install`](Self::node_package_install) is not
+    /// called.
+    ///
+    /// [`AlreadyApplied`](InstallPreflight::AlreadyApplied) is also
+    /// terminal, and must **never** be returned for a build whose
+    /// unit is in a failed state.  Keyed on build identity alone, a
+    /// package that installed cleanly but failed to start could never
+    /// be re-applied: an operator would fix the cause, re-run the
+    /// same build, and get a recorded success over a still-failed
+    /// service.  The contract is therefore `AlreadyApplied` only when
+    /// the build is installed **and** its unit is not failed;
+    /// otherwise [`Proceed`](InstallPreflight::Proceed).
+    ///
+    /// [`InsufficientDiskSpace`](InstallPreflight::InsufficientDiskSpace)
+    /// is decided from `size` alone, so nothing on the host is
+    /// touched before it is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the preflight checks could not be run.
+    async fn node_package_install_preflight(
+        &mut self,
+        _req: &NodePackageRequest,
+    ) -> Result<InstallPreflight, String> {
+        Err("not supported".to_string())
+    }
+
+    /// Applies an [`Install`](NodePackageRequest::Install) request
+    /// whose payload is arriving on `pkg`.
+    ///
+    /// This is step 4 of the install exchange and is called **only**
+    /// after this handler answered
+    /// [`Proceed`](InstallPreflight::Proceed).  `pkg` is bounded to
+    /// the request's `size`; whatever the handler leaves unread is
+    /// consumed by the dispatch loop, which then resumes on the next
+    /// request frame.  The value returned here is the single terminal
+    /// frame of the exchange: there are no progress frames, and
+    /// sub-steps are reported only through it.
+    ///
+    /// Return [`Done`](NodePackageResponse::Done) for an apply both
+    /// endpoints survive, and [`Accepted`](NodePackageResponse::Accepted)
+    /// for a self-disrupting apply — one whose target is the agent's
+    /// own binary or the manager itself, so that the swap tears down
+    /// this response channel.  `Accepted` is the terminal frame; no
+    /// `Done` follows it.  A typed apply failure travels as
+    /// [`Failed`](NodePackageResponse::Failed), not through the error
+    /// channel.
+    ///
+    /// # Contract
+    ///
+    /// The agent trusts **only** the manifest and signature inside
+    /// the received package, never the request.  The order is fixed:
+    ///
+    /// 1. Stream the payload to a temporary path.
+    /// 2. Verify: the signature over the in-package manifest, then
+    ///    each artifact's hash against that manifest, then that the
+    ///    manifest's identity equals the request's
+    ///    `target`/`version`/`commit`, failing with
+    ///    [`TargetMismatch`](crate::types::node::NodePackageError::TargetMismatch)
+    ///    otherwise.
+    /// 3. If `bootstrap_material` is `Some`, run enrollment — never
+    ///    before verification.
+    /// 4. Apply.
+    ///
+    /// A first install of a package with no existing identity
+    /// **requires** `bootstrap_material` and is rejected with
+    /// [`MissingBootstrapMaterial`](crate::types::node::NodePackageError::MissingBootstrapMaterial)
+    /// if it is absent, before any apply.  On an update, or on a
+    /// package whose identity already exists, `None` is expected and
+    /// a stray `Some` is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the payload could not be received.  A failure of the apply
+    /// itself is reported as
+    /// [`Failed`](NodePackageResponse::Failed) instead.
+    async fn node_package_install(
+        &mut self,
+        _req: NodePackageRequest,
+        _pkg: &mut PackageReader<'_>,
+    ) -> Result<NodePackageResponse, String> {
         Err("not supported".to_string())
     }
 }
@@ -524,6 +742,64 @@ pub trait Handler: Send {
     ) -> Result<NodeVersionResponse, String> {
         Err("not supported".to_string())
     }
+
+    /// Handles a unary node package-management request:
+    /// [`Remove`](NodePackageRequest::Remove),
+    /// [`ListInstalled`](NodePackageRequest::ListInstalled) or
+    /// [`Status`](NodePackageRequest::Status).
+    ///
+    /// See [`NodeHandler::node_package`] for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the underlying operation fails.
+    async fn node_package(
+        &mut self,
+        _req: NodePackageRequest,
+    ) -> Result<NodePackageResponse, String> {
+        Err("not supported".to_string())
+    }
+
+    /// Decides whether the agent will accept the package bytes of an
+    /// [`Install`](NodePackageRequest::Install) request.
+    ///
+    /// See [`NodeHandler::node_package_install_preflight`] for the
+    /// full contract, including why
+    /// [`AlreadyApplied`](InstallPreflight::AlreadyApplied) must
+    /// never be returned for a build whose unit is in a failed state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the preflight checks could not be run.
+    async fn node_package_install_preflight(
+        &mut self,
+        _req: &NodePackageRequest,
+    ) -> Result<InstallPreflight, String> {
+        Err("not supported".to_string())
+    }
+
+    /// Applies an [`Install`](NodePackageRequest::Install) request
+    /// whose payload is arriving on `pkg`.
+    ///
+    /// See [`NodeHandler::node_package_install`] for the full
+    /// contract, including the fixed verify-then-enrol-then-apply
+    /// order and the `bootstrap_material` presence rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the payload could not be received.  A failure of the apply
+    /// itself is reported as
+    /// [`Failed`](NodePackageResponse::Failed) instead.
+    async fn node_package_install(
+        &mut self,
+        _req: NodePackageRequest,
+        _pkg: &mut PackageReader<'_>,
+    ) -> Result<NodePackageResponse, String> {
+        Err("not supported".to_string())
+    }
 }
 
 /// Blanket implementation: every [`Handler`] automatically satisfies
@@ -591,6 +867,85 @@ impl<T: Handler + ?Sized> NodeHandler for T {
     ) -> Result<NodeVersionResponse, String> {
         Handler::node_version(self, req).await
     }
+
+    async fn node_package(
+        &mut self,
+        req: NodePackageRequest,
+    ) -> Result<NodePackageResponse, String> {
+        Handler::node_package(self, req).await
+    }
+
+    async fn node_package_install_preflight(
+        &mut self,
+        req: &NodePackageRequest,
+    ) -> Result<InstallPreflight, String> {
+        Handler::node_package_install_preflight(self, req).await
+    }
+
+    async fn node_package_install(
+        &mut self,
+        req: NodePackageRequest,
+        pkg: &mut PackageReader<'_>,
+    ) -> Result<NodePackageResponse, String> {
+        Handler::node_package_install(self, req, pkg).await
+    }
+}
+
+/// Serves one `node.package` request, streaming the payload when the
+/// request is an [`Install`](NodePackageRequest::Install).
+///
+/// The parsed request's variant decides the path.  `Remove`,
+/// `ListInstalled` and `Status` are answered with a single frame like
+/// every other family.  `Install` runs the three-step exchange: ask
+/// the handler for a preflight verdict, write it, and — only on
+/// [`Proceed`](InstallPreflight::Proceed) — read exactly `size` bytes
+/// of payload before writing the single terminal response.
+///
+/// Whatever the handler leaves unread is consumed here, so the caller's
+/// dispatch loop resumes on the next request frame either way.
+async fn dispatch_node_package<H: NodeHandler>(
+    handler: &mut H,
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    buf: &mut Vec<u8>,
+    req: NodePackageRequest,
+) -> Result<(), HandlerError> {
+    let size = match &req {
+        NodePackageRequest::Install { size, .. } => *size,
+        NodePackageRequest::Remove { .. }
+        | NodePackageRequest::ListInstalled
+        | NodePackageRequest::Status { .. } => {
+            let result = handler.node_package(req).await;
+            return send_response(send, buf, result)
+                .await
+                .map_err(HandlerError::SendError);
+        }
+    };
+
+    let verdict = handler.node_package_install_preflight(&req).await;
+    let proceed = matches!(verdict, Ok(InstallPreflight::Proceed));
+    send_response(send, buf, verdict)
+        .await
+        .map_err(HandlerError::SendError)?;
+    if !proceed {
+        // `AlreadyApplied`, `InsufficientDiskSpace` and an `Err`
+        // verdict are each the terminal frame: no bytes move and no
+        // response follows.
+        return Ok(());
+    }
+
+    let mut pkg = PackageReader::new(recv, size);
+    let result = handler.node_package_install(req, &mut pkg).await;
+    // Whatever the handler did not read is consumed here. A handler
+    // that already failed keeps its own, more specific message.
+    let result = match (result, pkg.drain().await) {
+        (result, Ok(())) => result,
+        (Err(e), Err(_)) => Err(e),
+        (Ok(_), Err(e)) => Err(format!("failed to receive the package payload: {e}")),
+    };
+    send_response(send, buf, result)
+        .await
+        .map_err(HandlerError::SendError)
 }
 
 /// Handles only node-family requests to an agent.
@@ -600,7 +955,7 @@ impl<T: Handler + ?Sized> NodeHandler for T {
 /// node-family requests without implementing the full [`Handler`]
 /// trait.
 ///
-/// Only `Node*` request codes (100–108) are dispatched. Any
+/// Only `Node*` request codes (100–109) are dispatched. Any
 /// non-node request code receives an error response on the wire
 /// (same format as unknown codes in [`handle()`]).
 ///
@@ -714,6 +1069,11 @@ pub async fn handle_node<H: NodeHandler>(
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
+            }
+            RequestCode::NodePackage => {
+                let req =
+                    parse_args::<NodePackageRequest>(body).map_err(HandlerError::RecvError)?;
+                dispatch_node_package(handler, send, recv, &mut buf, req).await?;
             }
             _ => {
                 let err_msg = format!("unknown request code: {code}");
@@ -1035,12 +1395,20 @@ pub async fn handle<H: Handler>(
                     .map_err(HandlerError::SendError)?;
             }
 
-            // `NodePackage` shares the unknown-code answer on
-            // purpose: the family is declared but not yet served, so
-            // it must not hang or panic here. The handler trait
-            // method and the real dispatch land in the companion
-            // dispatch issue, which gives it an arm of its own.
-            RequestCode::NodePackage | RequestCode::Unknown => {
+            // `Install` streams its payload on this same stream, so
+            // this arm reads past the request frame; the other three
+            // variants are answered with one frame like every other
+            // family.
+            RequestCode::NodePackage => {
+                let req =
+                    parse_args::<NodePackageRequest>(body).map_err(HandlerError::RecvError)?;
+                dispatch_node_package(handler, send, recv, &mut buf, req).await?;
+            }
+
+            // The fail-closed backstop for a code this build has not
+            // assigned. An older binary, whose `RequestCode` has no
+            // `NodePackage` variant, answers 109 through here.
+            RequestCode::Unknown => {
                 let err_msg = format!("unknown request code: {code}");
                 oinq::message::send_err(send, &mut buf, err_msg)
                     .await
@@ -2558,15 +2926,775 @@ mod tests {
         assert!(server_res.is_ok());
     }
 
-    /// `handle` answers the not-yet-served `node.package` family as
-    /// an unknown code.
+    // ── node.package dispatch tests ──────────────────────────────
+    //
+    // These cover both entry points: the unary variants answered
+    // with one frame, and the `Install` streaming exchange whose
+    // frame order the crate — not the handler — enforces.
+
+    /// Builds an `Install` request for `target` whose payload is
+    /// `size` bytes long.
+    #[cfg(feature = "server")]
+    fn install_request(target: &str, size: u64) -> crate::types::node::NodePackageRequest {
+        use crate::types::node::{FailurePolicy, NodePackageRequest};
+
+        NodePackageRequest::Install {
+            target: target.into(),
+            instance: Some(1),
+            version: "1.2.3".into(),
+            commit: "0123456789abcdef".into(),
+            size,
+            idempotency_key: "idem-1".into(),
+            bootstrap_material: None,
+            on_failure: FailurePolicy::Rollback,
+        }
+    }
+
+    /// The two installed entries a `ListInstalled` answer carries.
+    /// They differ only in `instance`, which is what makes the
+    /// instance dimension observable on the wire.
+    #[cfg(feature = "server")]
+    fn installed_pair() -> Vec<crate::types::node::InstalledPackage> {
+        use crate::types::node::{InstalledPackage, Lifecycle, PackageState};
+
+        let state = || PackageState {
+            version: "1.2.3".into(),
+            commit: "0123456789abcdef".into(),
+            lifecycle: Lifecycle::Running,
+            bound_addrs: vec![],
+        };
+        vec![
+            InstalledPackage {
+                target: "sensor".into(),
+                instance: Some(1),
+                state: state(),
+            },
+            InstalledPackage {
+                target: "sensor".into(),
+                instance: Some(2),
+                state: state(),
+            },
+        ]
+    }
+
+    /// A handler that serves the whole `node.package` family.
     ///
-    /// This pins the interim state: code 109 is declared but routes
-    /// nowhere, so neither entry point may hang or panic. The
-    /// companion dispatch issue replaces this expectation.
+    /// The preflight verdict is chosen by the install target, so a
+    /// test picks the branch it wants to drive by naming it; the
+    /// received payload is recorded so a test can compare it against
+    /// what it sent.
+    #[cfg(feature = "server")]
+    #[derive(Clone, Default)]
+    struct PackageHandler {
+        received: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    #[cfg(feature = "server")]
+    #[async_trait::async_trait]
+    impl super::Handler for PackageHandler {
+        async fn node_package(
+            &mut self,
+            req: crate::types::node::NodePackageRequest,
+        ) -> Result<crate::types::node::NodePackageResponse, String> {
+            use crate::types::node::{
+                Lifecycle, NodePackageRequest, NodePackageResponse, PackageState,
+            };
+
+            match req {
+                NodePackageRequest::Remove { .. } => Ok(NodePackageResponse::Done),
+                NodePackageRequest::ListInstalled => {
+                    Ok(NodePackageResponse::Installed(installed_pair()))
+                }
+                NodePackageRequest::Status { .. } => Ok(NodePackageResponse::State(PackageState {
+                    version: "1.2.3".into(),
+                    commit: "0123456789abcdef".into(),
+                    lifecycle: Lifecycle::Stopped,
+                    bound_addrs: vec![],
+                })),
+                NodePackageRequest::Install { .. } => {
+                    Err("an install must never reach the unary method".to_string())
+                }
+            }
+        }
+
+        async fn node_package_install_preflight(
+            &mut self,
+            req: &crate::types::node::NodePackageRequest,
+        ) -> Result<crate::types::node::InstallPreflight, String> {
+            use crate::types::node::{InstallPreflight, NodePackageRequest};
+
+            let NodePackageRequest::Install { target, .. } = req else {
+                return Err("the preflight must only see an install".to_string());
+            };
+            match target.as_str() {
+                "already" => Ok(InstallPreflight::AlreadyApplied),
+                "nospace" => Ok(InstallPreflight::InsufficientDiskSpace {
+                    filesystem: "/opt".to_string(),
+                    required: 4_194_304,
+                    available: 1_024,
+                }),
+                _ => Ok(InstallPreflight::Proceed),
+            }
+        }
+
+        async fn node_package_install(
+            &mut self,
+            req: crate::types::node::NodePackageRequest,
+            pkg: &mut super::PackageReader<'_>,
+        ) -> Result<crate::types::node::NodePackageResponse, String> {
+            use crate::types::node::{NodePackageRequest, NodePackageResponse};
+
+            let NodePackageRequest::Install { target, .. } = req else {
+                return Err("the install path must only see an install".to_string());
+            };
+
+            let mut payload = Vec::new();
+            let mut chunk = Vec::new();
+            while pkg
+                .next_chunk(&mut chunk)
+                .await
+                .map_err(|e| format!("failed to read the payload: {e}"))?
+            {
+                payload.extend_from_slice(&chunk);
+            }
+            assert_eq!(pkg.remaining(), 0);
+            assert_eq!(payload.len() as u64, pkg.size());
+            *self.received.lock().unwrap() = payload;
+
+            if target == "selfdisrupting" {
+                Ok(NodePackageResponse::Accepted)
+            } else {
+                Ok(NodePackageResponse::Done)
+            }
+        }
+    }
+
+    /// Round-trip helper for the unary `node.package` variants
+    /// through `handle`.
+    #[cfg(feature = "server")]
+    async fn package_unary_roundtrip(
+        req: crate::types::node::NodePackageRequest,
+        expected: crate::types::node::NodePackageResponse,
+    ) {
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::NodePackageResponse;
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = PackageHandler::default();
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let res: Result<NodePackageResponse, String> = crate::unary_request(
+            &mut client_send,
+            &mut client_recv,
+            u32::from(RequestCode::NodePackage),
+            req,
+        )
+        .await
+        .expect("wire transport should succeed");
+
+        assert_eq!(res.expect("response should be Ok"), expected);
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// Round-trip helper for the unary `node.package` variants
+    /// through `handle_node`.
+    #[cfg(feature = "server")]
+    async fn package_unary_roundtrip_handle_node(
+        req: crate::types::node::NodePackageRequest,
+        expected: crate::types::node::NodePackageResponse,
+    ) {
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::NodePackageResponse;
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = PackageHandler::default();
+            super::handle_node(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let res: Result<NodePackageResponse, String> = crate::unary_request(
+            &mut client_send,
+            &mut client_recv,
+            u32::from(RequestCode::NodePackage),
+            req,
+        )
+        .await
+        .expect("wire transport should succeed");
+
+        assert_eq!(res.expect("response should be Ok"), expected);
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// `Remove` is unary through `handle`.
     #[tokio::test]
     #[cfg(feature = "server")]
-    async fn handle_node_package_is_unserved() {
+    async fn node_package_remove_roundtrip() {
+        use crate::types::node::{NodePackageRequest, NodePackageResponse};
+        package_unary_roundtrip(
+            NodePackageRequest::Remove {
+                target: "sensor".into(),
+                instance: Some(1),
+                idempotency_key: "idem-1".into(),
+            },
+            NodePackageResponse::Done,
+        )
+        .await;
+    }
+
+    /// `ListInstalled` carries entries that differ only in
+    /// `instance`.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_list_installed_roundtrip() {
+        use crate::types::node::{NodePackageRequest, NodePackageResponse};
+        package_unary_roundtrip(
+            NodePackageRequest::ListInstalled,
+            NodePackageResponse::Installed(installed_pair()),
+        )
+        .await;
+    }
+
+    /// `Status` is unary through `handle`.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_status_roundtrip() {
+        use crate::types::node::{
+            Lifecycle, NodePackageRequest, NodePackageResponse, PackageState,
+        };
+        package_unary_roundtrip(
+            NodePackageRequest::Status {
+                target: "sensor".into(),
+                instance: Some(1),
+            },
+            NodePackageResponse::State(PackageState {
+                version: "1.2.3".into(),
+                commit: "0123456789abcdef".into(),
+                lifecycle: Lifecycle::Stopped,
+                bound_addrs: vec![],
+            }),
+        )
+        .await;
+    }
+
+    /// `Remove` is unary through `handle_node` too.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_package_remove_roundtrip() {
+        use crate::types::node::{NodePackageRequest, NodePackageResponse};
+        package_unary_roundtrip_handle_node(
+            NodePackageRequest::Remove {
+                target: "sensor".into(),
+                instance: None,
+                idempotency_key: "idem-2".into(),
+            },
+            NodePackageResponse::Done,
+        )
+        .await;
+    }
+
+    /// `ListInstalled` is unary through `handle_node` too.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_package_list_installed_roundtrip() {
+        use crate::types::node::{NodePackageRequest, NodePackageResponse};
+        package_unary_roundtrip_handle_node(
+            NodePackageRequest::ListInstalled,
+            NodePackageResponse::Installed(installed_pair()),
+        )
+        .await;
+    }
+
+    /// `Status` is unary through `handle_node` too.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_package_status_roundtrip() {
+        use crate::types::node::{
+            Lifecycle, NodePackageRequest, NodePackageResponse, PackageState,
+        };
+        package_unary_roundtrip_handle_node(
+            NodePackageRequest::Status {
+                target: "sensor".into(),
+                instance: Some(7),
+            },
+            NodePackageResponse::State(PackageState {
+                version: "1.2.3".into(),
+                commit: "0123456789abcdef".into(),
+                lifecycle: Lifecycle::Stopped,
+                bound_addrs: vec![],
+            }),
+        )
+        .await;
+    }
+
+    /// Sends the framed install request and returns the agent's
+    /// preflight verdict frame.
+    #[cfg(feature = "server")]
+    async fn send_install_request(
+        send: &mut quinn::SendStream,
+        recv: &mut quinn::RecvStream,
+        req: crate::types::node::NodePackageRequest,
+    ) -> Result<crate::types::node::InstallPreflight, String> {
+        use crate::types::node::InstallPreflight;
+
+        let mut buf = Vec::new();
+        oinq::message::send_request(send, &mut buf, u32::from(RequestCode::NodePackage), req)
+            .await
+            .expect("should send the install request");
+        oinq::frame::recv::<Result<InstallPreflight, String>>(recv, &mut buf)
+            .await
+            .expect("should receive the preflight verdict")
+    }
+
+    /// A payload whose length is deliberately not a multiple of the
+    /// chunk sizes the tests send it in.
+    #[cfg(feature = "server")]
+    fn payload(len: usize) -> Vec<u8> {
+        (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect()
+    }
+
+    /// A `Proceed` install transfers the payload byte-for-byte and
+    /// is answered with exactly one terminal response.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_install_proceed() {
+        use std::time::Duration;
+
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{InstallPreflight, NodePackageResponse};
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let handler = PackageHandler::default();
+        let received = handler.received.clone();
+        let server_task = tokio::spawn(async move {
+            let mut handler = handler;
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        // 2431 bytes in chunks of 1000, 1000 and 431: the length is
+        // not a multiple of the chunk size, so the last chunk is a
+        // partial one.
+        let sent = payload(2431);
+        let verdict = send_install_request(
+            &mut client_send,
+            &mut client_recv,
+            install_request("sensor", sent.len() as u64),
+        )
+        .await
+        .expect("the verdict should be Ok");
+        assert_eq!(verdict, InstallPreflight::Proceed);
+
+        for chunk in sent.chunks(1000) {
+            oinq::frame::send_raw(&mut client_send, chunk)
+                .await
+                .expect("should send a payload chunk");
+        }
+
+        let mut buf = Vec::new();
+        let resp =
+            oinq::frame::recv::<Result<NodePackageResponse, String>>(&mut client_recv, &mut buf)
+                .await
+                .expect("should receive the terminal response");
+        assert_eq!(
+            resp.expect("response should be Ok"),
+            NodePackageResponse::Done
+        );
+        assert_eq!(*received.lock().unwrap(), sent);
+
+        // Exactly one terminal frame: nothing else follows it.
+        let extra = tokio::time::timeout(
+            Duration::from_millis(200),
+            oinq::frame::recv::<Result<NodePackageResponse, String>>(&mut client_recv, &mut buf),
+        )
+        .await;
+        assert!(extra.is_err(), "a completed install sends one frame only");
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// A self-disrupting apply answers `Accepted`, and that frame is
+    /// terminal.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_install_accepted_is_terminal() {
+        use std::time::Duration;
+
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{InstallPreflight, NodePackageResponse};
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = PackageHandler::default();
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let sent = payload(600);
+        let verdict = send_install_request(
+            &mut client_send,
+            &mut client_recv,
+            install_request("selfdisrupting", sent.len() as u64),
+        )
+        .await
+        .expect("the verdict should be Ok");
+        assert_eq!(verdict, InstallPreflight::Proceed);
+
+        oinq::frame::send_raw(&mut client_send, &sent)
+            .await
+            .expect("should send the payload");
+
+        let mut buf = Vec::new();
+        let resp =
+            oinq::frame::recv::<Result<NodePackageResponse, String>>(&mut client_recv, &mut buf)
+                .await
+                .expect("should receive the terminal response");
+        assert_eq!(
+            resp.expect("response should be Ok"),
+            NodePackageResponse::Accepted
+        );
+
+        let extra = tokio::time::timeout(
+            Duration::from_millis(200),
+            oinq::frame::recv::<Result<NodePackageResponse, String>>(&mut client_recv, &mut buf),
+        )
+        .await;
+        assert!(extra.is_err(), "no frame follows `Accepted`");
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// An `AlreadyApplied` verdict ends the exchange: no bytes are
+    /// sent and no response frame follows.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_install_already_applied_is_terminal() {
+        use std::time::Duration;
+
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{InstallPreflight, NodePackageResponse};
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let handler = PackageHandler::default();
+        let received = handler.received.clone();
+        let server_task = tokio::spawn(async move {
+            let mut handler = handler;
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let verdict = send_install_request(
+            &mut client_send,
+            &mut client_recv,
+            install_request("already", 4_194_304),
+        )
+        .await
+        .expect("the verdict should be Ok");
+        assert_eq!(verdict, InstallPreflight::AlreadyApplied);
+
+        let mut buf = Vec::new();
+        let extra = tokio::time::timeout(
+            Duration::from_millis(200),
+            oinq::frame::recv::<Result<NodePackageResponse, String>>(&mut client_recv, &mut buf),
+        )
+        .await;
+        assert!(
+            extra.is_err(),
+            "`AlreadyApplied` is the terminal frame; nothing follows it"
+        );
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "no payload should have been requested"
+        );
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// An `InsufficientDiskSpace` verdict ends the exchange and
+    /// carries its measurements through.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_install_insufficient_disk_space_is_terminal() {
+        use std::time::Duration;
+
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{InstallPreflight, NodePackageResponse};
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = PackageHandler::default();
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let verdict = send_install_request(
+            &mut client_send,
+            &mut client_recv,
+            install_request("nospace", 4_194_304),
+        )
+        .await
+        .expect("the verdict should be Ok");
+        assert_eq!(
+            verdict,
+            InstallPreflight::InsufficientDiskSpace {
+                filesystem: "/opt".to_string(),
+                required: 4_194_304,
+                available: 1_024,
+            }
+        );
+
+        let mut buf = Vec::new();
+        let extra = tokio::time::timeout(
+            Duration::from_millis(200),
+            oinq::frame::recv::<Result<NodePackageResponse, String>>(&mut client_recv, &mut buf),
+        )
+        .await;
+        assert!(
+            extra.is_err(),
+            "`InsufficientDiskSpace` is the terminal frame; nothing follows it"
+        );
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// A payload that stops short leaves the agent with an error
+    /// terminal response rather than a hang.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_install_truncated_payload() {
+        use std::time::Duration;
+
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{InstallPreflight, NodePackageResponse};
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = PackageHandler::default();
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let verdict = send_install_request(
+            &mut client_send,
+            &mut client_recv,
+            install_request("sensor", 4_096),
+        )
+        .await
+        .expect("the verdict should be Ok");
+        assert_eq!(verdict, InstallPreflight::Proceed);
+
+        // Half the declared payload, then a clean end of stream.
+        oinq::frame::send_raw(&mut client_send, &payload(2_048))
+            .await
+            .expect("should send a payload chunk");
+        client_send.finish().ok();
+
+        let mut buf = Vec::new();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            oinq::frame::recv::<Result<NodePackageResponse, String>>(&mut client_recv, &mut buf),
+        )
+        .await
+        .expect("the agent must answer rather than hang")
+        .expect("should receive the terminal response");
+        assert!(
+            resp.unwrap_err().contains("failed to read the payload"),
+            "a truncated transfer is an error terminal response"
+        );
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// A payload cut off by a peer reset is an error terminal
+    /// response too, not a hang.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_install_reset_payload() {
+        use std::time::Duration;
+
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{InstallPreflight, NodePackageResponse};
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = PackageHandler::default();
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let verdict = send_install_request(
+            &mut client_send,
+            &mut client_recv,
+            install_request("sensor", 4_096),
+        )
+        .await
+        .expect("the verdict should be Ok");
+        assert_eq!(verdict, InstallPreflight::Proceed);
+
+        oinq::frame::send_raw(&mut client_send, &payload(1_024))
+            .await
+            .expect("should send a payload chunk");
+        client_send.reset(quinn::VarInt::from_u32(1)).ok();
+
+        let mut buf = Vec::new();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            oinq::frame::recv::<Result<NodePackageResponse, String>>(&mut client_recv, &mut buf),
+        )
+        .await
+        .expect("the agent must answer rather than hang")
+        .expect("should receive the terminal response");
+        assert!(
+            resp.is_err(),
+            "a reset transfer is an error terminal response"
+        );
+
+        drop(client_send);
+        drop(client_recv);
+
+        // The reset also breaks the dispatch loop's own next read, so
+        // its result is not asserted here.
+        let _ = server_task.await.unwrap();
+    }
+
+    /// The install exchange consumes exactly its own bytes, so the
+    /// next request on the same stream still round-trips.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_install_leaves_the_loop_aligned() {
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{
+            InstallPreflight, NodePackageResponse, NodeServiceRequest, NodeServiceResponse,
+        };
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = PackageHandler::default();
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let sent = payload(1_500);
+        let verdict = send_install_request(
+            &mut client_send,
+            &mut client_recv,
+            install_request("sensor", sent.len() as u64),
+        )
+        .await
+        .expect("the verdict should be Ok");
+        assert_eq!(verdict, InstallPreflight::Proceed);
+
+        for chunk in sent.chunks(512) {
+            oinq::frame::send_raw(&mut client_send, chunk)
+                .await
+                .expect("should send a payload chunk");
+        }
+
+        let mut buf = Vec::new();
+        let resp =
+            oinq::frame::recv::<Result<NodePackageResponse, String>>(&mut client_recv, &mut buf)
+                .await
+                .expect("should receive the terminal response");
+        assert_eq!(
+            resp.expect("response should be Ok"),
+            NodePackageResponse::Done
+        );
+
+        // A normal node request on the same stream, after the
+        // install: the dispatch loop resumed on the request frame.
+        let res: Result<NodeServiceResponse, String> = crate::unary_request(
+            &mut client_send,
+            &mut client_recv,
+            u32::from(RequestCode::NodeService),
+            NodeServiceRequest::Status {
+                service: "nginx".into(),
+            },
+        )
+        .await
+        .expect("wire transport should succeed");
+        assert_eq!(res.unwrap_err(), "not supported");
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// An agent that overrides none of the new handler methods
+    /// answers `"not supported"` to a unary `node.package` request.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_default_not_supported() {
         use crate::test::{TOKEN, channel};
         use crate::types::node::{NodePackageRequest, NodePackageResponse};
 
@@ -2585,12 +3713,15 @@ mod tests {
             &mut client_send,
             &mut client_recv,
             u32::from(RequestCode::NodePackage),
-            NodePackageRequest::ListInstalled,
+            NodePackageRequest::Status {
+                target: "sensor".into(),
+                instance: Some(1),
+            },
         )
         .await
         .expect("wire transport should succeed");
 
-        assert_eq!(res.unwrap_err(), "unknown request code: 109");
+        assert_eq!(res.unwrap_err(), "not supported");
 
         drop(client_send);
         drop(client_recv);
@@ -2599,11 +3730,10 @@ mod tests {
         assert!(server_res.is_ok());
     }
 
-    /// `handle_node` answers the not-yet-served `node.package`
-    /// family as an unknown code, through its `_` arm.
+    /// The same through `handle_node`, on a `NodeHandler`-only type.
     #[tokio::test]
     #[cfg(feature = "server")]
-    async fn handle_node_node_package_is_unserved() {
+    async fn handle_node_package_default_not_supported() {
         use crate::test::{TOKEN, channel};
         use crate::types::node::{NodePackageRequest, NodePackageResponse};
 
@@ -2622,15 +3752,133 @@ mod tests {
             &mut client_send,
             &mut client_recv,
             u32::from(RequestCode::NodePackage),
-            NodePackageRequest::Status {
-                target: "sensor".into(),
-                instance: Some(1),
-            },
+            NodePackageRequest::ListInstalled,
         )
         .await
         .expect("wire transport should succeed");
 
-        assert_eq!(res.unwrap_err(), "unknown request code: 109");
+        assert_eq!(res.unwrap_err(), "not supported");
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// An agent that overrides none of the new handler methods
+    /// answers an `Install` with `"not supported"` as the terminal
+    /// preflight frame, and asks for no bytes.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_install_default_not_supported() {
+        use std::time::Duration;
+
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::NodePackageResponse;
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = NoopHandler;
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let verdict = send_install_request(
+            &mut client_send,
+            &mut client_recv,
+            install_request("sensor", 4_194_304),
+        )
+        .await;
+        assert_eq!(verdict.unwrap_err(), "not supported");
+
+        let mut buf = Vec::new();
+        let extra = tokio::time::timeout(
+            Duration::from_millis(200),
+            oinq::frame::recv::<Result<NodePackageResponse, String>>(&mut client_recv, &mut buf),
+        )
+        .await;
+        assert!(
+            extra.is_err(),
+            "an error verdict is itself the terminal frame"
+        );
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// A code this crate has not assigned still takes the
+    /// fail-closed path through `handle`.  This is what an older
+    /// binary, whose `RequestCode` has no `NodePackage` variant,
+    /// does with 109.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_unassigned_code_is_unknown() {
+        use crate::test::{TOKEN, channel};
+
+        const UNASSIGNED: u32 = 111;
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        assert_eq!(
+            RequestCode::from_primitive(UNASSIGNED),
+            RequestCode::Unknown,
+            "the test needs a code this crate has not assigned"
+        );
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = NoopHandler;
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let res: Result<(), String> =
+            crate::unary_request(&mut client_send, &mut client_recv, UNASSIGNED, ())
+                .await
+                .expect("wire transport should succeed");
+        assert_eq!(res.unwrap_err(), "unknown request code: 111");
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// The same fail-closed path through `handle_node`.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_unassigned_code_is_unknown() {
+        use crate::test::{TOKEN, channel};
+
+        const UNASSIGNED: u32 = 111;
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = StandaloneNodeHandler;
+            super::handle_node(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let res: Result<(), String> =
+            crate::unary_request(&mut client_send, &mut client_recv, UNASSIGNED, ())
+                .await
+                .expect("wire transport should succeed");
+        assert_eq!(res.unwrap_err(), "unknown request code: 111");
 
         drop(client_send);
         drop(client_recv);

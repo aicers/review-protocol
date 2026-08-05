@@ -35,9 +35,35 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   `NodePackageResponse::Failed` as structured data rather than through the
   string error channel, so a caller classifies them by pattern-matching.
   `BootstrapMaterial` redacts its wrapped one-time credential from its
-  `Debug` output, so logging a request that relays it cannot leak it. The
-  request family is not dispatched yet: an agent answers a `node.package`
-  request as an unknown request code.
+  `Debug` output, so logging a request that relays it cannot leak it.
+- Added the `node.package` request family (request code 109) to both agent
+  dispatch entry points and to the manager API. On the agent side,
+  `request::Handler` and `request::NodeHandler` gain `node_package` for the
+  unary `Remove`, `ListInstalled` and `Status` operations, plus
+  `node_package_install_preflight` and `node_package_install` for `Install`;
+  each defaults to `Err("not supported")`, so an agent that implements none
+  of them answers every `node.package` request that way. On the manager
+  side, `server::Connection::node_package` and
+  `server::Connection::node_package_install` — mirrored onto the
+  `server::node::Node` handle as `package` and `package_install`, each with
+  the family's `_authorized` and `_with_context` variants — call them. Each
+  entry point rejects the other's variants before opening a stream, so an
+  `Install` is never sent without its payload.
+- Added the package-install streaming exchange. `Install` is not unary: the
+  agent answers the framed request with one `InstallPreflight` verdict, and
+  only on `Proceed` does the manager stream the `.pkg` bytes as
+  length-prefixed chunks on that same bi-stream, followed by exactly one
+  terminal response. The new `request::PackageReader` hands the agent's
+  handler a reader bounded to the request's `size`, so it cannot over-read
+  into the next request frame and the dispatch loop stays aligned. The new
+  `server::node::InstallOutcome` and `server::node::TerminalPreflight` keep
+  the two terminal shapes apart: `TerminalPreflight` has no `Proceed` arm,
+  so a continuation cannot be mistaken for a refusal.
+- Enabled `tokio`'s `io-util` feature under this crate's `server` feature.
+  `server::Connection::node_package_install` takes its byte source as
+  `tokio::io::AsyncRead`, whose `AsyncReadExt` combinators live behind
+  `io-util`. No new crate enters the dependency tree, and the `client`
+  feature still pulls in no `tokio`.
 - Added five conditionally decoded tail fields to `AgentInfo`, appended in this
   order: `capabilities`, `active_trust_epoch`, `manifest_formats`,
   `provisioning_fingerprint` and `audit_health`. An agent uses them to advertise
