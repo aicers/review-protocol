@@ -67,9 +67,10 @@
 use crate::types::node::{
     NodeHostnameRequest, NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
     NodeNetworkInterfaceRequest, NodeNetworkInterfaceResponse, NodeObservationRequest,
-    NodeObservationResponse, NodePowerRequest, NodePowerResponse, NodeRemoteAccessRequest,
-    NodeRemoteAccessResponse, NodeServiceRequest, NodeServiceResponse, NodeTimeSyncRequest,
-    NodeTimeSyncResponse, NodeVersionRequest, NodeVersionResponse,
+    NodeObservationResponse, NodePackageRequest, NodePackageResponse, NodePowerRequest,
+    NodePowerResponse, NodeRemoteAccessRequest, NodeRemoteAccessResponse, NodeServiceRequest,
+    NodeServiceResponse, NodeTimeSyncRequest, NodeTimeSyncResponse, NodeVersionRequest,
+    NodeVersionResponse,
 };
 
 /// Result of a node power-control operation.
@@ -90,6 +91,45 @@ pub enum NodePowerOutcome {
     Sent,
     /// The agent responded with a [`NodePowerResponse`].
     Response(NodePowerResponse),
+}
+
+/// The two *terminal* preflight verdicts of a package install.
+///
+/// [`Proceed`](crate::types::node::InstallPreflight::Proceed) is
+/// deliberately absent — it is a continuation, not a terminal frame —
+/// so it cannot be placed inside an
+/// [`InstallOutcome::Preflight`].  This mirrors the terminal arms of
+/// the wire [`InstallPreflight`](crate::types::node::InstallPreflight);
+/// the manager builds it from the step-2 frame and never surfaces
+/// `Proceed` here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminalPreflight {
+    /// The build is already installed and its unit is not failed.
+    AlreadyApplied,
+    /// The target filesystem cannot hold the package, decided from
+    /// the request's `size` alone before any bytes move.
+    InsufficientDiskSpace {
+        /// The filesystem that is short of space.
+        filesystem: String,
+        /// The space in bytes the install needs.
+        required: u64,
+        /// The space in bytes currently available.
+        available: u64,
+    },
+}
+
+/// Which branch of the package-install exchange terminated, so that a
+/// caller cannot mistake a preflight refusal for an applied install.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InstallOutcome {
+    /// The exchange ended at the preflight verdict.  No package bytes
+    /// were sent.  The carried [`TerminalPreflight`] is by
+    /// construction `AlreadyApplied` or `InsufficientDiskSpace`, never
+    /// `Proceed`.
+    Preflight(TerminalPreflight),
+    /// The package bytes were streamed and the agent answered once
+    /// with its terminal response.
+    Applied(NodePackageResponse),
 }
 
 /// A handle for issuing node-family requests over an existing
@@ -470,6 +510,91 @@ impl<'a> Node<'a> {
             .await
     }
 
+    /// Sends a unary node package-management request to the agent.
+    ///
+    /// Accepts [`Remove`](NodePackageRequest::Remove),
+    /// [`ListInstalled`](NodePackageRequest::ListInstalled) and
+    /// [`Status`](NodePackageRequest::Status).  An
+    /// [`Install`](NodePackageRequest::Install) is rejected — use
+    /// [`package_install`](Self::package_install), which carries the
+    /// payload the agent waits for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request is an `Install`,
+    /// serialization/deserialization failed, or communication with
+    /// the client failed.
+    pub async fn package(&self, req: NodePackageRequest) -> anyhow::Result<NodePackageResponse> {
+        self.conn.node_package(req).await
+    }
+
+    /// Sends a unary node package-management request with
+    /// authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authorization was denied, the request is
+    /// an [`Install`](NodePackageRequest::Install),
+    /// serialization/deserialization failed, or communication with
+    /// the client failed.
+    pub async fn package_authorized(
+        &self,
+        req: NodePackageRequest,
+        peer: &crate::auth::PeerContext,
+        authorizer: &dyn crate::auth::Authorizer,
+    ) -> anyhow::Result<NodePackageResponse> {
+        self.conn
+            .node_package_authorized(req, peer, authorizer)
+            .await
+    }
+
+    /// Installs a package on the agent, streaming `pkg` on the
+    /// request's own stream.
+    ///
+    /// See
+    /// [`Connection::node_package_install`](super::Connection::node_package_install)
+    /// for the exchange this drives.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request is not an
+    /// [`Install`](NodePackageRequest::Install), if `pkg` ends before
+    /// the request's `size` bytes, or if communication with the
+    /// client failed.
+    pub async fn package_install<R>(
+        &self,
+        req: NodePackageRequest,
+        pkg: R,
+    ) -> anyhow::Result<InstallOutcome>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+    {
+        self.conn.node_package_install(req, pkg).await
+    }
+
+    /// Installs a package on the agent with authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authorization was denied, if the request
+    /// is not an [`Install`](NodePackageRequest::Install), if `pkg`
+    /// ends before the request's `size` bytes, or if communication
+    /// with the client failed.
+    pub async fn package_install_authorized<R>(
+        &self,
+        req: NodePackageRequest,
+        pkg: R,
+        peer: &crate::auth::PeerContext,
+        authorizer: &dyn crate::auth::Authorizer,
+    ) -> anyhow::Result<InstallOutcome>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+    {
+        self.conn
+            .node_package_install_authorized(req, pkg, peer, authorizer)
+            .await
+    }
+
     // -- _with_context variants (AuthorizerV2) -----------------
 
     /// Sends a node service-control request with
@@ -685,6 +810,50 @@ impl<'a> Node<'a> {
     ) -> anyhow::Result<NodeVersionResponse> {
         self.conn
             .node_version_with_context(req, auth_ctx, authorizer)
+            .await
+    }
+
+    /// Sends a unary node package-management request with
+    /// [`AuthorizerV2`](crate::auth::AuthorizerV2) authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authorization was denied, the request is
+    /// an [`Install`](NodePackageRequest::Install),
+    /// serialization/deserialization failed, or communication with
+    /// the client failed.
+    pub async fn package_with_context(
+        &self,
+        req: NodePackageRequest,
+        auth_ctx: &crate::auth::AuthorizationContext,
+        authorizer: &dyn crate::auth::AuthorizerV2,
+    ) -> anyhow::Result<NodePackageResponse> {
+        self.conn
+            .node_package_with_context(req, auth_ctx, authorizer)
+            .await
+    }
+
+    /// Installs a package on the agent with
+    /// [`AuthorizerV2`](crate::auth::AuthorizerV2) authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authorization was denied, if the request
+    /// is not an [`Install`](NodePackageRequest::Install), if `pkg`
+    /// ends before the request's `size` bytes, or if communication
+    /// with the client failed.
+    pub async fn package_install_with_context<R>(
+        &self,
+        req: NodePackageRequest,
+        pkg: R,
+        auth_ctx: &crate::auth::AuthorizationContext,
+        authorizer: &dyn crate::auth::AuthorizerV2,
+    ) -> anyhow::Result<InstallOutcome>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+    {
+        self.conn
+            .node_package_install_with_context(req, pkg, auth_ctx, authorizer)
             .await
     }
 }
@@ -1166,6 +1335,334 @@ mod tests {
         let client_res = client_handle.await;
         assert!(client_res.is_ok());
 
+        test_env.teardown(&server_conn);
+    }
+
+    // ── node.package handle tests ────────────────────────────────
+
+    /// The payload the package test handler last received.  The
+    /// install tests hold the `TEST_ENV` lock, so they observe it one
+    /// at a time.
+    #[cfg(all(feature = "client", feature = "server"))]
+    static RECEIVED_PACKAGE: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+    /// A handler that serves the `node.package` family.
+    #[cfg(all(feature = "client", feature = "server"))]
+    struct PackageHandler;
+
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[async_trait::async_trait]
+    impl crate::request::Handler for PackageHandler {
+        async fn node_package(
+            &mut self,
+            req: NodePackageRequest,
+        ) -> Result<NodePackageResponse, String> {
+            match req {
+                NodePackageRequest::Remove { .. } => Ok(NodePackageResponse::Done),
+                NodePackageRequest::ListInstalled => Ok(NodePackageResponse::Installed(vec![])),
+                NodePackageRequest::Status { .. } => Ok(NodePackageResponse::State(PackageState {
+                    version: "1.2.3".into(),
+                    commit: "0123456789abcdef".into(),
+                    lifecycle: Lifecycle::Running,
+                    bound_addrs: vec![],
+                })),
+                NodePackageRequest::Install { .. } => {
+                    Err("an install must never reach the unary method".to_string())
+                }
+            }
+        }
+
+        async fn node_package_install_preflight(
+            &mut self,
+            _req: &NodePackageRequest,
+        ) -> Result<InstallPreflight, String> {
+            Ok(InstallPreflight::Proceed)
+        }
+
+        async fn node_package_install(
+            &mut self,
+            _req: NodePackageRequest,
+            pkg: &mut crate::request::PackageReader<'_>,
+        ) -> Result<NodePackageResponse, String> {
+            let mut payload = Vec::new();
+            let mut chunk = Vec::new();
+            while pkg
+                .next_chunk(&mut chunk)
+                .await
+                .map_err(|e| format!("failed to read the payload: {e}"))?
+            {
+                payload.extend_from_slice(&chunk);
+            }
+            *RECEIVED_PACKAGE.lock().unwrap() = payload;
+            Ok(NodePackageResponse::Done)
+        }
+    }
+
+    /// Builds an `Install` request whose payload is `size` bytes.
+    #[cfg(all(feature = "client", feature = "server"))]
+    fn install_request(size: u64) -> NodePackageRequest {
+        NodePackageRequest::Install {
+            target: "sensor".into(),
+            instance: Some(1),
+            version: "1.2.3".into(),
+            commit: "0123456789abcdef".into(),
+            size,
+            idempotency_key: "idem-1".into(),
+            bootstrap_material: None,
+            on_failure: FailurePolicy::Rollback,
+        }
+    }
+
+    /// Spawns the agent side: one accepted bi-stream served by
+    /// `crate::request::handle`.
+    #[cfg(all(feature = "client", feature = "server"))]
+    fn spawn_package_agent(
+        conn: crate::client::Connection,
+    ) -> tokio::task::JoinHandle<Result<(), crate::request::HandlerError>> {
+        tokio::spawn(async move {
+            let mut handler = PackageHandler;
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            crate::request::handle(&mut handler, &mut send, &mut recv).await
+        })
+    }
+
+    /// Verifies that `Node::package` produces the same result as
+    /// `Connection::node_package`.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn package_via_node_handle() {
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let client_handle = spawn_package_agent(client_conn.clone());
+
+        let node = server_conn.node();
+        let resp = node
+            .package(NodePackageRequest::Remove {
+                target: "sensor".into(),
+                instance: Some(1),
+                idempotency_key: "idem-1".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp, NodePackageResponse::Done);
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// Verifies that `Node::package_install` drives the whole
+    /// exchange.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn package_install_via_node_handle() {
+        use super::InstallOutcome;
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        RECEIVED_PACKAGE.lock().unwrap().clear();
+        let client_handle = spawn_package_agent(client_conn.clone());
+
+        let pkg: Vec<u8> = (0..3_333_u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let node = server_conn.node();
+        let outcome = node
+            .package_install(install_request(pkg.len() as u64), pkg.as_slice())
+            .await
+            .unwrap();
+        assert_eq!(outcome, InstallOutcome::Applied(NodePackageResponse::Done));
+        assert_eq!(*RECEIVED_PACKAGE.lock().unwrap(), pkg);
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// Verifies that `Node::package_authorized` denies before
+    /// sending when the authorizer refuses.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn package_authorized_denied_via_node_handle() {
+        use std::time::Duration;
+
+        use crate::auth::{AuthorizationError, Authorizer, PeerContext};
+        use crate::service_id::ServiceId;
+
+        struct DenyAll;
+        impl Authorizer for DenyAll {
+            fn authorize(
+                &self,
+                _peer: &PeerContext,
+                _service: &ServiceId,
+            ) -> Result<(), AuthorizationError> {
+                Err(AuthorizationError::new("denied"))
+            }
+        }
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let handler_conn = client_conn.clone();
+        let client_handle = tokio::spawn(async move { handler_conn.accept_bi().await });
+
+        let peer = PeerContext::new("test-agent");
+        let authorizer = DenyAll;
+        let node = server_conn.node();
+        let result = node
+            .package_authorized(NodePackageRequest::ListInstalled, &peer, &authorizer)
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("authorization denied")
+        );
+
+        let accepted = tokio::time::timeout(Duration::from_millis(200), client_handle).await;
+        assert!(accepted.is_err(), "a denied request is never sent");
+
+        drop(client_conn);
+        test_env.teardown(&server_conn);
+    }
+
+    /// Verifies that `Node::package_install_authorized` denies
+    /// before sending and without reading `pkg`.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn package_install_authorized_denied_via_node_handle() {
+        use std::time::Duration;
+
+        use crate::auth::{AuthorizationError, Authorizer, PeerContext};
+        use crate::service_id::ServiceId;
+
+        struct DenyAll;
+        impl Authorizer for DenyAll {
+            fn authorize(
+                &self,
+                _peer: &PeerContext,
+                _service: &ServiceId,
+            ) -> Result<(), AuthorizationError> {
+                Err(AuthorizationError::new("denied"))
+            }
+        }
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let handler_conn = client_conn.clone();
+        let client_handle = tokio::spawn(async move { handler_conn.accept_bi().await });
+
+        let peer = PeerContext::new("test-agent");
+        let authorizer = DenyAll;
+        let node = server_conn.node();
+        let pkg = vec![7_u8; 512];
+        let mut source = pkg.as_slice();
+        let result = node
+            .package_install_authorized(install_request(512), &mut source, &peer, &authorizer)
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("authorization denied")
+        );
+        assert_eq!(source.len(), pkg.len(), "`pkg` must not be read");
+
+        let accepted = tokio::time::timeout(Duration::from_millis(200), client_handle).await;
+        assert!(accepted.is_err(), "a denied request is never sent");
+
+        drop(client_conn);
+        test_env.teardown(&server_conn);
+    }
+
+    /// Verifies that `Node::package_with_context` allows a request
+    /// the `AuthorizerV2` permits.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn package_with_context_via_node_handle() {
+        use crate::auth::{AuthorizationContext, AuthorizerV2Adapter, NoopAuthorizer, PeerContext};
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let client_handle = spawn_package_agent(client_conn.clone());
+
+        let peer = PeerContext::new("test-agent");
+        let auth_ctx = AuthorizationContext::from_peer_context(&peer);
+        let authorizer = AuthorizerV2Adapter::new(NoopAuthorizer);
+        let node = server_conn.node();
+        let resp = node
+            .package_with_context(NodePackageRequest::ListInstalled, &auth_ctx, &authorizer)
+            .await
+            .unwrap();
+        assert_eq!(resp, NodePackageResponse::Installed(vec![]));
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// Verifies that `Node::package_install_with_context` denies
+    /// before sending when the `AuthorizerV2` refuses.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn package_install_with_context_denied() {
+        use std::time::Duration;
+
+        use crate::auth::{AuthorizationContext, AuthorizationError, AuthorizerV2, PeerContext};
+        use crate::service_id::ServiceId;
+
+        struct RequireAdmin;
+        impl AuthorizerV2 for RequireAdmin {
+            fn authorize_with_context(
+                &self,
+                ctx: &AuthorizationContext,
+                _service: &ServiceId,
+            ) -> Result<(), AuthorizationError> {
+                if ctx.roles().is_some_and(|r| r.iter().any(|s| s == "admin")) {
+                    Ok(())
+                } else {
+                    Err(AuthorizationError::new("admin required"))
+                }
+            }
+        }
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let handler_conn = client_conn.clone();
+        let client_handle = tokio::spawn(async move { handler_conn.accept_bi().await });
+
+        let peer = PeerContext::new("test-agent");
+        let auth_ctx = AuthorizationContext::from_peer_context(&peer);
+        let authorizer = RequireAdmin;
+        let node = server_conn.node();
+        let pkg = vec![7_u8; 256];
+        let mut source = pkg.as_slice();
+        let result = node
+            .package_install_with_context(install_request(256), &mut source, &auth_ctx, &authorizer)
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("authorization denied")
+        );
+        assert_eq!(source.len(), pkg.len(), "`pkg` must not be read");
+
+        let accepted = tokio::time::timeout(Duration::from_millis(200), client_handle).await;
+        assert!(accepted.is_err(), "a denied request is never sent");
+
+        drop(client_conn);
         test_env.teardown(&server_conn);
     }
 }

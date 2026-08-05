@@ -23,6 +23,9 @@ server = [
   "semver",
   "thiserror",
   "tokio",
+  # `AsyncReadExt`, which the package-install send loop pulls chunks
+  # with, lives behind `io-util`. The manager half only.
+  "tokio/io-util",
 ]
 tokio = ["dep:tokio"]
 test-support = ["client", "server", "rcgen", "tokio/rt-multi-thread"]

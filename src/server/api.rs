@@ -1,21 +1,34 @@
-use anyhow::anyhow;
+use anyhow::{Context, anyhow, bail};
 use oinq::frame;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::Connection;
-use super::node::NodePowerOutcome;
+use super::node::{InstallOutcome, NodePowerOutcome, TerminalPreflight};
 use crate::{
     client,
     types::{
         CustomerDataDeletionRequest, HostNetworkGroup, SamplingPolicy, TrafficFilterRule,
         node::{
-            NodeHostnameRequest, NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
-            NodeNetworkInterfaceRequest, NodeNetworkInterfaceResponse, NodeObservationRequest,
-            NodeObservationResponse, NodePowerRequest, NodePowerResponse, NodeRemoteAccessRequest,
+            InstallPreflight, NodeHostnameRequest, NodeHostnameResponse, NodeLoggingRequest,
+            NodeLoggingResponse, NodeNetworkInterfaceRequest, NodeNetworkInterfaceResponse,
+            NodeObservationRequest, NodeObservationResponse, NodePackageRequest,
+            NodePackageResponse, NodePowerRequest, NodePowerResponse, NodeRemoteAccessRequest,
             NodeRemoteAccessResponse, NodeServiceRequest, NodeServiceResponse, NodeTimeSyncRequest,
             NodeTimeSyncResponse, NodeVersionRequest, NodeVersionResponse,
         },
     },
 };
+
+/// The size of the chunks the package payload is sent in.
+///
+/// This is sender-side tuning, not wire contract: the receiver reads
+/// exactly the request's `size` bytes and must not observe how the
+/// payload was split.
+const PACKAGE_CHUNK_LEN: u64 = 64 * 1024;
+
+/// The stream error code the manager resets with when its own byte
+/// source ends before the declared `size`.
+const PACKAGE_TRANSFER_ABORTED: u32 = 1;
 
 /// The server API.
 ///
@@ -465,6 +478,83 @@ impl Connection {
             .await
     }
 
+    /// Sends a unary node package-management request to the agent.
+    ///
+    /// The request targets the agent on this connection.  The
+    /// specific operation is determined by the
+    /// [`NodePackageRequest`] variant: `Remove`, `ListInstalled` or
+    /// `Status`.
+    ///
+    /// [`Install`](NodePackageRequest::Install) is **rejected** here
+    /// rather than sent, because an install is not unary: the agent
+    /// answers it with a preflight verdict and then waits for the
+    /// package bytes that this method never sends.  Use
+    /// [`node_package_install`](Self::node_package_install) for it.
+    ///
+    /// Each variant carries a distinct
+    /// [`ServiceId`](crate::service_id::ServiceId) (e.g.
+    /// `"node.package.remove"`).  To enforce authorization, use
+    /// [`node_package_authorized`](Self::node_package_authorized)
+    /// instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request is an `Install`,
+    /// serialization/deserialization failed, or communication with
+    /// the client failed.
+    pub async fn node_package(
+        &self,
+        req: NodePackageRequest,
+    ) -> anyhow::Result<NodePackageResponse> {
+        reject_install(&req)?;
+        self.send_request(client::RequestCode::NodePackage, &req)
+            .await
+    }
+
+    /// Installs a package on the agent, streaming `pkg` on the
+    /// request's own stream.
+    ///
+    /// The exchange runs on a single bi-stream:
+    ///
+    /// 1. The framed [`Install`](NodePackageRequest::Install) request
+    ///    goes out.  No bytes yet.
+    /// 2. The agent answers with exactly one preflight verdict.
+    ///    [`AlreadyApplied`](InstallPreflight::AlreadyApplied) and
+    ///    [`InsufficientDiskSpace`](InstallPreflight::InsufficientDiskSpace)
+    ///    are terminal: this method returns
+    ///    [`InstallOutcome::Preflight`] without reading a byte of
+    ///    `pkg`.
+    /// 3. On [`Proceed`](InstallPreflight::Proceed), exactly the
+    ///    request's `size` bytes are read from `pkg` and streamed as
+    ///    length-prefixed chunks.
+    /// 4. The agent answers once, and that response is returned as
+    ///    [`InstallOutcome::Applied`].
+    ///
+    /// A source holding **more** than `size` bytes is not an error:
+    /// this method stops at `size` and performs no read beyond it, so
+    /// nothing is consumed that the caller may still need.  Pass
+    /// `&mut reader` to keep the remainder.  A source that ends
+    /// **before** `size` is an error, and the send stream is reset so
+    /// that the agent's bounded read fails instead of parking
+    /// forever; the agent's response is not awaited in that case.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `req` is not an `Install`, if `pkg` ends
+    /// before `size` bytes, if the agent reports a transport-level
+    /// failure, or if communication with the client failed.
+    pub async fn node_package_install<R>(
+        &self,
+        req: NodePackageRequest,
+        pkg: R,
+    ) -> anyhow::Result<InstallOutcome>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        let size = install_size(&req)?;
+        self.install_exchange(&req, size, pkg).await
+    }
+
     // ── authorized node feature-family methods ───────────────────
     //
     // Like the un-authorized node methods above, but each checks
@@ -755,6 +845,68 @@ impl Connection {
         .await
     }
 
+    /// Sends a unary node package-management request to the agent
+    /// with authorization.
+    ///
+    /// Behaves like [`node_package`](Self::node_package), but first
+    /// checks authorization using the method-level
+    /// [`ServiceId`](crate::service_id::ServiceId) from `req`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authorization was denied, the request is
+    /// an [`Install`](NodePackageRequest::Install),
+    /// serialization/deserialization failed, or communication with
+    /// the client failed.
+    pub async fn node_package_authorized(
+        &self,
+        req: NodePackageRequest,
+        peer: &crate::auth::PeerContext,
+        authorizer: &dyn crate::auth::Authorizer,
+    ) -> anyhow::Result<NodePackageResponse> {
+        reject_install(&req)?;
+        let sid = req.service_id();
+        self.send_request_authorized(
+            client::RequestCode::NodePackage,
+            &req,
+            &sid,
+            peer,
+            authorizer,
+        )
+        .await
+    }
+
+    /// Installs a package on the agent with authorization.
+    ///
+    /// Behaves like
+    /// [`node_package_install`](Self::node_package_install), but
+    /// first checks authorization using the method-level
+    /// [`ServiceId`](crate::service_id::ServiceId) from `req`
+    /// (`"node.package.install"`).  Nothing is sent and `pkg` is not
+    /// read if the authorizer denies the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authorization was denied, if `req` is not
+    /// an [`Install`](NodePackageRequest::Install), if `pkg` ends
+    /// before `size` bytes, or if communication with the client
+    /// failed.
+    pub async fn node_package_install_authorized<R>(
+        &self,
+        req: NodePackageRequest,
+        pkg: R,
+        peer: &crate::auth::PeerContext,
+        authorizer: &dyn crate::auth::Authorizer,
+    ) -> anyhow::Result<InstallOutcome>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        let size = install_size(&req)?;
+        let sid = req.service_id();
+        authorizer.authorize(peer, &sid).map_err(|e| anyhow!(e))?;
+        self.install_exchange(&req, size, pkg).await
+    }
+
     // -- _with_context variants (AuthorizerV2) -----------------
 
     /// Sends a node service-control request with
@@ -998,20 +1150,132 @@ impl Connection {
         .await
     }
 
+    /// Sends a unary node package-management request with
+    /// [`AuthorizerV2`](crate::auth::AuthorizerV2) authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authorization was denied, the request is
+    /// an [`Install`](NodePackageRequest::Install),
+    /// serialization/deserialization failed, or communication with
+    /// the client failed.
+    pub async fn node_package_with_context(
+        &self,
+        req: NodePackageRequest,
+        auth_ctx: &crate::auth::AuthorizationContext,
+        authorizer: &dyn crate::auth::AuthorizerV2,
+    ) -> anyhow::Result<NodePackageResponse> {
+        reject_install(&req)?;
+        let sid = req.service_id();
+        self.send_request_authorized_with_context(
+            client::RequestCode::NodePackage,
+            &req,
+            &sid,
+            auth_ctx,
+            authorizer,
+        )
+        .await
+    }
+
+    /// Installs a package on the agent with
+    /// [`AuthorizerV2`](crate::auth::AuthorizerV2) authorization.
+    ///
+    /// See [`node_package_install`](Self::node_package_install) for
+    /// the exchange this drives.  Nothing is sent and `pkg` is not
+    /// read if the authorizer denies the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authorization was denied, if `req` is not
+    /// an [`Install`](NodePackageRequest::Install), if `pkg` ends
+    /// before `size` bytes, or if communication with the client
+    /// failed.
+    pub async fn node_package_install_with_context<R>(
+        &self,
+        req: NodePackageRequest,
+        pkg: R,
+        auth_ctx: &crate::auth::AuthorizationContext,
+        authorizer: &dyn crate::auth::AuthorizerV2,
+    ) -> anyhow::Result<InstallOutcome>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        let size = install_size(&req)?;
+        let sid = req.service_id();
+        authorizer
+            .authorize_with_context(auth_ctx, &sid)
+            .map_err(|e| anyhow!(e))?;
+        self.install_exchange(&req, size, pkg).await
+    }
+
+    /// Drives the whole install exchange on one bi-stream.
+    ///
+    /// `size` is the payload length taken from `req`, which the
+    /// callers have already checked is an
+    /// [`Install`](NodePackageRequest::Install).
+    async fn install_exchange<R>(
+        &self,
+        req: &NodePackageRequest,
+        size: u64,
+        mut pkg: R,
+    ) -> anyhow::Result<InstallOutcome>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        let mut buf = encode_request(client::RequestCode::NodePackage, req)?;
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        frame::send_raw(&mut send, &buf).await?;
+
+        let preflight = frame::recv::<Result<InstallPreflight, String>>(&mut recv, &mut buf)
+            .await
+            .context("receiving the install preflight verdict")?
+            .map_err(|e| anyhow!(e))?;
+        match preflight {
+            InstallPreflight::AlreadyApplied => {
+                return Ok(InstallOutcome::Preflight(TerminalPreflight::AlreadyApplied));
+            }
+            InstallPreflight::InsufficientDiskSpace {
+                filesystem,
+                required,
+                available,
+            } => {
+                return Ok(InstallOutcome::Preflight(
+                    TerminalPreflight::InsufficientDiskSpace {
+                        filesystem,
+                        required,
+                        available,
+                    },
+                ));
+            }
+            InstallPreflight::Proceed => {}
+        }
+
+        if let Err(e) = send_package(&mut send, &mut pkg, size).await {
+            // The agent is parked on a bounded read that will never
+            // complete, so the transfer has to be ended actively.  A
+            // reset says "aborted", where dropping the stream would
+            // say "cleanly finished"; either way the agent's read
+            // fails rather than hanging, and its response is not
+            // awaited here.
+            send.reset(quinn::VarInt::from_u32(PACKAGE_TRANSFER_ABORTED))
+                .ok();
+            return Err(e);
+        }
+
+        let resp = frame::recv::<Result<NodePackageResponse, String>>(&mut recv, &mut buf)
+            .await
+            .context("receiving the install response")?
+            .map_err(|e| anyhow!(e))?;
+        Ok(InstallOutcome::Applied(resp))
+    }
+
     /// Sends the given payload to the client.
     async fn send_request<T: serde::Serialize + ?Sized, S: serde::de::DeserializeOwned>(
         &self,
         request_code: client::RequestCode,
         payload: &T,
     ) -> anyhow::Result<S> {
-        let code: u32 = request_code.into();
-        let Ok(mut buf) = bincode::serde::encode_to_vec(
-            code,
-            bincode::config::standard().with_fixed_int_encoding(),
-        ) else {
-            unreachable!("serialization of u32 into memory buffer should not fail")
-        };
-        bincode::serde::encode_into_std_write(payload, &mut buf, bincode::config::standard())?;
+        let mut buf = encode_request(request_code, payload)?;
 
         let (mut send, mut recv) = self.conn.open_bi().await?;
         frame::send_raw(&mut send, &buf).await?;
@@ -1033,14 +1297,7 @@ impl Connection {
         request_code: client::RequestCode,
         payload: &T,
     ) -> anyhow::Result<()> {
-        let code: u32 = request_code.into();
-        let Ok(mut buf) = bincode::serde::encode_to_vec(
-            code,
-            bincode::config::standard().with_fixed_int_encoding(),
-        ) else {
-            unreachable!("serialization of u32 into memory buffer should not fail")
-        };
-        bincode::serde::encode_into_std_write(payload, &mut buf, bincode::config::standard())?;
+        let buf = encode_request(request_code, payload)?;
 
         let (mut send, _recv) = self.conn.open_bi().await?;
         frame::send_raw(&mut send, &buf).await?;
@@ -1088,6 +1345,91 @@ impl Connection {
             .map_err(|e| anyhow!(e))?;
         self.send_request(request_code, payload).await
     }
+}
+
+/// Encodes a request frame: the fixed-int `u32` code followed by the
+/// bincode payload.
+fn encode_request<T: serde::Serialize + ?Sized>(
+    request_code: client::RequestCode,
+    payload: &T,
+) -> anyhow::Result<Vec<u8>> {
+    let code: u32 = request_code.into();
+    let Ok(mut buf) =
+        bincode::serde::encode_to_vec(code, bincode::config::standard().with_fixed_int_encoding())
+    else {
+        unreachable!("serialization of u32 into memory buffer should not fail")
+    };
+    bincode::serde::encode_into_std_write(payload, &mut buf, bincode::config::standard())?;
+    Ok(buf)
+}
+
+/// Rejects an [`Install`](NodePackageRequest::Install) handed to a
+/// unary entry point, before anything goes on the wire.
+///
+/// # Errors
+///
+/// Returns an error if `req` is an `Install`.
+fn reject_install(req: &NodePackageRequest) -> anyhow::Result<()> {
+    if matches!(req, NodePackageRequest::Install { .. }) {
+        bail!("an install request carries a payload; use `node_package_install`");
+    }
+    Ok(())
+}
+
+/// Returns the payload length of an
+/// [`Install`](NodePackageRequest::Install) request, rejecting a
+/// unary variant handed to the install entry point before anything
+/// goes on the wire.
+///
+/// # Errors
+///
+/// Returns an error if `req` is not an `Install`.
+fn install_size(req: &NodePackageRequest) -> anyhow::Result<u64> {
+    match req {
+        NodePackageRequest::Install { size, .. } => Ok(*size),
+        NodePackageRequest::Remove { .. }
+        | NodePackageRequest::ListInstalled
+        | NodePackageRequest::Status { .. } => {
+            bail!("`node_package_install` accepts only an install request; use `node_package`")
+        }
+    }
+}
+
+/// Streams exactly `size` bytes of `pkg` as length-prefixed chunks.
+///
+/// Stops at `size` and performs no read beyond it, so a source that
+/// holds more keeps its remainder.
+///
+/// # Errors
+///
+/// Returns an error if `pkg` ends before `size` bytes or the stream
+/// could not be written.
+async fn send_package<R>(send: &mut quinn::SendStream, pkg: &mut R, size: u64) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send,
+{
+    let chunk_len = usize::try_from(PACKAGE_CHUNK_LEN)?;
+    let mut chunk = vec![0_u8; chunk_len];
+    let mut remaining = size;
+    while remaining > 0 {
+        // `want` is capped at the chunk length and a read never
+        // fills more than the slice it was given, so both bounds
+        // hold by construction.
+        let want = usize::try_from(remaining.min(PACKAGE_CHUNK_LEN))?;
+        let read = pkg
+            .read(&mut chunk[..want])
+            .await
+            .context("reading the package payload")?;
+        if read == 0 {
+            bail!(
+                "the package source ended after {} of {size} bytes",
+                size - remaining
+            );
+        }
+        frame::send_raw(send, &chunk[..read]).await?;
+        remaining -= u64::try_from(read)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1218,6 +1560,75 @@ mod tests {
                 os_version: "22.04".into(),
                 product_version: "1.0.0".into(),
             })
+        }
+
+        async fn node_package(
+            &mut self,
+            req: super::NodePackageRequest,
+        ) -> Result<super::NodePackageResponse, String> {
+            use crate::types::node::{Lifecycle, NodePackageRequest, NodePackageResponse};
+
+            match req {
+                NodePackageRequest::Remove { .. } => Ok(NodePackageResponse::Done),
+                NodePackageRequest::ListInstalled => {
+                    Ok(NodePackageResponse::Installed(installed_pair()))
+                }
+                NodePackageRequest::Status { .. } => Ok(NodePackageResponse::State(package_state(
+                    Lifecycle::Running,
+                ))),
+                NodePackageRequest::Install { .. } => {
+                    Err("an install must never reach the unary method".to_string())
+                }
+            }
+        }
+
+        async fn node_package_install_preflight(
+            &mut self,
+            req: &super::NodePackageRequest,
+        ) -> Result<super::InstallPreflight, String> {
+            use crate::types::node::{InstallPreflight, NodePackageRequest};
+
+            let NodePackageRequest::Install { target, .. } = req else {
+                return Err("the preflight must only see an install".to_string());
+            };
+            match target.as_str() {
+                "already" => Ok(InstallPreflight::AlreadyApplied),
+                "nospace" => Ok(InstallPreflight::InsufficientDiskSpace {
+                    filesystem: "/opt".to_string(),
+                    required: 4_194_304,
+                    available: 1_024,
+                }),
+                _ => Ok(InstallPreflight::Proceed),
+            }
+        }
+
+        async fn node_package_install(
+            &mut self,
+            req: super::NodePackageRequest,
+            pkg: &mut crate::request::PackageReader<'_>,
+        ) -> Result<super::NodePackageResponse, String> {
+            use crate::types::node::{NodePackageRequest, NodePackageResponse};
+
+            let NodePackageRequest::Install { target, .. } = req else {
+                return Err("the install path must only see an install".to_string());
+            };
+
+            let mut payload = Vec::new();
+            let mut chunk = Vec::new();
+            while pkg
+                .next_chunk(&mut chunk)
+                .await
+                .map_err(|e| format!("failed to read the payload: {e}"))?
+            {
+                payload.extend_from_slice(&chunk);
+            }
+            *RECEIVED_PACKAGE.lock().unwrap() = payload;
+
+            if target == "selfdisrupting" {
+                Ok(NodePackageResponse::Accepted)
+            } else {
+                Ok(NodePackageResponse::Done)
+            }
         }
 
         async fn allowlist(&mut self, list: HostNetworkGroup) -> Result<(), String> {
@@ -2080,6 +2491,459 @@ mod tests {
 
         let client_res = client_handle.await.unwrap();
         assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    // ── node.package manager tests ───────────────────────────────
+
+    /// The payload the agent-side test handler last received.  The
+    /// install tests hold the `TEST_ENV` lock, so they observe it one
+    /// at a time.
+    #[cfg(all(feature = "client", feature = "server"))]
+    static RECEIVED_PACKAGE: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+    /// A `PackageState` in the given lifecycle.
+    #[cfg(all(feature = "client", feature = "server"))]
+    fn package_state(lifecycle: crate::types::node::Lifecycle) -> crate::types::node::PackageState {
+        crate::types::node::PackageState {
+            version: "1.2.3".into(),
+            commit: "0123456789abcdef".into(),
+            lifecycle,
+            bound_addrs: vec![],
+        }
+    }
+
+    /// Two installed entries that differ only in `instance`.
+    #[cfg(all(feature = "client", feature = "server"))]
+    fn installed_pair() -> Vec<crate::types::node::InstalledPackage> {
+        use crate::types::node::{InstalledPackage, Lifecycle};
+
+        vec![
+            InstalledPackage {
+                target: "sensor".into(),
+                instance: Some(1),
+                state: package_state(Lifecycle::Running),
+            },
+            InstalledPackage {
+                target: "sensor".into(),
+                instance: Some(2),
+                state: package_state(Lifecycle::Stopped),
+            },
+        ]
+    }
+
+    /// Builds an `Install` request for `target` whose payload is
+    /// `size` bytes long.
+    #[cfg(all(feature = "client", feature = "server"))]
+    fn install_request(target: &str, size: u64) -> crate::types::node::NodePackageRequest {
+        use crate::types::node::{FailurePolicy, NodePackageRequest};
+
+        NodePackageRequest::Install {
+            target: target.into(),
+            instance: Some(1),
+            version: "1.2.3".into(),
+            commit: "0123456789abcdef".into(),
+            size,
+            idempotency_key: "idem-1".into(),
+            bootstrap_material: None,
+            on_failure: FailurePolicy::Rollback,
+        }
+    }
+
+    /// A payload of `len` bytes with a recognizable pattern.
+    #[cfg(all(feature = "client", feature = "server"))]
+    fn payload(len: usize) -> Vec<u8> {
+        (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect()
+    }
+
+    /// Spawns the agent side: one accepted bi-stream served by
+    /// `crate::request::handle`.
+    #[cfg(all(feature = "client", feature = "server"))]
+    fn spawn_agent(
+        conn: crate::client::Connection,
+    ) -> tokio::task::JoinHandle<Result<(), crate::request::HandlerError>> {
+        tokio::spawn(async move {
+            let mut handler = TestHandler;
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            crate::request::handle(&mut handler, &mut send, &mut recv).await
+        })
+    }
+
+    /// `Remove` round-trips through `Connection::node_package`.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_package_remove() {
+        use crate::types::node::{NodePackageRequest, NodePackageResponse};
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let client_handle = spawn_agent(client_conn.clone());
+
+        let resp = server_conn
+            .node_package(NodePackageRequest::Remove {
+                target: "sensor".into(),
+                instance: Some(1),
+                idempotency_key: "idem-1".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp, NodePackageResponse::Done);
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// `ListInstalled` round-trips through `Connection::node_package`,
+    /// carrying two entries that differ only in `instance`.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_package_list_installed() {
+        use crate::types::node::{NodePackageRequest, NodePackageResponse};
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let client_handle = spawn_agent(client_conn.clone());
+
+        let resp = server_conn
+            .node_package(NodePackageRequest::ListInstalled)
+            .await
+            .unwrap();
+        assert_eq!(resp, NodePackageResponse::Installed(installed_pair()));
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// `Status` round-trips through `Connection::node_package`.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_package_status() {
+        use crate::types::node::{Lifecycle, NodePackageRequest, NodePackageResponse};
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let client_handle = spawn_agent(client_conn.clone());
+
+        let resp = server_conn
+            .node_package(NodePackageRequest::Status {
+                target: "sensor".into(),
+                instance: Some(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            resp,
+            NodePackageResponse::State(package_state(Lifecycle::Running))
+        );
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// A `Proceed` install streams the payload and returns the
+    /// agent's terminal response.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_package_install_proceed() {
+        use crate::server::node::InstallOutcome;
+        use crate::types::node::NodePackageResponse;
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        RECEIVED_PACKAGE.lock().unwrap().clear();
+        let client_handle = spawn_agent(client_conn.clone());
+
+        // Not a multiple of the sender's chunk size.
+        let pkg = payload(150_000);
+        let outcome = server_conn
+            .node_package_install(install_request("sensor", pkg.len() as u64), pkg.as_slice())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            InstallOutcome::Applied(NodePackageResponse::Done),
+            "a completed install returns the agent's terminal response"
+        );
+        assert_eq!(*RECEIVED_PACKAGE.lock().unwrap(), pkg);
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// A self-disrupting apply answers `Accepted`, which the manager
+    /// treats as terminal.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_package_install_accepted_is_terminal() {
+        use crate::server::node::InstallOutcome;
+        use crate::types::node::NodePackageResponse;
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        RECEIVED_PACKAGE.lock().unwrap().clear();
+        let client_handle = spawn_agent(client_conn.clone());
+
+        let pkg = payload(4_096);
+        let outcome = server_conn
+            .node_package_install(
+                install_request("selfdisrupting", pkg.len() as u64),
+                pkg.as_slice(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            InstallOutcome::Applied(NodePackageResponse::Accepted)
+        );
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// An `AlreadyApplied` verdict ends the exchange with no bytes
+    /// sent.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_package_install_already_applied() {
+        use crate::server::node::{InstallOutcome, TerminalPreflight};
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        RECEIVED_PACKAGE.lock().unwrap().clear();
+        let client_handle = spawn_agent(client_conn.clone());
+
+        let pkg = payload(4_096);
+        let outcome = server_conn
+            .node_package_install(install_request("already", pkg.len() as u64), pkg.as_slice())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            InstallOutcome::Preflight(TerminalPreflight::AlreadyApplied)
+        );
+        assert!(
+            RECEIVED_PACKAGE.lock().unwrap().is_empty(),
+            "no package bytes are sent after a terminal verdict"
+        );
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// An `InsufficientDiskSpace` verdict ends the exchange and
+    /// carries its measurements through.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_package_install_insufficient_disk_space() {
+        use crate::server::node::{InstallOutcome, TerminalPreflight};
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        RECEIVED_PACKAGE.lock().unwrap().clear();
+        let client_handle = spawn_agent(client_conn.clone());
+
+        let pkg = payload(4_096);
+        let outcome = server_conn
+            .node_package_install(install_request("nospace", pkg.len() as u64), pkg.as_slice())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            InstallOutcome::Preflight(TerminalPreflight::InsufficientDiskSpace {
+                filesystem: "/opt".to_string(),
+                required: 4_194_304,
+                available: 1_024,
+            })
+        );
+        assert!(RECEIVED_PACKAGE.lock().unwrap().is_empty());
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// A source holding more than `size` succeeds, and the surplus
+    /// is left unread.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_package_install_over_long_source() {
+        use crate::server::node::InstallOutcome;
+        use crate::types::node::NodePackageResponse;
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        RECEIVED_PACKAGE.lock().unwrap().clear();
+        let client_handle = spawn_agent(client_conn.clone());
+
+        let pkg = payload(5_000);
+        let declared = 3_000;
+        let mut source = pkg.as_slice();
+        let outcome = server_conn
+            .node_package_install(install_request("sensor", declared), &mut source)
+            .await
+            .unwrap();
+        assert_eq!(outcome, InstallOutcome::Applied(NodePackageResponse::Done));
+        assert_eq!(
+            *RECEIVED_PACKAGE.lock().unwrap(),
+            pkg[..usize::try_from(declared).unwrap()],
+            "the agent receives exactly the declared size"
+        );
+        assert_eq!(
+            source,
+            &pkg[usize::try_from(declared).unwrap()..],
+            "the surplus is still unread"
+        );
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// A source that ends before `size` is an error, and the manager
+    /// does not wait for a step-4 response that will never come.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_package_install_short_source() {
+        use std::time::Duration;
+
+        use crate::types::node::InstallPreflight;
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        // An agent that answers `Proceed` and then answers nothing
+        // more, so a manager that waited for step 4 would hang.
+        let handler_conn = client_conn.clone();
+        let client_handle = tokio::spawn(async move {
+            let (mut send, mut recv) = handler_conn.accept_bi().await.unwrap();
+            let mut buf = Vec::new();
+            oinq::message::recv_request_raw(&mut recv, &mut buf)
+                .await
+                .unwrap();
+            crate::request::send_response(
+                &mut send,
+                &mut buf,
+                Ok::<InstallPreflight, String>(InstallPreflight::Proceed),
+            )
+            .await
+            .unwrap();
+            // Park until the test drops the connection.
+            std::future::pending::<()>().await;
+        });
+
+        let pkg = payload(1_000);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            server_conn.node_package_install(install_request("sensor", 8_000), pkg.as_slice()),
+        )
+        .await
+        .expect("the manager must not wait for the agent's response");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("ended after 1000 of 8000 bytes"),
+            "unexpected error: {err}"
+        );
+
+        client_handle.abort();
+        test_env.teardown(&server_conn);
+    }
+
+    /// `node_package` refuses an `Install` before anything goes on
+    /// the wire.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_package_rejects_install() {
+        use std::time::Duration;
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let handler_conn = client_conn.clone();
+        let client_handle = tokio::spawn(async move { handler_conn.accept_bi().await });
+
+        let err = server_conn
+            .node_package(install_request("sensor", 4_096))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("node_package_install"), "unexpected: {err}");
+
+        let accepted = tokio::time::timeout(Duration::from_millis(200), client_handle).await;
+        assert!(
+            accepted.is_err(),
+            "the agent must not see a request frame at all"
+        );
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// `node_package_install` refuses each unary variant before
+    /// anything goes on the wire or a byte of `pkg` is read.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_package_install_rejects_unary_variants() {
+        use std::time::Duration;
+
+        use crate::types::node::NodePackageRequest;
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let handler_conn = client_conn.clone();
+        let client_handle = tokio::spawn(async move { handler_conn.accept_bi().await });
+
+        let unary = [
+            NodePackageRequest::Remove {
+                target: "sensor".into(),
+                instance: Some(1),
+                idempotency_key: "idem-1".into(),
+            },
+            NodePackageRequest::ListInstalled,
+            NodePackageRequest::Status {
+                target: "sensor".into(),
+                instance: Some(1),
+            },
+        ];
+        let pkg = payload(64);
+        for req in unary {
+            let mut source = pkg.as_slice();
+            let err = server_conn
+                .node_package_install(req, &mut source)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("node_package"), "unexpected: {err}");
+            assert_eq!(source.len(), pkg.len(), "`pkg` must not be read");
+        }
+
+        let accepted = tokio::time::timeout(Duration::from_millis(200), client_handle).await;
+        assert!(
+            accepted.is_err(),
+            "the agent must not see a request frame at all"
+        );
 
         test_env.teardown(&server_conn);
     }
