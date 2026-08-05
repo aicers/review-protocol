@@ -65,12 +65,12 @@
 //! ```
 
 use crate::types::node::{
-    NodeHostnameRequest, NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
-    NodeNetworkInterfaceRequest, NodeNetworkInterfaceResponse, NodeObservationRequest,
-    NodeObservationResponse, NodePackageRequest, NodePackageResponse, NodePowerRequest,
-    NodePowerResponse, NodeRemoteAccessRequest, NodeRemoteAccessResponse, NodeServiceRequest,
-    NodeServiceResponse, NodeTimeSyncRequest, NodeTimeSyncResponse, NodeVersionRequest,
-    NodeVersionResponse,
+    NodeEnrollRequest, NodeEnrollResponse, NodeHostnameRequest, NodeHostnameResponse,
+    NodeLoggingRequest, NodeLoggingResponse, NodeNetworkInterfaceRequest,
+    NodeNetworkInterfaceResponse, NodeObservationRequest, NodeObservationResponse,
+    NodePackageRequest, NodePackageResponse, NodePowerRequest, NodePowerResponse,
+    NodeRemoteAccessRequest, NodeRemoteAccessResponse, NodeServiceRequest, NodeServiceResponse,
+    NodeTimeSyncRequest, NodeTimeSyncResponse, NodeVersionRequest, NodeVersionResponse,
 };
 
 /// Result of a node power-control operation.
@@ -595,6 +595,41 @@ impl<'a> Node<'a> {
             .await
     }
 
+    /// Sends a node service-enrollment request to the agent.
+    ///
+    /// This family is directed at the **registrar** agent.  A
+    /// registrar refusal is not an error: it arrives as
+    /// [`NodeEnrollResponse::Failed`], which the caller classifies by
+    /// matching or through the response's own
+    /// [`retry_after`](NodeEnrollResponse::retry_after) and
+    /// [`leaves_teardown_owed`](NodeEnrollResponse::leaves_teardown_owed).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization/deserialization failed
+    /// or communication with the client failed.
+    pub async fn enroll(&self, req: NodeEnrollRequest) -> anyhow::Result<NodeEnrollResponse> {
+        self.conn.node_enroll(req).await
+    }
+
+    /// Sends a node service-enrollment request with authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authorization was denied,
+    /// serialization/deserialization failed, or communication
+    /// with the client failed.
+    pub async fn enroll_authorized(
+        &self,
+        req: NodeEnrollRequest,
+        peer: &crate::auth::PeerContext,
+        authorizer: &dyn crate::auth::Authorizer,
+    ) -> anyhow::Result<NodeEnrollResponse> {
+        self.conn
+            .node_enroll_authorized(req, peer, authorizer)
+            .await
+    }
+
     // -- _with_context variants (AuthorizerV2) -----------------
 
     /// Sends a node service-control request with
@@ -854,6 +889,25 @@ impl<'a> Node<'a> {
     {
         self.conn
             .node_package_install_with_context(req, pkg, auth_ctx, authorizer)
+            .await
+    }
+
+    /// Sends a node service-enrollment request with
+    /// [`AuthorizerV2`](crate::auth::AuthorizerV2) authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authorization was denied,
+    /// serialization/deserialization failed, or communication
+    /// with the client failed.
+    pub async fn enroll_with_context(
+        &self,
+        req: NodeEnrollRequest,
+        auth_ctx: &crate::auth::AuthorizationContext,
+        authorizer: &dyn crate::auth::AuthorizerV2,
+    ) -> anyhow::Result<NodeEnrollResponse> {
+        self.conn
+            .node_enroll_with_context(req, auth_ctx, authorizer)
             .await
     }
 }
@@ -1579,6 +1633,314 @@ mod tests {
         assert!(accepted.is_err(), "a denied request is never sent");
 
         drop(client_conn);
+        test_env.teardown(&server_conn);
+    }
+
+    // ── node.enroll handle tests ─────────────────────────────────
+
+    /// The material the enroll test handler mints.
+    #[cfg(all(feature = "client", feature = "server"))]
+    fn enroll_material() -> BootstrapMaterial {
+        BootstrapMaterial {
+            role_id: "sensor-installer".into(),
+            wrapped_secret_id: "s.9f3c1b".into(),
+            ca_anchor: vec![0x30, 0x82, 0x01, 0x0a],
+            expires_at: "2026-01-02T03:04:05.123456789Z"
+                .parse()
+                .expect("literal is a valid timestamp"),
+        }
+    }
+
+    /// A `Register` request for the identity the handler serves.
+    #[cfg(all(feature = "client", feature = "server"))]
+    fn enroll_register() -> NodeEnrollRequest {
+        NodeEnrollRequest::Register {
+            service_name: "sensor".into(),
+            delivery_mode: DeliveryMode::RemoteBootstrap,
+            host: "host01".into(),
+            instance: Some(1),
+            spec: ServiceSpec {
+                component: "sensor".into(),
+                service_name: "sensor".into(),
+                reload: ReloadHook("reload-sensor".into()),
+                cert_group: Some(CertGroup("internal".into())),
+            },
+            wrap_ttl: std::time::Duration::from_mins(10),
+            idempotency_key: "idem-1".into(),
+        }
+    }
+
+    /// A handler that serves the `node.enroll` family: it mints for a
+    /// `Register`, tears down for a `Deregister` on the bound host,
+    /// and refuses a wrong-host teardown with a typed failure.
+    #[cfg(all(feature = "client", feature = "server"))]
+    struct EnrollHandler;
+
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[async_trait::async_trait]
+    impl crate::request::Handler for EnrollHandler {
+        async fn node_enroll(
+            &mut self,
+            req: NodeEnrollRequest,
+        ) -> Result<NodeEnrollResponse, String> {
+            match req {
+                NodeEnrollRequest::Register { .. } => {
+                    Ok(NodeEnrollResponse::Material(enroll_material()))
+                }
+                NodeEnrollRequest::Deregister { host, .. } if host == "host01" => {
+                    Ok(NodeEnrollResponse::Done)
+                }
+                NodeEnrollRequest::Deregister { .. } => Ok(NodeEnrollResponse::Failed(
+                    NodeEnrollError::ServiceHostMismatch,
+                )),
+            }
+        }
+    }
+
+    /// Spawns the registrar side: one accepted bi-stream served by
+    /// `crate::request::handle`.
+    #[cfg(all(feature = "client", feature = "server"))]
+    fn spawn_enroll_agent(
+        conn: crate::client::Connection,
+    ) -> tokio::task::JoinHandle<Result<(), crate::request::HandlerError>> {
+        tokio::spawn(async move {
+            let mut handler = EnrollHandler;
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            crate::request::handle(&mut handler, &mut send, &mut recv).await
+        })
+    }
+
+    /// Verifies that `Node::enroll` round-trips a `Register` and
+    /// returns the minted material.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn enroll_register_via_node_handle() {
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let client_handle = spawn_enroll_agent(client_conn.clone());
+
+        let node = server_conn.node();
+        let resp = node.enroll(enroll_register()).await.unwrap();
+        assert_eq!(resp, NodeEnrollResponse::Material(enroll_material()));
+        assert_eq!(resp.retry_after(), None);
+        assert!(!resp.leaves_teardown_owed());
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// Verifies that `Node::enroll` round-trips a `Deregister`.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn enroll_deregister_via_node_handle() {
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let client_handle = spawn_enroll_agent(client_conn.clone());
+
+        let node = server_conn.node();
+        let resp = node
+            .enroll(NodeEnrollRequest::Deregister {
+                service_name: "sensor".into(),
+                host: "host01".into(),
+                instance: Some(1),
+                idempotency_key: "idem-1".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp, NodeEnrollResponse::Done);
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// A typed registrar refusal arrives as a successful response the
+    /// caller matches on, not as a transport error.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn enroll_typed_failure_via_node_handle() {
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let client_handle = spawn_enroll_agent(client_conn.clone());
+
+        let node = server_conn.node();
+        let resp = node
+            .enroll(NodeEnrollRequest::Deregister {
+                service_name: "sensor".into(),
+                host: "other-host".into(),
+                instance: Some(1),
+                idempotency_key: "idem-1".into(),
+            })
+            .await
+            .expect("a typed refusal is success-shaped on the wire");
+        assert_eq!(
+            resp,
+            NodeEnrollResponse::Failed(NodeEnrollError::ServiceHostMismatch)
+        );
+        assert_eq!(resp.retry_after(), None);
+        assert!(!resp.leaves_teardown_owed());
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// Verifies that `Node::enroll_authorized` denies before sending
+    /// when the authorizer refuses.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn enroll_authorized_denied_via_node_handle() {
+        use std::time::Duration;
+
+        use crate::auth::{AuthorizationError, Authorizer, PeerContext};
+        use crate::service_id::ServiceId;
+
+        struct DenyAll;
+        impl Authorizer for DenyAll {
+            fn authorize(
+                &self,
+                _peer: &PeerContext,
+                _service: &ServiceId,
+            ) -> Result<(), AuthorizationError> {
+                Err(AuthorizationError::new("denied"))
+            }
+        }
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let handler_conn = client_conn.clone();
+        let client_handle = tokio::spawn(async move { handler_conn.accept_bi().await });
+
+        let peer = PeerContext::new("test-agent");
+        let authorizer = DenyAll;
+        let node = server_conn.node();
+        let result = node
+            .enroll_authorized(enroll_register(), &peer, &authorizer)
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("authorization denied")
+        );
+
+        let accepted = tokio::time::timeout(Duration::from_millis(200), client_handle).await;
+        assert!(accepted.is_err(), "a denied request is never sent");
+
+        drop(client_conn);
+        test_env.teardown(&server_conn);
+    }
+
+    /// Authorization is checked against the request's **method-level**
+    /// identifier, so `register` and `deregister` are separately
+    /// grantable: an authorizer holding only `node.enroll.register`
+    /// passes a `Register` and refuses a `Deregister`.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn enroll_authorized_uses_the_method_level_service_id() {
+        use std::time::Duration;
+
+        use crate::auth::{AuthorizationError, Authorizer, PeerContext};
+        use crate::service_id::{NODE_ENROLL_REGISTER, ServiceId};
+
+        struct RegisterOnly;
+        impl Authorizer for RegisterOnly {
+            fn authorize(
+                &self,
+                _peer: &PeerContext,
+                service: &ServiceId,
+            ) -> Result<(), AuthorizationError> {
+                if *service == NODE_ENROLL_REGISTER {
+                    Ok(())
+                } else {
+                    Err(AuthorizationError::new("denied"))
+                }
+            }
+        }
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let client_handle = spawn_enroll_agent(client_conn.clone());
+
+        let peer = PeerContext::new("test-agent");
+        let authorizer = RegisterOnly;
+        let node = server_conn.node();
+        let resp = node
+            .enroll_authorized(enroll_register(), &peer, &authorizer)
+            .await
+            .unwrap();
+        assert_eq!(resp, NodeEnrollResponse::Material(enroll_material()));
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        // The sibling method identifier is a separate grant, and the
+        // family identifier is not what is checked: the same authorizer
+        // refuses the teardown, which is therefore never sent.
+        let handler_conn = client_conn.clone();
+        let deny_handle = tokio::spawn(async move { handler_conn.accept_bi().await });
+
+        let result = node
+            .enroll_authorized(
+                NodeEnrollRequest::Deregister {
+                    service_name: "sensor".into(),
+                    host: "host01".into(),
+                    instance: Some(1),
+                    idempotency_key: "idem-1".into(),
+                },
+                &peer,
+                &authorizer,
+            )
+            .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("authorization denied")
+        );
+
+        let accepted = tokio::time::timeout(Duration::from_millis(200), deny_handle).await;
+        assert!(accepted.is_err(), "a denied request is never sent");
+
+        drop(client_conn);
+        test_env.teardown(&server_conn);
+    }
+
+    /// Verifies that `Node::enroll_with_context` allows a request the
+    /// `AuthorizerV2` permits.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn enroll_with_context_via_node_handle() {
+        use crate::auth::{AuthorizationContext, AuthorizerV2Adapter, NoopAuthorizer, PeerContext};
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let client_handle = spawn_enroll_agent(client_conn.clone());
+
+        let peer = PeerContext::new("test-agent");
+        let auth_ctx = AuthorizationContext::from_peer_context(&peer);
+        let authorizer = AuthorizerV2Adapter::new(NoopAuthorizer);
+        let node = server_conn.node();
+        let resp = node
+            .enroll_with_context(enroll_register(), &auth_ctx, &authorizer)
+            .await
+            .unwrap();
+        assert_eq!(resp, NodeEnrollResponse::Material(enroll_material()));
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
         test_env.teardown(&server_conn);
     }
 
