@@ -421,6 +421,94 @@ pub struct EventMessage {
 /// Callers construct a request variant, send it through the protocol
 /// layer, and receive the corresponding response variant.
 ///
+/// # The reserved `"trust"` package target
+///
+/// The `node.package` family carries one reserved target. An
+/// [`Install`](node::NodePackageRequest::Install) with `target = "trust"`
+/// delivers a **release-signing trust-set generation** — the public keys by
+/// key id, the revoked-key list and the withdrawn-build list — rather than an
+/// installable component. It is how keys, revocations and withdrawals are
+/// updated at runtime once the original provisioning tool is gone, which makes
+/// it the highest-privilege channel in the family.
+///
+/// The value is reserved: it is never routed from an install or update action
+/// in a UI, and it is not part of any UI-facing package registry. A trust
+/// generation nonetheless streams over the ordinary install path, like any
+/// other package.
+///
+/// - It carries **no**
+///   [`bootstrap_material`](node::NodePackageRequest::Install::bootstrap_material).
+/// - It is verified against the **current active** trust generation, then
+///   activated as the next generation.
+/// - The generation carries a signed, strictly-monotonic `epoch`. The agent
+///   activates it **only if** that epoch is strictly greater than the active
+///   generation's; otherwise it rejects with
+///   [`StaleTrustSet`](node::NodePackageError::StaleTrustSet). This is what
+///   stops an older, validly signed generation from being replayed to restore
+///   a revoked key or drop a withdrawn build.
+/// - A trust generation carries a **package identity like any other package**:
+///   its in-package manifest sets the component to `"trust"`, the version to
+///   the generation's decimal epoch, and the commit to the generation digest.
+///   The ordinary identity check — signature, then hashes, then identity
+///   mismatch — therefore applies unchanged to the highest-privilege channel.
+///   Without this, `trust` would be the one package the identity check does
+///   not cover.
+/// - Raising the manifest format fleet-wide requires every agent binary to be
+///   updated **first**, delivered in a package of the **old** format, with the
+///   trust plane held at the minimum format any live host supports. The trust
+///   plane is the channel that carries revocations, so it must stay readable
+///   by the laggiest host.
+///
+/// A trust apply answers with one of three outcomes, and all three carry the
+/// agent's active epoch:
+/// [`NodePackageResponse::TrustActive`](node::NodePackageResponse::TrustActive),
+/// [`NodePackageError::StaleTrustSet`](node::NodePackageError::StaleTrustSet)
+/// and
+/// [`UnsupportedManifestFormat`](node::NodePackageError::UnsupportedManifestFormat).
+/// A manager reads that epoch from any of them with
+/// [`NodePackageResponse::active_trust_epoch`](node::NodePackageResponse::active_trust_epoch),
+/// without consulting its own delivery bookkeeping:
+///
+/// ```
+/// use review_protocol::types::node::{NodePackageError, NodePackageResponse};
+///
+/// // The epoch of the generation the manager streamed to the host.
+/// let delivered = 42;
+///
+/// // The agent activated it: the host is now on the delivered epoch.
+/// let resp = NodePackageResponse::TrustActive { active_epoch: delivered };
+/// assert_eq!(resp.active_trust_epoch(), Some(42));
+///
+/// // The agent rejected it as not newer, and reports where it stands.
+/// let resp = NodePackageResponse::Failed(NodePackageError::StaleTrustSet {
+///     active_epoch: 43,
+/// });
+/// assert_eq!(resp.active_trust_epoch(), Some(43));
+///
+/// // A non-trust outcome reports no epoch at all.
+/// let resp = NodePackageResponse::Failed(NodePackageError::MissingBootstrapMaterial);
+/// assert_eq!(resp.active_trust_epoch(), None);
+/// ```
+///
+/// The epoch these outcomes carry is **agent-asserted**, so it bounds the
+/// host's status **downward only**: a consumer clamps it against its own
+/// active epoch, where a report at or below that epoch may mark the host
+/// caught up, and a report **above** it is treated as un-confirmed, never as
+/// confirmed. This crate does not implement the clamp.
+///
+/// These per-apply readings are **complementary** to the connect-time
+/// [`AgentInfo::active_trust_epoch`](crate::AgentInfo::active_trust_epoch),
+/// not a duplicate of it. The handshake field is exchanged once per
+/// connection and so cannot report an activation that happens later; an agent
+/// that stays connected for weeks would never announce a newly activated epoch
+/// that way. These outcomes are what make the ground-truth reading usable on a
+/// long-lived connection.
+///
+/// This crate implements none of the trust activation itself: no epoch
+/// comparison, signature verification, trust-tree manipulation, key revocation
+/// or withdrawal handling lives here. It defines the outcomes the agent
+/// reports and documents the rule the agent must follow.
+///
 /// # Stability
 ///
 /// Low-level wire-format details such as field layout, byte order, or
@@ -432,7 +520,7 @@ pub mod node {
     use num_enum::{FromPrimitive, IntoPrimitive};
     use serde::{Deserialize, Serialize};
 
-    use super::{Process, ResourceUsage};
+    use super::{ManifestFormatRange, Process, ResourceUsage};
 
     // ── service control ─────────────────────────────────────────
 
@@ -940,6 +1028,40 @@ pub mod node {
         /// material, but deliberately NOT the manifest or signature.
         Install {
             /// The component this package places on the host.
+            ///
+            /// The value `"trust"` is **reserved**. It delivers a
+            /// release-signing trust-set generation — the public keys
+            /// by key id, the revoked-key list and the withdrawn-build
+            /// list — rather than an installable component, and is
+            /// never routed from an install or update action in a UI
+            /// nor listed in any UI-facing package registry. It
+            /// nonetheless streams over this same install path.
+            ///
+            /// A `"trust"` install carries no
+            /// [`bootstrap_material`](Self::Install::bootstrap_material).
+            /// The generation is verified against the current active
+            /// generation and then activated as the next one, and it
+            /// carries a package identity like any other package: its
+            /// in-package manifest sets the component to `"trust"`,
+            /// the version to the generation's decimal epoch and the
+            /// commit to the generation digest, so the ordinary
+            /// identity check applies unchanged to the
+            /// highest-privilege channel.
+            ///
+            /// The generation's signed `epoch` is strictly monotonic.
+            /// The agent activates it **only if** that epoch is
+            /// strictly greater than the active generation's,
+            /// answering [`NodePackageResponse::TrustActive`];
+            /// otherwise it rejects with
+            /// [`NodePackageError::StaleTrustSet`], which is what
+            /// stops an older, validly signed generation from being
+            /// replayed to restore a revoked key or drop a withdrawn
+            /// build. An agent that cannot decode the generation's
+            /// manifest format answers
+            /// [`NodePackageError::UnsupportedManifestFormat`]
+            /// instead. See the [module
+            /// documentation](crate::types::node) for the full
+            /// semantics of the reserved target.
             target: String,
             /// Which instance of `target` to place, or `None` when
             /// the component's class has no instance dimension.
@@ -1020,6 +1142,9 @@ pub mod node {
     /// [`NodePackageRequest::ListInstalled`], [`State`](Self::State)
     /// answers [`NodePackageRequest::Status`], and
     /// [`Failed`](Self::Failed) carries a typed apply failure.
+    /// [`TrustActive`](Self::TrustActive) is the terminal success of a
+    /// [reserved `"trust"` target](crate::types::node) apply, the one
+    /// outcome that reports an epoch rather than a package result.
     ///
     /// # Wire compatibility
     ///
@@ -1070,6 +1195,30 @@ pub mod node {
         /// `Result<_, String>` channel is left to transport and
         /// parse failures.
         Failed(NodePackageError),
+        /// Terminal success of a [reserved `"trust"`
+        /// target](crate::types::node) apply.
+        ///
+        /// The epoch carried here is the one the agent is ACTIVE ON
+        /// after activating, so a rollout is confirmed
+        /// in-connection rather than at the next handshake: the
+        /// connect-time [`AgentInfo::active_trust_epoch`] is
+        /// exchanged once per connection and cannot report an
+        /// activation that happens later on a still-open one.  The
+        /// two readings are complementary, not redundant.
+        ///
+        /// The value is agent-asserted, so it bounds the host's
+        /// status **downward only**: a consumer clamps it against
+        /// its own active epoch, where a report at or below that
+        /// epoch may mark the host caught up, and a report **above**
+        /// it is treated as un-confirmed, never as confirmed.  This
+        /// crate does not implement the clamp.
+        ///
+        /// [`AgentInfo::active_trust_epoch`]: crate::AgentInfo::active_trust_epoch
+        TrustActive {
+            /// The trust-set generation epoch the agent is active on
+            /// after this apply.
+            active_epoch: u64,
+        },
     }
 
     /// One installed package instance and its state.
@@ -1249,6 +1398,163 @@ pub mod node {
             /// The space in bytes currently available.
             available: u64,
         },
+        /// The delivered [reserved `"trust"`
+        /// target](crate::types::node) generation's epoch is not
+        /// strictly greater than the active one, so it was rejected.
+        ///
+        /// The epoch carried here is the agent's CURRENT active one.
+        /// That makes a rejection-on-equal an explicit
+        /// already-at-this-epoch confirmation rather than an
+        /// inference from what the manager believed it delivered, and
+        /// it is what stops an older, validly signed generation from
+        /// being replayed to restore a revoked key or drop a
+        /// withdrawn build.
+        ///
+        /// Reading the epoch here rather than at the next handshake
+        /// is what makes it usable: the connect-time
+        /// [`AgentInfo::active_trust_epoch`] is exchanged once per
+        /// connection and cannot report a later activation, so the
+        /// two readings are complementary, not redundant.
+        ///
+        /// The value is agent-asserted, so it bounds the host's
+        /// status **downward only**: a consumer clamps it against
+        /// its own active epoch, where a report at or below that
+        /// epoch may mark the host caught up, and a report **above**
+        /// it is treated as un-confirmed, never as confirmed.  This
+        /// crate does not implement the clamp.
+        ///
+        /// [`AgentInfo::active_trust_epoch`]: crate::AgentInfo::active_trust_epoch
+        StaleTrustSet {
+            /// The trust-set generation epoch the agent is currently
+            /// active on, which it kept.
+            active_epoch: u64,
+        },
+        /// The agent cannot decode the delivered [reserved `"trust"`
+        /// target](crate::types::node) generation's manifest format.
+        ///
+        /// This is **terminal for this host**: re-sending the same
+        /// generation cannot succeed, so the manager stops re-pushing
+        /// it rather than re-sending forever.  The field pair is what
+        /// makes that possible — `active_epoch` says where the host
+        /// actually stands and `supported` says which manifest
+        /// formats it can read, so the manager can name the cause
+        /// instead of marking the host generically exposed, and can
+        /// tell that raising the fleet-wide manifest format needs
+        /// this host's agent binary updated first.
+        ///
+        /// Reading the epoch here rather than at the next handshake
+        /// is what makes it usable: the connect-time
+        /// [`AgentInfo::active_trust_epoch`] is exchanged once per
+        /// connection and cannot report a later activation, so the
+        /// two readings are complementary, not redundant.
+        ///
+        /// The value is agent-asserted, so it bounds the host's
+        /// status **downward only**: a consumer clamps it against
+        /// its own active epoch, where a report at or below that
+        /// epoch may mark the host caught up, and a report **above**
+        /// it is treated as un-confirmed, never as confirmed.  This
+        /// crate does not implement the clamp.
+        ///
+        /// [`AgentInfo::active_trust_epoch`]: crate::AgentInfo::active_trust_epoch
+        UnsupportedManifestFormat {
+            /// The trust-set generation epoch the agent is currently
+            /// active on, which it kept.
+            active_epoch: u64,
+            /// The inclusive range of manifest `format_version`
+            /// values this agent can decode.
+            supported: ManifestFormatRange,
+        },
+    }
+
+    impl NodePackageError {
+        /// Returns the agent's active release-signing trust epoch if this
+        /// error reports one, or `None` for a non-trust failure.
+        ///
+        /// The epoch is agent-asserted and bounds the host's status
+        /// **downward only**; see the variant docs for the clamp a consumer
+        /// applies.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use review_protocol::types::node::NodePackageError;
+        ///
+        /// let err = NodePackageError::StaleTrustSet { active_epoch: 42 };
+        /// assert_eq!(err.active_trust_epoch(), Some(42));
+        ///
+        /// let err = NodePackageError::MissingBootstrapMaterial;
+        /// assert_eq!(err.active_trust_epoch(), None);
+        /// ```
+        #[must_use]
+        pub fn active_trust_epoch(&self) -> Option<u64> {
+            match self {
+                Self::StaleTrustSet { active_epoch }
+                | Self::UnsupportedManifestFormat { active_epoch, .. } => Some(*active_epoch),
+                // Listed explicitly rather than caught by `_`, so a future
+                // epoch-carrying variant fails the build instead of silently
+                // reading as `None`.
+                Self::TargetMismatch { .. }
+                | Self::MissingBootstrapMaterial
+                | Self::BootstrapMaterialExpired
+                | Self::InsufficientDiskSpace { .. } => None,
+            }
+        }
+    }
+
+    impl NodePackageResponse {
+        /// Returns the agent's active release-signing trust epoch if this
+        /// outcome reports one — including the trust apply errors reached
+        /// through [`Failed`](Self::Failed) — or `None` otherwise.
+        ///
+        /// One call covers all three outcomes of a [reserved `"trust"`
+        /// target](crate::types::node) apply, so a consumer computes a host's
+        /// true epoch by matching on the outcome rather than by consulting
+        /// its own delivery bookkeeping.  The name matches the connect-time
+        /// [`AgentInfo::active_trust_epoch`], the complementary reading that
+        /// a long-lived connection cannot refresh.
+        ///
+        /// The epoch is agent-asserted and bounds the host's status
+        /// **downward only**; see the variant docs for the clamp a consumer
+        /// applies.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use review_protocol::types::ManifestFormatRange;
+        /// use review_protocol::types::node::{NodePackageError, NodePackageResponse};
+        ///
+        /// let outcomes = [
+        ///     NodePackageResponse::TrustActive { active_epoch: 43 },
+        ///     NodePackageResponse::Failed(NodePackageError::StaleTrustSet {
+        ///         active_epoch: 43,
+        ///     }),
+        ///     NodePackageResponse::Failed(NodePackageError::UnsupportedManifestFormat {
+        ///         active_epoch: 43,
+        ///         supported: ManifestFormatRange { min: 1, max: 2 },
+        ///     }),
+        /// ];
+        /// for outcome in &outcomes {
+        ///     assert_eq!(outcome.active_trust_epoch(), Some(43));
+        /// }
+        ///
+        /// // A non-trust outcome reports no epoch at all.
+        /// let resp = NodePackageResponse::Failed(NodePackageError::BootstrapMaterialExpired);
+        /// assert_eq!(resp.active_trust_epoch(), None);
+        /// assert_eq!(NodePackageResponse::Done.active_trust_epoch(), None);
+        /// ```
+        ///
+        /// [`AgentInfo::active_trust_epoch`]: crate::AgentInfo::active_trust_epoch
+        #[must_use]
+        pub fn active_trust_epoch(&self) -> Option<u64> {
+            match self {
+                Self::TrustActive { active_epoch } => Some(*active_epoch),
+                Self::Failed(err) => err.active_trust_epoch(),
+                // Listed explicitly rather than caught by `_`, so a future
+                // epoch-carrying variant fails the build instead of silently
+                // reading as `None`.
+                Self::Done | Self::Accepted | Self::Installed(_) | Self::State(_) => None,
+            }
+        }
     }
 
     #[cfg(all(test, any(feature = "client", feature = "server")))]
@@ -1765,6 +2071,185 @@ pub mod node {
                 available: 1_048_576,
             };
             assert_eq!(err, roundtrip(&err));
+
+            let err = NodePackageError::StaleTrustSet { active_epoch: 43 };
+            assert_eq!(err, roundtrip(&err));
+
+            let err = NodePackageError::UnsupportedManifestFormat {
+                active_epoch: 43,
+                supported: ManifestFormatRange { min: 1, max: 3 },
+            };
+            assert_eq!(err, roundtrip(&err));
+        }
+
+        /// Every apply error that predates the reserved `"trust"` target, one
+        /// of each variant, for checking the new outcomes against all of them.
+        fn pre_existing_apply_errors() -> [NodePackageError; 4] {
+            [
+                NodePackageError::TargetMismatch {
+                    expected: PackageIdentity {
+                        target: "sensor".into(),
+                        version: "1.2.3".into(),
+                        commit: "0123456789abcdef".into(),
+                    },
+                    found: PackageIdentity {
+                        target: "collector".into(),
+                        version: "9.8.7".into(),
+                        commit: "fedcba9876543210".into(),
+                    },
+                },
+                NodePackageError::MissingBootstrapMaterial,
+                NodePackageError::BootstrapMaterialExpired,
+                NodePackageError::InsufficientDiskSpace {
+                    filesystem: "/var".into(),
+                    required: 8_388_608,
+                    available: 1_048_576,
+                },
+            ]
+        }
+
+        /// The three outcomes of a reserved `"trust"` target apply survive
+        /// the wire, and the two apply errors are told apart from each other
+        /// and from every pre-existing apply error by pattern-matching.
+        #[test]
+        fn serde_roundtrip_trust_outcomes() {
+            let resp = NodePackageResponse::TrustActive { active_epoch: 43 };
+            assert_eq!(resp, roundtrip(&resp));
+
+            let stale =
+                NodePackageResponse::Failed(NodePackageError::StaleTrustSet { active_epoch: 42 });
+            let decoded_stale = roundtrip(&stale);
+            assert_eq!(stale, decoded_stale);
+
+            // `min` and `max` differ, so a decode that collapsed or swapped
+            // them would not survive.
+            let unsupported =
+                NodePackageResponse::Failed(NodePackageError::UnsupportedManifestFormat {
+                    active_epoch: 42,
+                    supported: ManifestFormatRange { min: 1, max: 3 },
+                });
+            let decoded_unsupported = roundtrip(&unsupported);
+            assert_eq!(unsupported, decoded_unsupported);
+
+            let NodePackageResponse::Failed(NodePackageError::UnsupportedManifestFormat {
+                supported,
+                ..
+            }) = &decoded_unsupported
+            else {
+                panic!("expected an UnsupportedManifestFormat failure");
+            };
+            assert_eq!(supported.min, 1);
+            assert_eq!(supported.max, 3);
+
+            // The two trust errors are distinguishable from each other …
+            assert!(matches!(
+                decoded_stale,
+                NodePackageResponse::Failed(NodePackageError::StaleTrustSet { .. })
+            ));
+            assert!(!matches!(
+                decoded_stale,
+                NodePackageResponse::Failed(NodePackageError::UnsupportedManifestFormat { .. })
+            ));
+            assert!(!matches!(
+                decoded_unsupported,
+                NodePackageResponse::Failed(NodePackageError::StaleTrustSet { .. })
+            ));
+
+            // … and from every pre-existing apply error.
+            for err in pre_existing_apply_errors() {
+                let decoded = roundtrip(&err);
+                assert_eq!(decoded, err);
+                assert!(!matches!(decoded, NodePackageError::StaleTrustSet { .. }));
+                assert!(!matches!(
+                    decoded,
+                    NodePackageError::UnsupportedManifestFormat { .. }
+                ));
+            }
+        }
+
+        /// A consumer computes a host's true active epoch from any one of the
+        /// three trust outcomes alone, with no reference to what the manager
+        /// believed it had delivered.
+        #[test]
+        fn active_trust_epoch_is_read_from_the_outcome_alone() {
+            for resp in [
+                NodePackageResponse::TrustActive { active_epoch: 43 },
+                NodePackageResponse::Failed(NodePackageError::StaleTrustSet { active_epoch: 43 }),
+                NodePackageResponse::Failed(NodePackageError::UnsupportedManifestFormat {
+                    active_epoch: 43,
+                    supported: ManifestFormatRange { min: 1, max: 3 },
+                }),
+            ] {
+                // The reading survives the wire, so it is the agent's, not a
+                // local construction.
+                assert_eq!(roundtrip(&resp).active_trust_epoch(), Some(43));
+            }
+
+            // The two errors read the same directly, for a consumer holding
+            // only a bare `NodePackageError` handed on from the site that
+            // matched `Failed`.
+            for err in [
+                NodePackageError::StaleTrustSet { active_epoch: 43 },
+                NodePackageError::UnsupportedManifestFormat {
+                    active_epoch: 43,
+                    supported: ManifestFormatRange { min: 1, max: 3 },
+                },
+            ] {
+                assert_eq!(err.active_trust_epoch(), Some(43));
+            }
+
+            // Every non-trust outcome reports no epoch, including a `Failed`
+            // carrying any one of the pre-existing apply errors.
+            for resp in [
+                NodePackageResponse::Done,
+                NodePackageResponse::Accepted,
+                NodePackageResponse::Installed(Vec::new()),
+                NodePackageResponse::State(package_state(Lifecycle::Running, Vec::new())),
+            ]
+            .into_iter()
+            .chain(pre_existing_apply_errors().map(NodePackageResponse::Failed))
+            {
+                assert_eq!(resp.active_trust_epoch(), None);
+            }
+
+            // Every pre-existing apply error reads the same way directly.
+            for err in pre_existing_apply_errors() {
+                assert_eq!(err.active_trust_epoch(), None);
+            }
+        }
+
+        /// A `StaleTrustSet` whose `active_epoch` equals the delivered
+        /// generation's epoch is an explicit already-at-this-epoch
+        /// confirmation: the value needed to reach that conclusion travels in
+        /// the response itself.
+        #[test]
+        fn stale_trust_set_on_equal_epoch_confirms_the_host_is_already_there() {
+            const DELIVERED_EPOCH: u64 = 43;
+
+            let resp = NodePackageResponse::Failed(NodePackageError::StaleTrustSet {
+                active_epoch: DELIVERED_EPOCH,
+            });
+            let decoded = roundtrip(&resp);
+
+            // The whole reading comes from the decoded response. Nothing here
+            // consults what the manager believed it had delivered; the
+            // constant only names the epoch the assertion compares against.
+            let reported = decoded
+                .active_trust_epoch()
+                .expect("a StaleTrustSet response reports the agent's active epoch");
+            assert_eq!(
+                reported, DELIVERED_EPOCH,
+                "the host is already on the delivered epoch"
+            );
+
+            // A rejection at a *higher* epoch is a different reading from the
+            // same variant: the host moved past the delivered generation.
+            let ahead = roundtrip(&NodePackageResponse::Failed(
+                NodePackageError::StaleTrustSet {
+                    active_epoch: DELIVERED_EPOCH + 1,
+                },
+            ));
+            assert_eq!(ahead.active_trust_epoch(), Some(DELIVERED_EPOCH + 1));
         }
 
         /// A typed failure is reached through a *successful* decode,
@@ -1849,6 +2334,12 @@ pub mod node {
                 ))),
                 4
             );
+            assert_eq!(
+                variant_index(&encode(&NodePackageResponse::TrustActive {
+                    active_epoch: 43
+                })),
+                5
+            );
         }
 
         /// Declaration order is the wire order: a later insertion,
@@ -1882,6 +2373,19 @@ pub mod node {
                     available: 1_048_576,
                 })),
                 3
+            );
+            assert_eq!(
+                variant_index(&encode(&NodePackageError::StaleTrustSet {
+                    active_epoch: 43
+                })),
+                4
+            );
+            assert_eq!(
+                variant_index(&encode(&NodePackageError::UnsupportedManifestFormat {
+                    active_epoch: 43,
+                    supported: ManifestFormatRange { min: 1, max: 3 },
+                })),
+                5
             );
         }
 

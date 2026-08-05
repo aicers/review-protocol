@@ -64,6 +64,21 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   `tokio::io::AsyncRead`, whose `AsyncReadExt` combinators live behind
   `io-util`. No new crate enters the dependency tree, and the `client`
   feature still pulls in no `tokio`.
+- Added the reserved `"trust"` package target and the three outcomes a trust
+  apply reports. `NodePackageRequest::Install` with `target = "trust"` delivers
+  a release-signing trust-set generation — the public keys by key id, the
+  revoked-key list and the withdrawn-build list — rather than an installable
+  component, streaming over the existing install path with no
+  `bootstrap_material`; the agent activates it only if its signed epoch is
+  strictly greater than the active generation's. The apply answers with
+  `NodePackageResponse::TrustActive { active_epoch }`,
+  `NodePackageError::StaleTrustSet { active_epoch }` or
+  `NodePackageError::UnsupportedManifestFormat { active_epoch, supported }`,
+  the last being terminal for that host. All three carry the agent's active
+  epoch, read through the new `NodePackageResponse::active_trust_epoch()` and
+  `NodePackageError::active_trust_epoch()`, so a rollout is confirmed
+  in-connection rather than at the next handshake. The epoch is agent-asserted
+  and bounds a host's status downward only.
 - Added five conditionally decoded tail fields to `AgentInfo`, appended in this
   order: `capabilities`, `active_trust_epoch`, `manifest_formats`,
   `provisioning_fingerprint` and `audit_health`. An agent uses them to advertise
