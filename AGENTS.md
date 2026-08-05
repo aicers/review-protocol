@@ -55,7 +55,7 @@ re-run its sync. The drift check in CI fails if this copy diverges.
   descriptions or issue comments.
 <!-- END shared:workflow -->
 
-<!-- BEGIN shared:rust v1 -->
+<!-- BEGIN shared:rust v2 -->
 ## Coding standards (Rust)
 
 ### Errors and panics
@@ -86,21 +86,41 @@ re-run its sync. The drift check in CI fails if this copy diverges.
 
 - **Prefer `enum` over `String`** whenever a finite set of values is
   expected.
-- **Type casting (`as`)**:
-  - Use `as` only when the conversion is provably lossless (e.g. widening
-    `u32` to `u64`).
-  - **Integer to integer**: use `TryFrom`/`try_into()` and propagate the
-    `TryFromIntError`.
-  - **Float to integer**: `TryFrom` does not exist for this direction,
-    and `as` silently *saturates* (and maps `NaN` to 0). Check that the
-    value is finite and in range before converting, or, in a crate that
-    already depends on `num-traits`, use `ToPrimitive` (`to_u32()`,
-    `to_i64()`, ...) and handle the `None`. Adding `num-traits` for
-    this alone is subject to the dependency rule below — an explicit
-    range check needs nothing.
+- **Type casting (`as`)**: `as` checks nothing and reports nothing. Use
+  the checked form wherever one exists. Two directions have none, and
+  there `as` is a decision to be stated, not a reflex.
+  - **Integer to integer, lossless**: use `From` — `u64::from(value)`,
+    not `value as u64`. The compiler enforces the losslessness: change
+    the types so the conversion no longer fits and the impl is gone and
+    the build fails, where `as` would silently start truncating.
+  - **Integer to integer, otherwise**: use `TryFrom`/`try_into()` and
+    propagate the `TryFromIntError`.
+  - **Float to integer**: no `TryFrom` exists, and `as` saturates and
+    maps `NaN` to 0. Check the value is finite and in range yourself,
+    or use `num-traits`' `ToPrimitive` (`to_u32()`, ...) in a crate
+    that already depends on it — subject to the dependency rule below,
+    since an explicit check needs nothing. Either way, decide about the
+    fraction: `ToPrimitive` rejects `NaN` and out-of-range, then
+    truncates toward zero, so `(-0.9_f64).to_u32()` is `Some(0)`. Where
+    the value was supposed to be integral, handling the `None` is not
+    enough — test `fract() == 0.0` too.
+  - **Integer to float**: `From` where it exists (`f64::from(x: u32)`)
+    — exactly the conversions that cannot lose anything. Past them
+    nothing checks: `u64 as f64` rounds above 2^53, and `f32` stops
+    being exact above 2^24. Nor does `ToPrimitive` here — `to_f64()`
+    and `to_f32()` are `Some(x as _)`, leaving a `None` arm that can
+    never run. Use `as` after deciding rounding is acceptable across
+    the value's real range, and record why where that is not obvious.
+  - **Float to float**: `f64::from(x: f32)` widens exactly. Narrowing
+    has no checked form — `f64 as f32` rounds to nearest, so a value
+    just past `f32::MAX` lands back on it, and only one large enough to
+    overflow becomes infinity. Neither is an error. Same rule: a
+    decision, never a default.
   - `num-traits` is also the right tool for code generic over numeric
-    types. Integer/enum conversion derives come from `num-derive`, a
-    separate proc-macro crate.
+    types. Use `num-derive` only to derive its `FromPrimitive` and
+    `ToPrimitive` on simple enums or newtypes; it is not std's
+    `TryFrom`, which an enum rejecting an unknown discriminant still
+    needs.
 
 ### Ownership and performance
 
@@ -123,6 +143,8 @@ re-run its sync. The drift check in CI fails if this copy diverges.
   `sort_by_cached_key` when the key is expensive to compute.
 
 ### Async
+
+Where the crate has async code:
 
 - Use the `tokio` runtime. Avoid blocking operations in async contexts.
 - **No orphan tasks**: Do not discard the `JoinHandle` returned by
@@ -153,11 +175,14 @@ re-run its sync. The drift check in CI fails if this copy diverges.
 - **Atomic writes**: Write state, config, and other files that another
   process may read atomically — write to a temporary file in the same
   directory, then `fs::rename`. Never truncate-and-write in place.
-- **Restrictive permissions at creation**: Create files that hold secrets
-  with their final mode at open time
-  (`OpenOptions::new().mode(0o600)`), not by calling `set_permissions`
-  after writing — the latter leaves a window in which the file is
-  world-readable.
+- **Restrictive permissions at creation**: A file holding a secret gets
+  its final permissions as it is created, never afterwards —
+  `set_permissions` once the bytes are on disk leaves a window in which
+  the file is world-readable. On Unix that is
+  `OpenOptions::new().mode(0o600)`, from
+  `std::os::unix::fs::OpenOptionsExt`. These crates target Unix; if one
+  ever ships elsewhere, the equivalent has to exist before the first
+  byte is written.
 
 ### Output and logging
 
@@ -175,6 +200,49 @@ re-run its sync. The drift check in CI fails if this copy diverges.
 - A secret read from a file or an environment variable is still a
   secret. Wrap it at the boundary where it enters the program, not
   wherever it is eventually used.
+
+### Certificate verification
+
+Where the crate verifies certificates:
+
+- Verification is never disabled or weakened to make something work. If
+  a handshake or a chain check fails, fix the trust anchors, the SANs,
+  or the clock. There is no temporary exception here — only permanent
+  ones that were introduced temporarily.
+- All verification lives in one dedicated module per crate, named in the
+  repository-specific section below, whether it reaches for a library's
+  escape hatch (`rustls`'s `dangerous()`, a hand-written
+  `ServerCertVerifier` or `ClientCertVerifier`) or drives a verifier
+  directly (`webpki`'s `EndEntityCert`). Do not verify anywhere else,
+  and do not add a new path without a design decision recorded in the
+  pull request.
+- Never widen what is accepted — algorithms, key usages, name
+  constraints, validity windows — to make one certificate pass. Widening
+  admits every other certificate that fits the new opening, not only the
+  one in front of you.
+
+### Cryptography
+
+Where the crate handles key material or secrets:
+
+- Compare secrets, tokens, MACs, and certificate fingerprints in
+  constant time — `ring::constant_time::verify_slices_are_equal` in a
+  crate that already depends on `ring`. Never `==`: the derived
+  `PartialEq` on a secret-bearing type is a timing oracle.
+- Draw key material, and any value whose security rests on being
+  unguessable (session identifiers, API keys, opaque bearer tokens),
+  from a cryptographically secure source (`ring::rand::SystemRandom`)
+  — never from a general-purpose PRNG, a timestamp, or a process ID.
+  A signed token such as a JWT is not drawn this way at all: its
+  strength comes from the signing key, which is key material.
+- A nonce must meet whatever its construction documents, which is
+  usually uniqueness under a given key rather than randomness. Counter
+  and deterministically derived nonces are correct where the algorithm
+  calls for them. What is never acceptable is reusing one under the
+  same key.
+- Do not implement a cryptographic primitive by hand. If the operation is
+  not available in an existing dependency, that is a design discussion,
+  not a coding task.
 
 ### Visibility, imports, and modules
 
@@ -221,9 +289,14 @@ re-run its sync. The drift check in CI fails if this copy diverges.
 
 - Use `tempfile::tempdir()` for tests that need temporary files or
   directories. Never write to fixed paths.
-- When tests manipulate environment variables (`env::set_var`), protect
-  them with a shared `Mutex` lock so that parallel test threads do not
-  interfere with each other.
+- Do not mutate the process environment in tests. Pass the value in as a
+  parameter, or set it for a child process with `Command::env`. In
+  edition 2024 `env::set_var` is `unsafe` because another thread reading
+  the environment concurrently is undefined behaviour, and a `Mutex`
+  shared between tests does not establish otherwise: it serialises the
+  tests and says nothing about a runtime thread or a dependency reading
+  in the background. Where tests already do this, removing it is the
+  fix, not adding another lock.
 - Do not synchronise with `sleep`. Await the condition, or use
   `tokio::time` pause/advance with the `test-util` feature.
 - Do not hard-code port numbers; bind port 0 and read back the assigned
@@ -258,22 +331,6 @@ re-run its sync. The drift check in CI fails if this copy diverges.
   - If `allow` is necessary, you MUST add a comment explaining why.
   - Exceptions: `clippy::too_many_lines` can be treated loosely.
 <!-- END shared:rust -->
-
-<!-- BEGIN shared:rust-tls v1 -->
-### TLS
-
-- Certificate and hostname verification is never disabled to get a
-  handshake working. If a handshake fails, fix the trust chain, the SANs,
-  or the clock — do not reach for an escape hatch.
-- `rustls`'s `dangerous()` accessors and any hand-written
-  `ServerCertVerifier`/`ClientCertVerifier` live in one dedicated module
-  per crate, named in the repository-specific section below. Do not
-  introduce them anywhere else, and do not add a new verifier without an
-  explicit design decision recorded in the pull request.
-- Never widen a verifier to accept a certificate it would otherwise
-  reject as a temporary measure. There is no such thing as a temporary
-  measure here.
-<!-- END shared:rust-tls -->
 
 <!-- BEGIN shared:changelog v1 -->
 ## Changelog
