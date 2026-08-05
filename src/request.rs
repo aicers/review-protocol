@@ -128,6 +128,7 @@ pub struct PackageReader<'a> {
     recv: &'a mut quinn::RecvStream,
     size: u64,
     remaining: u64,
+    failed: bool,
 }
 
 impl<'a> PackageReader<'a> {
@@ -136,6 +137,7 @@ impl<'a> PackageReader<'a> {
             recv,
             size,
             remaining: size,
+            failed: false,
         }
     }
 }
@@ -160,17 +162,40 @@ impl PackageReader<'_> {
     /// Returns `Ok(false)` once exactly [`size`](Self::size) bytes
     /// have been read.
     ///
+    /// A failed read ends the transfer: the reader keeps no way to
+    /// tell how much of the declared payload is still coming, so
+    /// every later call fails without touching the stream rather
+    /// than waiting for a chunk that may never be sent.
+    ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::UnexpectedEof`] if the stream ends or
     /// resets before the whole payload arrives, and
     /// [`io::ErrorKind::InvalidData`] if a chunk would carry the
-    /// transfer past the declared `size`.
+    /// transfer past the declared `size` or if an earlier read
+    /// already failed.
     pub async fn next_chunk(&mut self, buf: &mut Vec<u8>) -> io::Result<bool> {
+        if self.failed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the package transfer already failed",
+            ));
+        }
         if self.remaining == 0 {
             buf.clear();
             return Ok(false);
         }
+        match self.read_chunk(buf).await {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                self.failed = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// Reads one chunk and accounts for it against `remaining`.
+    async fn read_chunk(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
         oinq::frame::recv_raw(self.recv, buf)
             .await
             .map_err(truncated_payload)?;
@@ -186,11 +211,15 @@ impl PackageReader<'_> {
             ));
         }
         self.remaining -= len;
-        Ok(true)
+        Ok(())
     }
 
     /// Reads whatever the handler left behind, so that the dispatch
     /// loop resumes on the next request frame.
+    ///
+    /// A transfer that already failed is not drained: there is no
+    /// determinate end to read up to, so waiting for one would park
+    /// the dispatch loop on chunks the peer has no reason to send.
     async fn drain(&mut self) -> io::Result<()> {
         let mut buf = Vec::new();
         while self.next_chunk(&mut buf).await? {}
@@ -425,7 +454,8 @@ pub trait NodeHandler: Send {
     /// [`Proceed`](InstallPreflight::Proceed).  `pkg` is bounded to
     /// the request's `size`; whatever the handler leaves unread is
     /// consumed by the dispatch loop, which then resumes on the next
-    /// request frame.  The value returned here is the single terminal
+    /// request frame, unless a read failed and the payload has no
+    /// determinate end left.  The value returned here is the single terminal
     /// frame of the exchange: there are no progress frames, and
     /// sub-steps are reported only through it.
     ///
@@ -902,7 +932,9 @@ impl<T: Handler + ?Sized> NodeHandler for T {
 /// of payload before writing the single terminal response.
 ///
 /// Whatever the handler leaves unread is consumed here, so the caller's
-/// dispatch loop resumes on the next request frame either way.
+/// dispatch loop resumes on the next request frame either way.  A
+/// transfer that failed mid-payload is the exception: the stream is no
+/// longer determinate, so it is reported rather than drained.
 async fn dispatch_node_package<H: NodeHandler>(
     handler: &mut H,
     send: &mut quinn::SendStream,
@@ -3620,6 +3652,248 @@ mod tests {
         // The reset also breaks the dispatch loop's own next read, so
         // its result is not asserted here.
         let _ = server_task.await.unwrap();
+    }
+
+    /// A chunk that overruns the declared `size` is an error terminal
+    /// response, and the agent does not park waiting for the rest of
+    /// a payload the sender has already overshot.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_install_chunk_overruns_size() {
+        use std::time::Duration;
+
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{InstallPreflight, NodePackageResponse};
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = PackageHandler::default();
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let verdict = send_install_request(
+            &mut client_send,
+            &mut client_recv,
+            install_request("sensor", 1_000),
+        )
+        .await
+        .expect("the verdict should be Ok");
+        assert_eq!(verdict, InstallPreflight::Proceed);
+
+        // Twice the declared size in one chunk, then nothing: a
+        // sender that overshoots has no reason to send more, so an
+        // agent that tried to drain the difference would hang.
+        oinq::frame::send_raw(&mut client_send, &payload(2_000))
+            .await
+            .expect("should send a payload chunk");
+
+        let mut buf = Vec::new();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            oinq::frame::recv::<Result<NodePackageResponse, String>>(&mut client_recv, &mut buf),
+        )
+        .await
+        .expect("the agent must answer rather than hang")
+        .expect("should receive the terminal response");
+        assert!(
+            resp.unwrap_err().contains("overruns"),
+            "an overrunning chunk is an error terminal response"
+        );
+
+        drop(client_send);
+        drop(client_recv);
+
+        let _ = server_task.await.unwrap();
+    }
+
+    /// A handler that leaves part of the payload unread still leaves
+    /// the dispatch loop aligned: the rest is drained for it.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_install_unread_payload_is_drained() {
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{
+            InstallPreflight, NodePackageRequest, NodePackageResponse, NodeServiceRequest,
+            NodeServiceResponse,
+        };
+
+        /// A handler that reads a single chunk and answers, leaving
+        /// the rest of the payload on the stream.
+        struct LazyPackageHandler;
+
+        #[async_trait::async_trait]
+        impl super::Handler for LazyPackageHandler {
+            async fn node_package_install_preflight(
+                &mut self,
+                _req: &NodePackageRequest,
+            ) -> Result<InstallPreflight, String> {
+                Ok(InstallPreflight::Proceed)
+            }
+
+            async fn node_package_install(
+                &mut self,
+                _req: NodePackageRequest,
+                pkg: &mut super::PackageReader<'_>,
+            ) -> Result<NodePackageResponse, String> {
+                let mut chunk = Vec::new();
+                pkg.next_chunk(&mut chunk)
+                    .await
+                    .map_err(|e| format!("failed to read the payload: {e}"))?;
+                assert!(pkg.remaining() > 0, "the handler must leave bytes behind");
+                Ok(NodePackageResponse::Done)
+            }
+        }
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = LazyPackageHandler;
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let sent = payload(1_500);
+        let verdict = send_install_request(
+            &mut client_send,
+            &mut client_recv,
+            install_request("sensor", sent.len() as u64),
+        )
+        .await
+        .expect("the verdict should be Ok");
+        assert_eq!(verdict, InstallPreflight::Proceed);
+
+        for chunk in sent.chunks(500) {
+            oinq::frame::send_raw(&mut client_send, chunk)
+                .await
+                .expect("should send a payload chunk");
+        }
+
+        let mut buf = Vec::new();
+        let resp =
+            oinq::frame::recv::<Result<NodePackageResponse, String>>(&mut client_recv, &mut buf)
+                .await
+                .expect("should receive the terminal response");
+        assert_eq!(
+            resp.expect("response should be Ok"),
+            NodePackageResponse::Done
+        );
+
+        // The two chunks the handler never read were drained, so the
+        // next request frame is where the loop resumes.
+        let res: Result<NodeServiceResponse, String> = crate::unary_request(
+            &mut client_send,
+            &mut client_recv,
+            u32::from(RequestCode::NodeService),
+            NodeServiceRequest::Status {
+                service: "nginx".into(),
+            },
+        )
+        .await
+        .expect("wire transport should succeed");
+        assert_eq!(res.unwrap_err(), "not supported");
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// The streaming exchange runs through `handle_node` too, on a
+    /// type that implements only `NodeHandler`.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_package_install_proceed() {
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{InstallPreflight, NodePackageRequest, NodePackageResponse};
+
+        /// A `NodeHandler`-only type serving the install exchange.
+        #[derive(Clone, Default)]
+        struct StandalonePackageHandler {
+            received: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl super::NodeHandler for StandalonePackageHandler {
+            async fn node_package_install_preflight(
+                &mut self,
+                _req: &NodePackageRequest,
+            ) -> Result<InstallPreflight, String> {
+                Ok(InstallPreflight::Proceed)
+            }
+
+            async fn node_package_install(
+                &mut self,
+                _req: NodePackageRequest,
+                pkg: &mut super::PackageReader<'_>,
+            ) -> Result<NodePackageResponse, String> {
+                let mut received = Vec::new();
+                let mut chunk = Vec::new();
+                while pkg
+                    .next_chunk(&mut chunk)
+                    .await
+                    .map_err(|e| format!("failed to read the payload: {e}"))?
+                {
+                    received.extend_from_slice(&chunk);
+                }
+                *self.received.lock().unwrap() = received;
+                Ok(NodePackageResponse::Done)
+            }
+        }
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let handler = StandalonePackageHandler::default();
+        let received = handler.received.clone();
+        let server_task = tokio::spawn(async move {
+            let mut handler = handler;
+            super::handle_node(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let sent = payload(2_431);
+        let verdict = send_install_request(
+            &mut client_send,
+            &mut client_recv,
+            install_request("sensor", sent.len() as u64),
+        )
+        .await
+        .expect("the verdict should be Ok");
+        assert_eq!(verdict, InstallPreflight::Proceed);
+
+        for chunk in sent.chunks(1_000) {
+            oinq::frame::send_raw(&mut client_send, chunk)
+                .await
+                .expect("should send a payload chunk");
+        }
+
+        let mut buf = Vec::new();
+        let resp =
+            oinq::frame::recv::<Result<NodePackageResponse, String>>(&mut client_recv, &mut buf)
+                .await
+                .expect("should receive the terminal response");
+        assert_eq!(
+            resp.expect("response should be Ok"),
+            NodePackageResponse::Done
+        );
+        assert_eq!(*received.lock().unwrap(), sent);
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
     }
 
     /// The install exchange consumes exactly its own bytes, so the
