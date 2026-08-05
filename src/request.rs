@@ -52,12 +52,13 @@ use crate::{
         CustomerDataDeletionRequest, HostNetworkGroup, Process, ResourceUsage, SamplingPolicy,
         TrafficFilterRule,
         node::{
-            InstallPreflight, NodeHostnameRequest, NodeHostnameResponse, NodeLoggingRequest,
-            NodeLoggingResponse, NodeNetworkInterfaceRequest, NodeNetworkInterfaceResponse,
-            NodeObservationRequest, NodeObservationResponse, NodePackageRequest,
-            NodePackageResponse, NodePowerRequest, NodePowerResponse, NodeRemoteAccessRequest,
-            NodeRemoteAccessResponse, NodeServiceRequest, NodeServiceResponse, NodeTimeSyncRequest,
-            NodeTimeSyncResponse, NodeVersionRequest, NodeVersionResponse,
+            InstallPreflight, NodeEnrollRequest, NodeEnrollResponse, NodeHostnameRequest,
+            NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
+            NodeNetworkInterfaceRequest, NodeNetworkInterfaceResponse, NodeObservationRequest,
+            NodeObservationResponse, NodePackageRequest, NodePackageResponse, NodePowerRequest,
+            NodePowerResponse, NodeRemoteAccessRequest, NodeRemoteAccessResponse,
+            NodeServiceRequest, NodeServiceResponse, NodeTimeSyncRequest, NodeTimeSyncResponse,
+            NodeVersionRequest, NodeVersionResponse,
         },
     },
 };
@@ -504,6 +505,30 @@ pub trait NodeHandler: Send {
     ) -> Result<NodePackageResponse, String> {
         Err("not supported".to_string())
     }
+
+    /// Handles a node service-enrollment request:
+    /// [`Register`](NodeEnrollRequest::Register) or
+    /// [`Deregister`](NodeEnrollRequest::Deregister).
+    ///
+    /// The family is directed at the registrar agent, so an agent
+    /// that is not the registrar leaves this method unimplemented.
+    ///
+    /// A typed registrar failure travels as
+    /// [`Failed`](NodeEnrollResponse::Failed), not through the error
+    /// channel: a string cannot be classified, and six of the seven
+    /// failures must never be retried while
+    /// [`RegistrarBusy`](crate::types::node::NodeEnrollError::RegistrarBusy)
+    /// must be retried after the delay it carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the request could not be carried out at all.  A refusal by the
+    /// registrar is reported as
+    /// [`Failed`](NodeEnrollResponse::Failed) instead.
+    async fn node_enroll(&mut self, _req: NodeEnrollRequest) -> Result<NodeEnrollResponse, String> {
+        Err("not supported".to_string())
+    }
 }
 
 /// A request handler that can handle a request to an agent.
@@ -830,6 +855,25 @@ pub trait Handler: Send {
     ) -> Result<NodePackageResponse, String> {
         Err("not supported".to_string())
     }
+
+    /// Handles a node service-enrollment request:
+    /// [`Register`](NodeEnrollRequest::Register) or
+    /// [`Deregister`](NodeEnrollRequest::Deregister).
+    ///
+    /// See [`NodeHandler::node_enroll`] for the full contract,
+    /// including why a registrar refusal travels as
+    /// [`Failed`](NodeEnrollResponse::Failed) rather than through the
+    /// error channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the request could not be carried out at all.  A refusal by the
+    /// registrar is reported as
+    /// [`Failed`](NodeEnrollResponse::Failed) instead.
+    async fn node_enroll(&mut self, _req: NodeEnrollRequest) -> Result<NodeEnrollResponse, String> {
+        Err("not supported".to_string())
+    }
 }
 
 /// Blanket implementation: every [`Handler`] automatically satisfies
@@ -919,6 +963,10 @@ impl<T: Handler + ?Sized> NodeHandler for T {
     ) -> Result<NodePackageResponse, String> {
         Handler::node_package_install(self, req, pkg).await
     }
+
+    async fn node_enroll(&mut self, req: NodeEnrollRequest) -> Result<NodeEnrollResponse, String> {
+        Handler::node_enroll(self, req).await
+    }
 }
 
 /// Serves one `node.package` request, streaming the payload when the
@@ -987,7 +1035,7 @@ async fn dispatch_node_package<H: NodeHandler>(
 /// node-family requests without implementing the full [`Handler`]
 /// trait.
 ///
-/// Only `Node*` request codes (100–109) are dispatched. Any
+/// Only `Node*` request codes (100–110) are dispatched. Any
 /// non-node request code receives an error response on the wire
 /// (same format as unknown codes in [`handle()`]).
 ///
@@ -1106,6 +1154,13 @@ pub async fn handle_node<H: NodeHandler>(
                 let req =
                     parse_args::<NodePackageRequest>(body).map_err(HandlerError::RecvError)?;
                 dispatch_node_package(handler, send, recv, &mut buf, req).await?;
+            }
+            RequestCode::NodeEnroll => {
+                let req = parse_args::<NodeEnrollRequest>(body).map_err(HandlerError::RecvError)?;
+                let result = handler.node_enroll(req).await;
+                send_response(send, &mut buf, result)
+                    .await
+                    .map_err(HandlerError::SendError)?;
             }
             _ => {
                 let err_msg = format!("unknown request code: {code}");
@@ -1437,9 +1492,18 @@ pub async fn handle<H: Handler>(
                 dispatch_node_package(handler, send, recv, &mut buf, req).await?;
             }
 
+            RequestCode::NodeEnroll => {
+                let req = parse_args::<NodeEnrollRequest>(body).map_err(HandlerError::RecvError)?;
+                let result = handler.node_enroll(req).await;
+                send_response(send, &mut buf, result)
+                    .await
+                    .map_err(HandlerError::SendError)?;
+            }
+
             // The fail-closed backstop for a code this build has not
-            // assigned. An older binary, whose `RequestCode` has no
-            // `NodePackage` variant, answers 109 through here.
+            // assigned. An older binary, whose `RequestCode` has
+            // neither a `NodePackage` nor a `NodeEnroll` variant,
+            // answers 109 and 110 through here.
             RequestCode::Unknown => {
                 let err_msg = format!("unknown request code: {code}");
                 oinq::message::send_err(send, &mut buf, err_msg)
@@ -1483,6 +1547,7 @@ mod tests {
             (RequestCode::NodeObservation, 107),
             (RequestCode::NodeVersion, 108),
             (RequestCode::NodePackage, 109),
+            (RequestCode::NodeEnroll, 110),
         ];
         for &(code, num) in cases {
             assert_eq!(u32::from(code), num);
@@ -1503,8 +1568,13 @@ mod tests {
             RequestCode::NodePackage,
             "109 is now assigned to the node.package family"
         );
+        assert_eq!(
+            RequestCode::from_primitive(110),
+            RequestCode::NodeEnroll,
+            "110 is now assigned to the node.enroll family"
+        );
         // The first value past the assigned node codes.
-        assert_eq!(RequestCode::from_primitive(110), RequestCode::Unknown);
+        assert_eq!(RequestCode::from_primitive(111), RequestCode::Unknown);
     }
 
     #[cfg(feature = "server")]
@@ -1968,6 +2038,13 @@ mod tests {
                 os_version: "22.04".into(),
                 product_version: "1.0.0".into(),
             })
+        }
+
+        async fn node_enroll(
+            &mut self,
+            req: crate::types::node::NodeEnrollRequest,
+        ) -> Result<crate::types::node::NodeEnrollResponse, String> {
+            Ok(enroll_response(&req))
         }
     }
 
@@ -2742,6 +2819,13 @@ mod tests {
             _req: crate::types::node::NodePowerRequest,
         ) -> Result<crate::types::node::NodePowerResponse, String> {
             Ok(crate::types::node::NodePowerResponse::Initiated)
+        }
+
+        async fn node_enroll(
+            &mut self,
+            req: crate::types::node::NodeEnrollRequest,
+        ) -> Result<crate::types::node::NodeEnrollResponse, String> {
+            Ok(enroll_response(&req))
         }
     }
 
@@ -4153,6 +4237,264 @@ mod tests {
                 .await
                 .expect("wire transport should succeed");
         assert_eq!(res.unwrap_err(), "unknown request code: 111");
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    // ── node.enroll dispatch tests ──────────────────────────────
+
+    /// The material the enroll test handlers mint.
+    #[cfg(feature = "server")]
+    fn enroll_material() -> crate::types::node::BootstrapMaterial {
+        crate::types::node::BootstrapMaterial {
+            role_id: "sensor-installer".into(),
+            wrapped_secret_id: "s.9f3c1b".into(),
+            ca_anchor: vec![0x30, 0x82, 0x01, 0x0a],
+            expires_at: "2026-01-02T03:04:05.123456789Z"
+                .parse()
+                .expect("literal is a valid timestamp"),
+        }
+    }
+
+    /// A `Register` request carrying every field the family defines.
+    #[cfg(feature = "server")]
+    fn enroll_register() -> crate::types::node::NodeEnrollRequest {
+        use std::time::Duration;
+
+        use crate::types::node::{
+            CertGroup, DeliveryMode, NodeEnrollRequest, ReloadHook, ServiceSpec,
+        };
+
+        NodeEnrollRequest::Register {
+            service_name: "sensor".into(),
+            delivery_mode: DeliveryMode::RemoteBootstrap,
+            host: "host01".into(),
+            instance: Some(1),
+            spec: ServiceSpec {
+                component: "sensor".into(),
+                service_name: "sensor".into(),
+                reload: ReloadHook("reload-sensor".into()),
+                cert_group: Some(CertGroup("internal".into())),
+            },
+            wrap_ttl: Duration::from_mins(10),
+            idempotency_key: "b6f0".into(),
+        }
+    }
+
+    /// A `Deregister` request for the same identity.
+    #[cfg(feature = "server")]
+    fn enroll_deregister() -> crate::types::node::NodeEnrollRequest {
+        crate::types::node::NodeEnrollRequest::Deregister {
+            service_name: "sensor".into(),
+            host: "host01".into(),
+            instance: Some(1),
+            idempotency_key: "b6f0".into(),
+        }
+    }
+
+    /// The registrar's answer to each request variant.
+    #[cfg(feature = "server")]
+    fn enroll_response(
+        req: &crate::types::node::NodeEnrollRequest,
+    ) -> crate::types::node::NodeEnrollResponse {
+        use crate::types::node::{NodeEnrollRequest, NodeEnrollResponse};
+
+        match req {
+            NodeEnrollRequest::Register { .. } => NodeEnrollResponse::Material(enroll_material()),
+            NodeEnrollRequest::Deregister { .. } => NodeEnrollResponse::Done,
+        }
+    }
+
+    /// `handle` dispatches a `Register` to `node_enroll` and returns
+    /// the minted material.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_enroll_register_roundtrip() {
+        use crate::types::node::NodeEnrollResponse;
+        node_handler_roundtrip(
+            RequestCode::NodeEnroll,
+            enroll_register(),
+            NodeEnrollResponse::Material(enroll_material()),
+        )
+        .await;
+    }
+
+    /// `handle` dispatches a `Deregister` to `node_enroll`.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_enroll_deregister_roundtrip() {
+        use crate::types::node::NodeEnrollResponse;
+        node_handler_roundtrip(
+            RequestCode::NodeEnroll,
+            enroll_deregister(),
+            NodeEnrollResponse::Done,
+        )
+        .await;
+    }
+
+    /// The same `Register` through `handle_node`, on a
+    /// `NodeHandler`-only type.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_enroll_register_roundtrip() {
+        use crate::types::node::NodeEnrollResponse;
+        handle_node_roundtrip(
+            RequestCode::NodeEnroll,
+            enroll_register(),
+            NodeEnrollResponse::Material(enroll_material()),
+        )
+        .await;
+    }
+
+    /// The same `Deregister` through `handle_node`.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_enroll_deregister_roundtrip() {
+        use crate::types::node::NodeEnrollResponse;
+        handle_node_roundtrip(
+            RequestCode::NodeEnroll,
+            enroll_deregister(),
+            NodeEnrollResponse::Done,
+        )
+        .await;
+    }
+
+    /// A typed registrar failure reaches the caller through a
+    /// *successful* decode, not through the `Result<_, String>`
+    /// channel, so it stays classifiable after dispatch.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_enroll_typed_failure_rides_the_response() {
+        use std::time::Duration;
+
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{NodeEnrollError, NodeEnrollRequest, NodeEnrollResponse};
+
+        struct BusyRegistrar;
+
+        #[async_trait::async_trait]
+        impl super::Handler for BusyRegistrar {
+            async fn node_enroll(
+                &mut self,
+                _req: NodeEnrollRequest,
+            ) -> Result<NodeEnrollResponse, String> {
+                Ok(NodeEnrollResponse::Failed(NodeEnrollError::RegistrarBusy {
+                    retry_after: Duration::from_secs(30),
+                }))
+            }
+        }
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = BusyRegistrar;
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let res: Result<NodeEnrollResponse, String> = crate::unary_request(
+            &mut client_send,
+            &mut client_recv,
+            u32::from(RequestCode::NodeEnroll),
+            enroll_register(),
+        )
+        .await
+        .expect("wire transport should succeed");
+
+        let resp = res.expect("a typed failure is success-shaped on the wire");
+        assert_eq!(resp.retry_after(), Some(Duration::from_secs(30)));
+        assert!(!resp.leaves_teardown_owed());
+        assert!(matches!(
+            resp,
+            NodeEnrollResponse::Failed(NodeEnrollError::RegistrarBusy { .. })
+        ));
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// An agent that overrides no handler method answers
+    /// `"not supported"` to a `node.enroll` request, rather than the
+    /// unknown-code message: 110 is dispatched now.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_enroll_default_not_supported() {
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::NodeEnrollResponse;
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = NoopHandler;
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let res: Result<NodeEnrollResponse, String> = crate::unary_request(
+            &mut client_send,
+            &mut client_recv,
+            u32::from(RequestCode::NodeEnroll),
+            enroll_deregister(),
+        )
+        .await
+        .expect("wire transport should succeed");
+
+        assert_eq!(res.unwrap_err(), "not supported");
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// The same through `handle_node`, on a `NodeHandler`-only type
+    /// that does not override `node_enroll`.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_enroll_default_not_supported() {
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::NodeEnrollResponse;
+
+        struct BareNodeHandler;
+
+        #[async_trait::async_trait]
+        impl super::NodeHandler for BareNodeHandler {}
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = BareNodeHandler;
+            super::handle_node(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let res: Result<NodeEnrollResponse, String> = crate::unary_request(
+            &mut client_send,
+            &mut client_recv,
+            u32::from(RequestCode::NodeEnroll),
+            enroll_register(),
+        )
+        .await
+        .expect("wire transport should succeed");
+
+        assert_eq!(res.unwrap_err(), "not supported");
 
         drop(client_send);
         drop(client_recv);

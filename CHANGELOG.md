@@ -79,6 +79,35 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   `NodePackageError::active_trust_epoch()`, so a rollout is confirmed
   in-connection rather than at the next handshake. The epoch is agent-asserted
   and bounds a host's status downward only.
+- Added the `node.enroll` request family (request code 110), a unary
+  Manager-to-Agent command directed at the registrar agent. The
+  `NodeEnrollRequest`, `NodeEnrollResponse`, `NodeEnrollError`, `ServiceSpec`,
+  `ReloadHook`, `CertGroup`, `DeliveryMode` and `RegistrarUnavailableReason`
+  types in `types::node` carry it, `Register` returning the existing
+  `BootstrapMaterial` and `Deregister` returning `NodeEnrollResponse::Done`.
+  The request carries the identity's parts — a plain `service_name`, a `host`
+  and an `instance` — never a composed name, and `ReloadHook` and `CertGroup`
+  are opaque newtypes over `String` that this crate never parses or validates.
+  The `node.enroll`, `node.enroll.register` and `node.enroll.deregister`
+  service identifiers and `NodeEnrollRequest::service_id()` name the
+  operations. On the agent side, `request::Handler` and `request::NodeHandler`
+  gain `node_enroll`, defaulting to `Err("not supported")`; on the manager
+  side, `server::Connection::node_enroll` — mirrored onto the
+  `server::node::Node` handle as `enroll`, each with the family's
+  `_authorized` and `_with_context` variants — calls it.
+- Added seven typed registrar failures, carried by
+  `NodeEnrollResponse::Failed` as structured data rather than through the
+  string error channel: `ServiceSpecConflict`, `ServiceNameCollision`,
+  `ServiceInstanceMismatch`, `ServiceHostMismatch`, `RegistrarUnavailable`
+  with a closed six-value `RegistrarUnavailableReason`, `RegistrarBusy` with
+  the delay to honour, and `ServiceLabelInvalid`. Both classification
+  properties are read through `retry_after()` and `leaves_teardown_owed()`,
+  available on `NodeEnrollError` and mirrored on `NodeEnrollResponse`:
+  `RegistrarBusy` is the only retryable failure and returns its own delay from
+  the same call, and `RegistrarUnavailable { reason: PostMintUnrecordable }`
+  is the only outcome that leaves a compensating `Deregister` owed. An
+  unrecognized `RegistrarUnavailableReason` fails the decode rather than
+  falling back to a catch-all value.
 - Added five conditionally decoded tail fields to `AgentInfo`, appended in this
   order: `capabilities`, `active_trust_epoch`, `manifest_formats`,
   `provisioning_fingerprint` and `audit_health`. An agent uses them to advertise

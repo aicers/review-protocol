@@ -217,6 +217,7 @@ pub const NODE_POWER: ServiceId = ServiceId::new("node.power", "");
 pub const NODE_OBSERVATION: ServiceId = ServiceId::new("node.observation", "");
 pub const NODE_VERSION: ServiceId = ServiceId::new("node.version", "");
 pub const NODE_PACKAGE: ServiceId = ServiceId::new("node.package", "");
+pub const NODE_ENROLL: ServiceId = ServiceId::new("node.enroll", "");
 
 // ── node.service (method-level) ───────────────────────────────
 
@@ -290,6 +291,11 @@ pub const NODE_PACKAGE_INSTALL: ServiceId = ServiceId::new("node.package", "inst
 pub const NODE_PACKAGE_REMOVE: ServiceId = ServiceId::new("node.package", "remove");
 pub const NODE_PACKAGE_LIST: ServiceId = ServiceId::new("node.package", "list");
 pub const NODE_PACKAGE_STATUS: ServiceId = ServiceId::new("node.package", "status");
+
+// ── node.enroll ────────────────────────────────────────────────
+
+pub const NODE_ENROLL_REGISTER: ServiceId = ServiceId::new("node.enroll", "register");
+pub const NODE_ENROLL_DEREGISTER: ServiceId = ServiceId::new("node.enroll", "deregister");
 
 // ── common ─────────────────────────────────────────────────────
 //
@@ -406,9 +412,9 @@ pub const SERVER_CUSTOMER_DATA_DELETION_REPORT: ServiceId =
 // request is available (e.g. on the REview-to-agent path).
 
 use crate::types::node::{
-    NodeHostnameRequest, NodeLoggingRequest, NodeNetworkInterfaceRequest, NodeObservationRequest,
-    NodePackageRequest, NodePowerRequest, NodeRemoteAccessRequest, NodeServiceRequest,
-    NodeTimeSyncRequest, NodeVersionRequest,
+    NodeEnrollRequest, NodeHostnameRequest, NodeLoggingRequest, NodeNetworkInterfaceRequest,
+    NodeObservationRequest, NodePackageRequest, NodePowerRequest, NodeRemoteAccessRequest,
+    NodeServiceRequest, NodeTimeSyncRequest, NodeVersionRequest,
 };
 
 impl NodeServiceRequest {
@@ -538,6 +544,17 @@ impl NodePackageRequest {
     }
 }
 
+impl NodeEnrollRequest {
+    /// Returns the method-level [`ServiceId`] for this request.
+    #[must_use]
+    pub fn service_id(&self) -> ServiceId {
+        match self {
+            Self::Register { .. } => NODE_ENROLL_REGISTER,
+            Self::Deregister { .. } => NODE_ENROLL_DEREGISTER,
+        }
+    }
+}
+
 // ── RequestCode → ServiceId mapping ────────────────────────────
 //
 // Maps wire request codes to their logical service identifiers.
@@ -600,6 +617,7 @@ pub(crate) fn from_client_request_code(code: ClientRequestCode) -> Option<Servic
         ClientRequestCode::NodeObservation => Some(NODE_OBSERVATION),
         ClientRequestCode::NodeVersion => Some(NODE_VERSION),
         ClientRequestCode::NodePackage => Some(NODE_PACKAGE),
+        ClientRequestCode::NodeEnroll => Some(NODE_ENROLL),
 
         ClientRequestCode::Unknown => None,
     }
@@ -665,6 +683,9 @@ pub(crate) fn from_server_request_code(code: ServerRequestCode) -> Option<Servic
 /// assert!(ids.contains(&service_id::NODE_POWER)); // family
 /// ```
 #[must_use]
+// The body is one entry per identifier, so its length tracks the number of
+// service identifiers rather than any branching to be broken up.
+#[allow(clippy::too_many_lines)]
 pub fn all() -> &'static [ServiceId] {
     &[
         // node family-level
@@ -678,6 +699,7 @@ pub fn all() -> &'static [ServiceId] {
         NODE_OBSERVATION,
         NODE_VERSION,
         NODE_PACKAGE,
+        NODE_ENROLL,
         // node.service
         NODE_SERVICE_START,
         NODE_SERVICE_STOP,
@@ -725,6 +747,9 @@ pub fn all() -> &'static [ServiceId] {
         NODE_PACKAGE_REMOVE,
         NODE_PACKAGE_LIST,
         NODE_PACKAGE_STATUS,
+        // node.enroll
+        NODE_ENROLL_REGISTER,
+        NODE_ENROLL_DEREGISTER,
         // common
         COMMON_DNS_START,
         COMMON_DNS_STOP,
@@ -818,6 +843,7 @@ mod tests {
         assert_eq!(NODE_SERVICE.to_string(), "node.service");
         assert_eq!(NODE_OBSERVATION.to_string(), "node.observation");
         assert_eq!(NODE_PACKAGE.to_string(), "node.package");
+        assert_eq!(NODE_ENROLL.to_string(), "node.enroll");
     }
 
     #[test]
@@ -826,6 +852,12 @@ mod tests {
         assert_eq!(NODE_PACKAGE_REMOVE.to_string(), "node.package.remove");
         assert_eq!(NODE_PACKAGE_LIST.to_string(), "node.package.list");
         assert_eq!(NODE_PACKAGE_STATUS.to_string(), "node.package.status");
+    }
+
+    #[test]
+    fn node_enroll_display_format() {
+        assert_eq!(NODE_ENROLL_REGISTER.to_string(), "node.enroll.register");
+        assert_eq!(NODE_ENROLL_DEREGISTER.to_string(), "node.enroll.deregister");
     }
 
     #[test]
@@ -923,6 +955,10 @@ mod tests {
             from_client_request_code(ClientRequestCode::NodePackage),
             Some(NODE_PACKAGE)
         );
+        assert_eq!(
+            from_client_request_code(ClientRequestCode::NodeEnroll),
+            Some(NODE_ENROLL)
+        );
     }
 
     #[test]
@@ -966,6 +1002,7 @@ mod tests {
             ClientRequestCode::NodeObservation,
             ClientRequestCode::NodeVersion,
             ClientRequestCode::NodePackage,
+            ClientRequestCode::NodeEnroll,
         ];
         for &code in codes {
             assert!(
@@ -1207,6 +1244,51 @@ mod tests {
         }
         assert!(NODE_PACKAGE.is_family());
         assert!(all().contains(&NODE_PACKAGE));
+    }
+
+    #[test]
+    fn node_enroll_request_service_ids() {
+        use std::time::Duration;
+
+        use crate::types::node::{
+            CertGroup, DeliveryMode, NodeEnrollRequest, ReloadHook, ServiceSpec,
+        };
+
+        assert_eq!(
+            NodeEnrollRequest::Register {
+                service_name: "sensor".into(),
+                delivery_mode: DeliveryMode::RemoteBootstrap,
+                host: "host01".into(),
+                instance: Some(1),
+                spec: ServiceSpec {
+                    component: "sensor".into(),
+                    service_name: "sensor".into(),
+                    reload: ReloadHook("reload-sensor".into()),
+                    cert_group: Some(CertGroup("internal".into())),
+                },
+                wrap_ttl: Duration::from_mins(10),
+                idempotency_key: "k".into(),
+            }
+            .service_id(),
+            NODE_ENROLL_REGISTER
+        );
+        assert_eq!(
+            NodeEnrollRequest::Deregister {
+                service_name: "sensor".into(),
+                host: "host01".into(),
+                instance: None,
+                idempotency_key: "k".into(),
+            }
+            .service_id(),
+            NODE_ENROLL_DEREGISTER
+        );
+
+        for id in [NODE_ENROLL_REGISTER, NODE_ENROLL_DEREGISTER] {
+            assert!(!id.is_family());
+            assert!(all().contains(&id));
+        }
+        assert!(NODE_ENROLL.is_family());
+        assert!(all().contains(&NODE_ENROLL));
     }
 
     /// Every `service_id()` return value should be method-level

@@ -614,7 +614,7 @@ pub struct BootstrapMaterial {
     role_id: String,
     wrapped_secret_id: String,
     ca_anchor: Vec<u8>,
-    expires_at: DateTime<Utc>,
+    expires_at: jiff::Timestamp,
 }
 
 pub enum NodeEnrollResponse {
@@ -627,8 +627,19 @@ pub enum NodeEnrollResponse {
     /// MUST NOT assume it equals what it requested.
     Material(BootstrapMaterial),  // for Register
     Done,                         // for Deregister
+    /// A typed registrar failure. Success-shaped on the wire: a decode
+    /// success still means "the registrar answered," and the manager
+    /// classifies the refusal by matching on the error rather than by
+    /// parsing a string.
+    Failed(NodeEnrollError),
 }
 ```
+
+Typed failures ride the **response**, not the `Result<_, String>` error
+channel, exactly as `node.package`'s apply errors ride
+`NodePackageResponse::Failed` (§4). The error channel is left to transport
+and parse failures, which is what keeps a deterministic refusal from being
+classified as transient and retried.
 
 - **[DIRECTION] Semantics.** The registrar roxyd invokes bootroot's
   **restricted mint verb** locally (RFC-F §4/§5.1; RFC-A §6) and returns the
@@ -668,16 +679,19 @@ pub enum NodeEnrollResponse {
     double-mint** — it **re-issues fresh wrapped material for the same
     identity** (role and policy already exist and are reused; a **new wrapped
     `secret_id`** is minted and returned); on a **conflict** (same identity,
-    **same bound host**, different spec — `cert_group` or `reload`) it
-    returns **`ServiceSpecConflict`** and mints **nothing**, so a stale or
+    **same bound host**, a different `ServiceSpec`) it returns
+    **`ServiceSpecConflict`** and mints **nothing**, so a stale or
     wrong-shape service is never silently re-issued fresh material. The
-    matching case is what makes a first-install crash between mint and a
-    completed `node.package` `Install` recoverable: the wrapped `secret_id` is
-    single-use and short-TTL and is **not** persisted anywhere (never stored
-    in the operation ledger), so resume cannot replay the old material — it
-    **re-mints** it. The existence probe that distinguishes "already exists →
-    spec-check → re-wrap" from "new → create" runs **inside** bootroot's
-    restricted mint verb, not in roxyd (RFC-F §4–§5, RFC-B §6).
+    comparison is over the spec **as a whole** — `cert_group` and `reload`
+    are merely the fields that differ most often, not the closed list of
+    fields that can. The matching case is what makes a first-install crash
+    between mint and a completed `node.package` `Install` recoverable: the
+    wrapped `secret_id` is single-use and short-TTL and is **not** persisted
+    anywhere (never stored in the operation ledger), so resume cannot replay
+    the old material — it **re-mints** it. The existence probe that
+    distinguishes "already exists → spec-check → re-wrap" from "new → create"
+    runs **inside** bootroot's restricted mint verb, not in roxyd (RFC-F
+    §4–§5, RFC-B §6).
   - **[DECISION] `ServiceNameCollision` is a THIRD typed enroll error, defined
     here.** Two other documents already depend on it by name — RFC-F §5.1
     rejects a derived `registration_id` already bound to a *different* host
@@ -772,6 +786,30 @@ pub enum NodeEnrollResponse {
     at once (RFC-D2 §4b), and the retry storm feeds the limiter. So it is
     typed, carries `retry_after`, and review **honors that delay without
     consuming the apply budget**; RFC-E §9 carries its line.
+  - **[DECISION] `ServiceLabelInvalid` is a SEVENTH typed enroll error, and it
+    is declared LAST.** The registrar validates both identity parts as single
+    DNS labels on its pre-derivation arm (RFC-F §5.6), before any identity is
+    derived, and refuses a `service_name` or `host` that is not one. That
+    refusal has no identifier among the six above: it happens *earlier* than
+    `ServiceNameCollision`, which compares an identity that was already
+    derived, and it is not about multiplicity, so `ServiceInstanceMismatch`
+    does not cover it. Without its own type it arrives generic, is classified
+    transient, and is retried until the apply budget is spent for an input
+    that will never become valid — the outcome every error in this list was
+    typed to prevent. Nothing is minted and nothing is probed, so it is **not
+    retryable** and leaves **no teardown owed**; both follow from the two
+    rules above and need no special case. It carries **no payload**: no
+    discriminator for which of the two parts was rejected and no echo of the
+    offending string, which the registrar keeps escaped in its own audit
+    record. It does **not** cover a component with no entry in the
+    multiplicity table — that case keeps `ServiceInstanceMismatch` (RFC-F
+    §5.1, RFC-E §9, RFC-A §4), an intentional second meaning of that variant
+    rather than a gap this one fills. It reads as a sibling of the four
+    `Service*` errors and grouping it with them would be tidier, but the
+    declaration index **is** the wire encoding: the six variants before it are
+    already cited by position in three merged design documents and this one
+    was added after they were settled, so it **appends**. Do not reorder the
+    enum to group it.
   - **[DECISION] `Register` is idempotent in EFFECT, and always returns FRESH
     material — the `idempotency_key` is NOT a material cache.** These two must
     not be conflated: because the registrar **does not persist** the
@@ -1000,12 +1038,15 @@ gets a criterion here rather than only a prose mention.
 - **`instance` rides both families as `Option<u32>`.** A test asserts the wire
   round-trips `None` and `Some(n)` and that v1's `Some(1)` needs no wire change
   to become `Some(2)`.
-- **Six typed enroll errors exist and are distinguishable:**
+- **Seven typed enroll errors exist and are distinguishable:**
   `ServiceSpecConflict`, `ServiceNameCollision`, `ServiceInstanceMismatch`,
-  `ServiceHostMismatch`, `RegistrarUnavailable { reason }`, and
-  `RegistrarBusy { retry_after }`. Tests assert each is a distinct wire variant
-  and — the property they exist for — that the first five are **not**
-  classifiable as transient while `RegistrarBusy` **is**, carrying a delay.
+  `ServiceHostMismatch`, `RegistrarUnavailable { reason }`,
+  `RegistrarBusy { retry_after }`, and `ServiceLabelInvalid` — the last
+  declared last, because the six before it are cited by position and the
+  declaration index is the wire encoding. Tests assert each is a distinct wire
+  variant and — the property they exist for — that every one except
+  `RegistrarBusy` is **not** classifiable as transient while `RegistrarBusy`
+  **is**, carrying a delay.
   `RegistrarUnavailable`'s reason set is closed:
   `CredentialInvalid`, `NotProvisioned`, `AuditUnwritable`,
   `EndpointUnreachable`, `PostMintUnrecordable`, `RegistrarUnreachable`. A test

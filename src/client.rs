@@ -126,6 +126,9 @@ pub(crate) enum RequestCode {
     /// Node package-management family.
     NodePackage = 109,
 
+    /// Node service-enrollment family.
+    NodeEnroll = 110,
+
     /// Unknown request
     #[num_enum(default)]
     Unknown = u32::MAX,

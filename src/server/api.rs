@@ -9,12 +9,13 @@ use crate::{
     types::{
         CustomerDataDeletionRequest, HostNetworkGroup, SamplingPolicy, TrafficFilterRule,
         node::{
-            InstallPreflight, NodeHostnameRequest, NodeHostnameResponse, NodeLoggingRequest,
-            NodeLoggingResponse, NodeNetworkInterfaceRequest, NodeNetworkInterfaceResponse,
-            NodeObservationRequest, NodeObservationResponse, NodePackageRequest,
-            NodePackageResponse, NodePowerRequest, NodePowerResponse, NodeRemoteAccessRequest,
-            NodeRemoteAccessResponse, NodeServiceRequest, NodeServiceResponse, NodeTimeSyncRequest,
-            NodeTimeSyncResponse, NodeVersionRequest, NodeVersionResponse,
+            InstallPreflight, NodeEnrollRequest, NodeEnrollResponse, NodeHostnameRequest,
+            NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
+            NodeNetworkInterfaceRequest, NodeNetworkInterfaceResponse, NodeObservationRequest,
+            NodeObservationResponse, NodePackageRequest, NodePackageResponse, NodePowerRequest,
+            NodePowerResponse, NodeRemoteAccessRequest, NodeRemoteAccessResponse,
+            NodeServiceRequest, NodeServiceResponse, NodeTimeSyncRequest, NodeTimeSyncResponse,
+            NodeVersionRequest, NodeVersionResponse,
         },
     },
 };
@@ -555,6 +556,35 @@ impl Connection {
         self.install_exchange(&req, size, pkg).await
     }
 
+    /// Sends a node service-enrollment request to the agent.
+    ///
+    /// The request targets the agent on this connection, which for
+    /// this family is the **registrar** — the agent co-located with
+    /// the identity store.  The specific operation is determined by
+    /// the [`NodeEnrollRequest`] variant: `Register` or `Deregister`.
+    ///
+    /// A registrar refusal is **not** an error here: it arrives as
+    /// [`NodeEnrollResponse::Failed`], carrying a typed
+    /// [`NodeEnrollError`](crate::types::node::NodeEnrollError) the
+    /// caller classifies by matching, or through
+    /// [`retry_after`](NodeEnrollResponse::retry_after) and
+    /// [`leaves_teardown_owed`](NodeEnrollResponse::leaves_teardown_owed).
+    ///
+    /// Each variant carries a distinct
+    /// [`ServiceId`](crate::service_id::ServiceId) (e.g.
+    /// `"node.enroll.register"`).  To enforce authorization, use
+    /// [`node_enroll_authorized`](Self::node_enroll_authorized)
+    /// instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization/deserialization failed or
+    /// communication with the client failed.
+    pub async fn node_enroll(&self, req: NodeEnrollRequest) -> anyhow::Result<NodeEnrollResponse> {
+        self.send_request(client::RequestCode::NodeEnroll, &req)
+            .await
+    }
+
     // ── authorized node feature-family methods ───────────────────
     //
     // Like the un-authorized node methods above, but each checks
@@ -907,6 +937,35 @@ impl Connection {
         self.install_exchange(&req, size, pkg).await
     }
 
+    /// Sends a node service-enrollment request to the agent with
+    /// authorization.
+    ///
+    /// Behaves like [`node_enroll`](Self::node_enroll), but first
+    /// checks authorization using the method-level
+    /// [`ServiceId`](crate::service_id::ServiceId) from `req`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authorization was denied,
+    /// serialization/deserialization failed, or communication with
+    /// the client failed.
+    pub async fn node_enroll_authorized(
+        &self,
+        req: NodeEnrollRequest,
+        peer: &crate::auth::PeerContext,
+        authorizer: &dyn crate::auth::Authorizer,
+    ) -> anyhow::Result<NodeEnrollResponse> {
+        let sid = req.service_id();
+        self.send_request_authorized(
+            client::RequestCode::NodeEnroll,
+            &req,
+            &sid,
+            peer,
+            authorizer,
+        )
+        .await
+    }
+
     // -- _with_context variants (AuthorizerV2) -----------------
 
     /// Sends a node service-control request with
@@ -1206,6 +1265,31 @@ impl Connection {
             .authorize_with_context(auth_ctx, &sid)
             .map_err(|e| anyhow!(e))?;
         self.install_exchange(&req, size, pkg).await
+    }
+
+    /// Sends a node service-enrollment request with
+    /// [`AuthorizerV2`](crate::auth::AuthorizerV2) authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authorization was denied,
+    /// serialization/deserialization failed, or communication with
+    /// the client failed.
+    pub async fn node_enroll_with_context(
+        &self,
+        req: NodeEnrollRequest,
+        auth_ctx: &crate::auth::AuthorizationContext,
+        authorizer: &dyn crate::auth::AuthorizerV2,
+    ) -> anyhow::Result<NodeEnrollResponse> {
+        let sid = req.service_id();
+        self.send_request_authorized_with_context(
+            client::RequestCode::NodeEnroll,
+            &req,
+            &sid,
+            auth_ctx,
+            authorizer,
+        )
+        .await
     }
 
     /// Drives the whole install exchange on one bi-stream.
@@ -1560,6 +1644,25 @@ mod tests {
                 os_version: "22.04".into(),
                 product_version: "1.0.0".into(),
             })
+        }
+
+        async fn node_enroll(
+            &mut self,
+            req: super::NodeEnrollRequest,
+        ) -> Result<super::NodeEnrollResponse, String> {
+            use crate::types::node::{NodeEnrollError, NodeEnrollRequest, NodeEnrollResponse};
+
+            match req {
+                NodeEnrollRequest::Register { .. } => {
+                    Ok(NodeEnrollResponse::Material(enroll_material()))
+                }
+                NodeEnrollRequest::Deregister { host, .. } if host == "host01" => {
+                    Ok(NodeEnrollResponse::Done)
+                }
+                NodeEnrollRequest::Deregister { .. } => Ok(NodeEnrollResponse::Failed(
+                    NodeEnrollError::ServiceHostMismatch,
+                )),
+            }
         }
 
         async fn node_package(
@@ -2533,6 +2636,45 @@ mod tests {
         ]
     }
 
+    /// The material the enroll test handler mints.
+    #[cfg(all(feature = "client", feature = "server"))]
+    fn enroll_material() -> crate::types::node::BootstrapMaterial {
+        crate::types::node::BootstrapMaterial {
+            role_id: "sensor-installer".into(),
+            wrapped_secret_id: "s.9f3c1b".into(),
+            ca_anchor: vec![0x30, 0x82, 0x01, 0x0a],
+            expires_at: "2026-01-02T03:04:05.123456789Z"
+                .parse()
+                .expect("literal is a valid timestamp"),
+        }
+    }
+
+    /// Builds a `Register` request for the identity the test handler
+    /// serves.
+    #[cfg(all(feature = "client", feature = "server"))]
+    fn enroll_register() -> crate::types::node::NodeEnrollRequest {
+        use std::time::Duration;
+
+        use crate::types::node::{
+            CertGroup, DeliveryMode, NodeEnrollRequest, ReloadHook, ServiceSpec,
+        };
+
+        NodeEnrollRequest::Register {
+            service_name: "sensor".into(),
+            delivery_mode: DeliveryMode::RemoteBootstrap,
+            host: "host01".into(),
+            instance: Some(1),
+            spec: ServiceSpec {
+                component: "sensor".into(),
+                service_name: "sensor".into(),
+                reload: ReloadHook("reload-sensor".into()),
+                cert_group: Some(CertGroup("internal".into())),
+            },
+            wrap_ttl: Duration::from_mins(10),
+            idempotency_key: "idem-1".into(),
+        }
+    }
+
     /// Builds an `Install` request for `target` whose payload is
     /// `size` bytes long.
     #[cfg(all(feature = "client", feature = "server"))]
@@ -2568,6 +2710,95 @@ mod tests {
             let (mut send, mut recv) = conn.accept_bi().await.unwrap();
             crate::request::handle(&mut handler, &mut send, &mut recv).await
         })
+    }
+
+    /// `Register` round-trips through `Connection::node_enroll` and
+    /// brings back the granted material.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_enroll_register() {
+        use crate::types::node::NodeEnrollResponse;
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let client_handle = spawn_agent(client_conn.clone());
+
+        let resp = server_conn.node_enroll(enroll_register()).await.unwrap();
+        assert_eq!(resp, NodeEnrollResponse::Material(enroll_material()));
+
+        let NodeEnrollResponse::Material(material) = resp else {
+            panic!("expected a Material response");
+        };
+        assert_eq!(material.expires_at, enroll_material().expires_at);
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// `Deregister` round-trips through `Connection::node_enroll`.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_enroll_deregister() {
+        use crate::types::node::{NodeEnrollRequest, NodeEnrollResponse};
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let client_handle = spawn_agent(client_conn.clone());
+
+        let resp = server_conn
+            .node_enroll(NodeEnrollRequest::Deregister {
+                service_name: "sensor".into(),
+                host: "host01".into(),
+                instance: Some(1),
+                idempotency_key: "idem-1".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp, NodeEnrollResponse::Done);
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
+    /// A wrong-host teardown comes back as a typed refusal on the
+    /// success channel rather than as an error, so the caller
+    /// classifies it by matching instead of parsing a string.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_enroll_typed_failure() {
+        use crate::types::node::{NodeEnrollError, NodeEnrollRequest, NodeEnrollResponse};
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let client_handle = spawn_agent(client_conn.clone());
+
+        let resp = server_conn
+            .node_enroll(NodeEnrollRequest::Deregister {
+                service_name: "sensor".into(),
+                host: "other-host".into(),
+                instance: Some(1),
+                idempotency_key: "idem-1".into(),
+            })
+            .await
+            .expect("a typed refusal is success-shaped on the wire");
+        assert_eq!(
+            resp,
+            NodeEnrollResponse::Failed(NodeEnrollError::ServiceHostMismatch)
+        );
+        assert_eq!(resp.retry_after(), None);
+        assert!(!resp.leaves_teardown_owed());
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
     }
 
     /// `Remove` round-trips through `Connection::node_package`.

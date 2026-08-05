@@ -1557,6 +1557,554 @@ pub mod node {
         }
     }
 
+    // ── service enrollment ──────────────────────────────────────
+
+    /// Request for minting or tearing down a service identity.
+    ///
+    /// The family is directed at the **registrar** agent — the one
+    /// co-located with the identity store — and is unary: one request
+    /// frame, one response frame, no streaming.
+    ///
+    /// The request carries the identity's **parts**, never a composed
+    /// name.  The registrar derives both the certificate name and the
+    /// namespace key from `service_name`, `host` and `instance`; this
+    /// crate never composes, parses or validates them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use review_protocol::types::node::{
+    ///     DeliveryMode, NodeEnrollRequest, ReloadHook, ServiceSpec,
+    /// };
+    ///
+    /// let req = NodeEnrollRequest::Register {
+    ///     service_name: "sensor".into(),
+    ///     delivery_mode: DeliveryMode::RemoteBootstrap,
+    ///     host: "host01".into(),
+    ///     instance: Some(1),
+    ///     spec: ServiceSpec {
+    ///         component: "sensor".into(),
+    ///         service_name: "sensor".into(),
+    ///         reload: ReloadHook("reload-sensor".into()),
+    ///         cert_group: None,
+    ///     },
+    ///     wrap_ttl: Duration::from_mins(10),
+    ///     idempotency_key: "b6f0".into(),
+    /// };
+    /// assert!(matches!(req, NodeEnrollRequest::Register { .. }));
+    /// ```
+    ///
+    /// # Wire compatibility
+    ///
+    /// bincode encodes enum variants by declaration order, so any
+    /// later variant must be **appended** at the end.  Never insert
+    /// a variant in the middle or reorder the existing ones.
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub enum NodeEnrollRequest {
+        /// Register a new service and return its bootstrap material.
+        /// Used for both per-service install and new-host onboarding.
+        ///
+        /// This is idempotent in **effect**, not in response bytes.
+        /// For an identity that already exists with a matching
+        /// [`ServiceSpec`], the existing role and policy are reused
+        /// and **fresh** wrapped material is returned; for one that
+        /// exists with a different spec the registrar answers
+        /// [`ServiceSpecConflict`](NodeEnrollError::ServiceSpecConflict)
+        /// and mints nothing.
+        Register {
+            /// The component's PLAIN keyword — a single DNS label,
+            /// never host- or instance-qualified.
+            ///
+            /// This is the *identity* being registered, together with
+            /// `host` and `instance`.  It is not derived from
+            /// [`spec.service_name`](ServiceSpec::service_name) and
+            /// does not derive it; see [`spec`](Self::Register::spec).
+            service_name: String,
+            /// How the minted material reaches the target.
+            delivery_mode: DeliveryMode,
+            /// The target host's single DNS label.
+            host: String,
+            /// Which instance of `service_name` on `host` this is, or
+            /// `None` when the component's multiplicity class has no
+            /// instance dimension.  The number is allocated by the
+            /// manager; this crate carries it and never derives,
+            /// defaults or validates it.
+            instance: Option<u32>,
+            /// What the identity is registered *as*.
+            ///
+            /// This mirrors the registrar's own registration record,
+            /// which carries its own `component` and `service_name`,
+            /// and the registrar compares it **as a whole** against
+            /// the one already bound to the identity.  Its
+            /// `service_name` and this request's are filled
+            /// independently by the manager: neither is derived from
+            /// the other, and this crate neither reconciles nor
+            /// rejects a request whose two values differ.
+            spec: ServiceSpec,
+            /// Requested lifetime of the wrapped material.  The
+            /// registrar MAY clamp it; the GRANTED absolute deadline
+            /// comes back in the material's
+            /// [`expires_at`](BootstrapMaterial::expires_at).
+            wrap_ttl: Duration,
+            /// An opaque key that correlates a re-driven request with
+            /// the operation it retries.
+            ///
+            /// It is a correlation handle, **not** a response cache:
+            /// the wrapped secret is single-use, short-TTL and is not
+            /// persisted anywhere, so the same bytes cannot be
+            /// returned on a re-drive.  The key exists only so that a
+            /// retry of one logical operation is recorded as the same
+            /// operation rather than a second one.
+            idempotency_key: String,
+        },
+        /// Deregister a service on uninstall: tear down its role,
+        /// policy, per-service store and state entry.
+        ///
+        /// This is idempotent: a teardown of an already-absent
+        /// identity **for the matching host** answers
+        /// [`Done`](NodeEnrollResponse::Done) rather than an error, so
+        /// an owed teardown can be re-driven after a crash.  A
+        /// `Deregister` whose `host` is not the identity's bound host
+        /// is refused with
+        /// [`ServiceHostMismatch`](NodeEnrollError::ServiceHostMismatch)
+        /// and tears nothing down.
+        Deregister {
+            /// The component's PLAIN keyword, as on
+            /// [`Register`](Self::Register).
+            service_name: String,
+            /// The target host's single DNS label.
+            host: String,
+            /// Which instance to tear down, with the same meaning as
+            /// on [`Register`](Self::Register).
+            instance: Option<u32>,
+            /// An opaque key that correlates a re-driven request with
+            /// the operation it retries, with the same meaning as on
+            /// [`Register`](Self::Register).
+            idempotency_key: String,
+        },
+    }
+
+    /// The registration shape the registrar applies and compares.
+    ///
+    /// These four fields are the whole shape.  There is deliberately
+    /// **no** privilege field: a service's authority is derived from
+    /// a fixed per-service policy on the registrar side, so no
+    /// component differs on that dimension.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use review_protocol::types::node::{CertGroup, ReloadHook, ServiceSpec};
+    ///
+    /// let spec = ServiceSpec {
+    ///     component: "sensor".into(),
+    ///     service_name: "sensor".into(),
+    ///     reload: ReloadHook("reload-sensor".into()),
+    ///     cert_group: Some(CertGroup("internal".into())),
+    /// };
+    /// assert_eq!(spec.cert_group.as_ref().map(|g| g.0.as_str()), Some("internal"));
+    /// ```
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub struct ServiceSpec {
+        /// The component's canonical package id.
+        pub component: String,
+        /// The component's plain keyword.
+        pub service_name: String,
+        /// How the service is reloaded after a certificate rotation.
+        pub reload: ReloadHook,
+        /// The certificate group the material belongs to, if any.
+        pub cert_group: Option<CertGroup>,
+    }
+
+    /// How the service is reloaded after its certificate is rotated.
+    ///
+    /// Opaque to this crate: the value is carried verbatim to the
+    /// registrar, which validates it against its own safe-set.  It is
+    /// never parsed, normalised, enumerated or rejected here, and this
+    /// type deliberately has no validating constructor — an
+    /// unacceptable value is the registrar's business, not a decode
+    /// failure.
+    ///
+    /// serde encodes a newtype struct as its inner value, so this is
+    /// byte-identical on the wire to the bare [`String`] it wraps.
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub struct ReloadHook(pub String);
+
+    /// The certificate group the service's material belongs to.
+    ///
+    /// Opaque to this crate on the same terms as [`ReloadHook`], and
+    /// byte-identical on the wire to the bare [`String`] it wraps.
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub struct CertGroup(pub String);
+
+    /// How the minted material reaches the target.
+    ///
+    /// # Wire compatibility
+    ///
+    /// bincode encodes enum variants by declaration order, so any
+    /// later variant must be **appended** at the end.  Never insert
+    /// a variant in the middle or reorder the existing ones.
+    #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub enum DeliveryMode {
+        /// Material placed on the host out of band.
+        LocalFile,
+        /// Remote enrollment via the on-host agent.
+        RemoteBootstrap,
+    }
+
+    /// Response from a service-enrollment operation.
+    ///
+    /// [`Material`](Self::Material) answers a
+    /// [`Register`](NodeEnrollRequest::Register),
+    /// [`Done`](Self::Done) answers a
+    /// [`Deregister`](NodeEnrollRequest::Deregister), and
+    /// [`Failed`](Self::Failed) carries a typed registrar failure.
+    ///
+    /// [`Debug`] is derived, so the `Material` payload is rendered by
+    /// [`BootstrapMaterial`]'s own hand-written implementation and
+    /// keeps its redaction of the wrapped one-time credential.
+    ///
+    /// # Wire compatibility
+    ///
+    /// bincode encodes enum variants by declaration order, so any
+    /// later variant must be **appended** at the end.  Never insert
+    /// a variant in the middle or reorder the existing ones.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use review_protocol::types::node::{
+    ///     NodeEnrollError, NodeEnrollResponse, RegistrarUnavailableReason,
+    /// };
+    ///
+    /// let resp = NodeEnrollResponse::Failed(NodeEnrollError::RegistrarUnavailable {
+    ///     reason: RegistrarUnavailableReason::NotProvisioned,
+    /// });
+    ///
+    /// // A typed failure is classified by matching on it, not by
+    /// // parsing a string.
+    /// let NodeEnrollResponse::Failed(NodeEnrollError::RegistrarUnavailable { reason }) = &resp
+    /// else {
+    ///     panic!("expected a registrar-unavailable failure");
+    /// };
+    /// assert_eq!(*reason, RegistrarUnavailableReason::NotProvisioned);
+    /// ```
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub enum NodeEnrollResponse {
+        /// Wrapped bootstrap material the target consumes to obtain
+        /// its certificate.  Returned for
+        /// [`Register`](NodeEnrollRequest::Register).
+        ///
+        /// The material's
+        /// [`expires_at`](BootstrapMaterial::expires_at) is the
+        /// GRANTED absolute deadline, which may correspond to a
+        /// shorter lifetime than the requested
+        /// [`wrap_ttl`](NodeEnrollRequest::Register::wrap_ttl).  A
+        /// consumer must never assume the grant equals the request.
+        Material(BootstrapMaterial),
+        /// The teardown completed.  Returned for
+        /// [`Deregister`](NodeEnrollRequest::Deregister).
+        Done,
+        /// A typed registrar failure.  Success-shaped on the wire — a
+        /// decode success still means "the registrar answered"; the
+        /// `Result<_, String>` channel is left to transport and parse
+        /// failures.
+        Failed(NodeEnrollError),
+    }
+
+    /// Typed registrar failures, carried by
+    /// [`NodeEnrollResponse::Failed`].
+    ///
+    /// This is data, not an error type: the manager matches on it
+    /// rather than printing it, so it implements neither
+    /// `std::error::Error` nor `Display`.
+    ///
+    /// Exactly one of these is retryable —
+    /// [`RegistrarBusy`](Self::RegistrarBusy) — and exactly one
+    /// leaves a registrar identity behind:
+    /// [`RegistrarUnavailable`](Self::RegistrarUnavailable) with
+    /// [`PostMintUnrecordable`](RegistrarUnavailableReason::PostMintUnrecordable).
+    /// Read both properties through
+    /// [`retry_after`](Self::retry_after) and
+    /// [`leaves_teardown_owed`](Self::leaves_teardown_owed) rather
+    /// than re-deriving them from the variant list.
+    ///
+    /// # Wire compatibility
+    ///
+    /// bincode encodes enum variants by declaration order, so any
+    /// later variant must be **appended** at the end.  Never insert
+    /// a variant in the middle or reorder the existing ones.
+    /// [`ServiceLabelInvalid`](Self::ServiceLabelInvalid) is the
+    /// worked example: it reads as a sibling of the other `Service*`
+    /// variants but was added after they were settled, so it is last.
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub enum NodeEnrollError {
+        /// The identity already exists on the same bound host,
+        /// registered with a **different [`ServiceSpec`]**.
+        ///
+        /// The comparison is over the spec **as a whole**: any of its
+        /// four fields may be the one that differs.  `reload` and
+        /// `cert_group` are the two that differ in practice, but they
+        /// are examples rather than the whole rule — a differing
+        /// `component` or `spec.service_name` is the same conflict.
+        /// Nothing is minted.
+        ServiceSpecConflict,
+        /// The derived registration identity is already bound to a
+        /// **different** host.
+        ///
+        /// Raised **before** any spec comparison, so it is never
+        /// reported as a [`ServiceSpecConflict`](Self::ServiceSpecConflict).
+        ServiceNameCollision,
+        /// `instance` contradicts the component's multiplicity:
+        /// present for a component that has no instance dimension, or
+        /// absent for one that does.
+        ///
+        /// A component with **no entry in the multiplicity table** is
+        /// also reported here.  That is an intentional second meaning
+        /// of this variant, not a gap covered by
+        /// [`ServiceLabelInvalid`](Self::ServiceLabelInvalid).
+        ///
+        /// Raised before any mint, so nothing is created.
+        ServiceInstanceMismatch,
+        /// A [`Deregister`](NodeEnrollRequest::Deregister) whose
+        /// `host` is not the identity's bound host.
+        ///
+        /// The teardown is refused, so a cleanup aimed at one host can
+        /// never remove another host's identity.
+        ServiceHostMismatch,
+        /// A fail-closed condition on the registrar, with a closed
+        /// reason set.
+        RegistrarUnavailable {
+            /// Which fail-closed condition was hit.
+            reason: RegistrarUnavailableReason,
+        },
+        /// The registrar's rate limit was hit.
+        ///
+        /// This is the **only** retryable failure in the family: it
+        /// clears on its own, and the delay to honour travels with it.
+        RegistrarBusy {
+            /// The delay to honour before re-driving the request.
+            retry_after: Duration,
+        },
+        /// The `service_name` or the `host` in the request is not a
+        /// single DNS label, so the registrar refused **before** it
+        /// could derive the registration identity at all.
+        ///
+        /// Nothing is minted and nothing is probed.  The refusal is
+        /// pre-derivation, so it is neither
+        /// [`ServiceNameCollision`](Self::ServiceNameCollision), which
+        /// compares an identity that was already derived, nor
+        /// [`ServiceInstanceMismatch`](Self::ServiceInstanceMismatch),
+        /// which is about multiplicity.
+        ///
+        /// It carries no payload: no discriminator for which of the
+        /// two parts was rejected, and no echo of the offending
+        /// string, which the registrar keeps escaped in its own audit
+        /// record.
+        ServiceLabelInvalid,
+    }
+
+    /// Why the registrar is unavailable, carried by
+    /// [`NodeEnrollError::RegistrarUnavailable`].
+    ///
+    /// # Wire compatibility
+    ///
+    /// This is an ordinary bincode enum: it is encoded as its
+    /// declaration index, so any later variant must be **appended**
+    /// at the end, and a value this build does not recognize is a
+    /// **decode error**.  Unlike [`Lifecycle`], it has no tolerant
+    /// fallback variant — the reason set is fixed by the registrar
+    /// contract, so a reason this build has never heard of is a
+    /// protocol violation the manager must see rather than a value it
+    /// silently accepts.
+    #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub enum RegistrarUnavailableReason {
+        /// The registrar's client certificate has lapsed or was
+        /// rejected by the endpoint.
+        CredentialInvalid,
+        /// The rendered file carrying the safe-set, the multiplicity
+        /// map and the domain is missing or unreadable.
+        NotProvisioned,
+        /// The audit intent record could not be written, so the verb
+        /// refused before creating anything.
+        AuditUnwritable,
+        /// The identity-store daemon endpoint is down or not
+        /// listening.
+        EndpointUnreachable,
+        /// The outcome audit record could not be written **after** a
+        /// successful mint.
+        ///
+        /// This is the one reason that leaves the identity created, so
+        /// a compensating
+        /// [`Deregister`](NodeEnrollRequest::Deregister) is still
+        /// owed; see
+        /// [`NodeEnrollError::leaves_teardown_owed`].
+        PostMintUnrecordable,
+        /// The manager could not reach the registrar agent at all.
+        ///
+        /// Every other reason is a *response*, so this one is
+        /// synthesized by the manager when the registrar agent is not
+        /// connected and there is nothing to respond.
+        RegistrarUnreachable,
+    }
+
+    impl NodeEnrollError {
+        /// Returns the delay to honour before re-driving the request if
+        /// this failure is transient, or `None` if it must never be
+        /// retried.
+        ///
+        /// The delay comes back from the same call as the yes/no answer,
+        /// so a caller cannot discover that a failure is retryable and
+        /// then have to guess the interval.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use std::time::Duration;
+        ///
+        /// use review_protocol::types::node::NodeEnrollError;
+        ///
+        /// let err = NodeEnrollError::RegistrarBusy {
+        ///     retry_after: Duration::from_secs(30),
+        /// };
+        /// assert_eq!(err.retry_after(), Some(Duration::from_secs(30)));
+        ///
+        /// let err = NodeEnrollError::ServiceLabelInvalid;
+        /// assert_eq!(err.retry_after(), None);
+        /// ```
+        #[must_use]
+        pub fn retry_after(&self) -> Option<Duration> {
+            match self {
+                Self::RegistrarBusy { retry_after } => Some(*retry_after),
+                // Listed explicitly rather than caught by `_`, so a future
+                // retryable variant fails the build instead of silently
+                // reading as `None`.
+                Self::ServiceSpecConflict
+                | Self::ServiceNameCollision
+                | Self::ServiceInstanceMismatch
+                | Self::ServiceHostMismatch
+                | Self::RegistrarUnavailable { .. }
+                | Self::ServiceLabelInvalid => None,
+            }
+        }
+
+        /// Returns whether this failure left a registrar identity
+        /// created, so a compensating
+        /// [`Deregister`](NodeEnrollRequest::Deregister) is still owed.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use review_protocol::types::node::{NodeEnrollError, RegistrarUnavailableReason};
+        ///
+        /// let err = NodeEnrollError::RegistrarUnavailable {
+        ///     reason: RegistrarUnavailableReason::PostMintUnrecordable,
+        /// };
+        /// assert!(err.leaves_teardown_owed());
+        ///
+        /// // Every other reason failed before anything was created.
+        /// let err = NodeEnrollError::RegistrarUnavailable {
+        ///     reason: RegistrarUnavailableReason::AuditUnwritable,
+        /// };
+        /// assert!(!err.leaves_teardown_owed());
+        /// assert!(!NodeEnrollError::ServiceLabelInvalid.leaves_teardown_owed());
+        /// ```
+        #[must_use]
+        pub fn leaves_teardown_owed(&self) -> bool {
+            match self {
+                Self::RegistrarUnavailable { reason } => match reason {
+                    RegistrarUnavailableReason::PostMintUnrecordable => true,
+                    // Listed explicitly rather than caught by `_`, so a
+                    // future reason fails the build instead of silently
+                    // reading as `false`.
+                    RegistrarUnavailableReason::CredentialInvalid
+                    | RegistrarUnavailableReason::NotProvisioned
+                    | RegistrarUnavailableReason::AuditUnwritable
+                    | RegistrarUnavailableReason::EndpointUnreachable
+                    | RegistrarUnavailableReason::RegistrarUnreachable => false,
+                },
+                // Listed explicitly rather than caught by `_`, so a future
+                // variant fails the build instead of silently reading as
+                // `false`.
+                Self::ServiceSpecConflict
+                | Self::ServiceNameCollision
+                | Self::ServiceInstanceMismatch
+                | Self::ServiceHostMismatch
+                | Self::RegistrarBusy { .. }
+                | Self::ServiceLabelInvalid => false,
+            }
+        }
+    }
+
+    impl NodeEnrollResponse {
+        /// Returns the delay to honour before re-driving the request if
+        /// this outcome is a transient failure, or `None` otherwise.
+        ///
+        /// A success reports `None`, and so does every non-retryable
+        /// failure reached through [`Failed`](Self::Failed), so a
+        /// manager classifies the value it actually received in one
+        /// call.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use std::time::Duration;
+        ///
+        /// use review_protocol::types::node::{NodeEnrollError, NodeEnrollResponse};
+        ///
+        /// let resp = NodeEnrollResponse::Failed(NodeEnrollError::RegistrarBusy {
+        ///     retry_after: Duration::from_secs(5),
+        /// });
+        /// assert_eq!(resp.retry_after(), Some(Duration::from_secs(5)));
+        ///
+        /// assert_eq!(NodeEnrollResponse::Done.retry_after(), None);
+        /// let resp = NodeEnrollResponse::Failed(NodeEnrollError::ServiceNameCollision);
+        /// assert_eq!(resp.retry_after(), None);
+        /// ```
+        #[must_use]
+        pub fn retry_after(&self) -> Option<Duration> {
+            match self {
+                Self::Failed(err) => err.retry_after(),
+                // Listed explicitly rather than caught by `_`, so a future
+                // variant fails the build instead of silently reading as
+                // `None`.
+                Self::Material(_) | Self::Done => None,
+            }
+        }
+
+        /// Returns whether this outcome left a registrar identity
+        /// created without the caller being told so, leaving a
+        /// compensating [`Deregister`](NodeEnrollRequest::Deregister)
+        /// owed.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use review_protocol::types::node::{
+        ///     NodeEnrollError, NodeEnrollResponse, RegistrarUnavailableReason,
+        /// };
+        ///
+        /// let resp = NodeEnrollResponse::Failed(NodeEnrollError::RegistrarUnavailable {
+        ///     reason: RegistrarUnavailableReason::PostMintUnrecordable,
+        /// });
+        /// assert!(resp.leaves_teardown_owed());
+        ///
+        /// assert!(!NodeEnrollResponse::Done.leaves_teardown_owed());
+        /// ```
+        #[must_use]
+        pub fn leaves_teardown_owed(&self) -> bool {
+            match self {
+                Self::Failed(err) => err.leaves_teardown_owed(),
+                // Listed explicitly rather than caught by `_`, so a future
+                // variant fails the build instead of silently reading as
+                // `false`.
+                Self::Material(_) | Self::Done => false,
+            }
+        }
+    }
+
     #[cfg(all(test, any(feature = "client", feature = "server")))]
     mod tests {
         use std::time::Duration;
@@ -2425,6 +2973,421 @@ pub mod node {
             let decoded: PackageState =
                 decode(&bytes).expect("an unrecognized discriminant must still decode");
             assert_eq!(decoded.lifecycle, Lifecycle::Unknown);
+        }
+
+        // ── node.enroll ─────────────────────────────────────────
+
+        /// Helper: a `ServiceSpec` with the given certificate group.
+        fn service_spec(cert_group: Option<CertGroup>) -> ServiceSpec {
+            ServiceSpec {
+                component: "sensor".into(),
+                service_name: "sensor".into(),
+                reload: ReloadHook("reload-sensor".into()),
+                cert_group,
+            }
+        }
+
+        /// Helper: a `Register` request with the given identity parts.
+        fn register(
+            instance: Option<u32>,
+            delivery_mode: DeliveryMode,
+            wrap_ttl: Duration,
+        ) -> NodeEnrollRequest {
+            NodeEnrollRequest::Register {
+                service_name: "sensor".into(),
+                delivery_mode,
+                host: "host01".into(),
+                instance,
+                spec: service_spec(Some(CertGroup("internal".into()))),
+                wrap_ttl,
+                idempotency_key: "b6f0".into(),
+            }
+        }
+
+        /// Helper: one of each `NodeEnrollError`, in declaration
+        /// order, so a table-driven test covers all seven.
+        fn every_enroll_error() -> [NodeEnrollError; 7] {
+            [
+                NodeEnrollError::ServiceSpecConflict,
+                NodeEnrollError::ServiceNameCollision,
+                NodeEnrollError::ServiceInstanceMismatch,
+                NodeEnrollError::ServiceHostMismatch,
+                NodeEnrollError::RegistrarUnavailable {
+                    reason: RegistrarUnavailableReason::CredentialInvalid,
+                },
+                NodeEnrollError::RegistrarBusy {
+                    retry_after: Duration::from_secs(30),
+                },
+                NodeEnrollError::ServiceLabelInvalid,
+            ]
+        }
+
+        /// Helper: every `RegistrarUnavailableReason`, in declaration
+        /// order.
+        fn every_unavailable_reason() -> [RegistrarUnavailableReason; 6] {
+            [
+                RegistrarUnavailableReason::CredentialInvalid,
+                RegistrarUnavailableReason::NotProvisioned,
+                RegistrarUnavailableReason::AuditUnwritable,
+                RegistrarUnavailableReason::EndpointUnreachable,
+                RegistrarUnavailableReason::PostMintUnrecordable,
+                RegistrarUnavailableReason::RegistrarUnreachable,
+            ]
+        }
+
+        #[test]
+        fn serde_roundtrip_node_enroll_request() {
+            for instance in [None, Some(7)] {
+                for delivery_mode in [DeliveryMode::LocalFile, DeliveryMode::RemoteBootstrap] {
+                    let wrap_ttl = Duration::from_millis(90_500);
+                    let req = register(instance, delivery_mode, wrap_ttl);
+                    let decoded = roundtrip(&req);
+                    assert_eq!(req, decoded);
+
+                    let NodeEnrollRequest::Register {
+                        wrap_ttl: decoded_ttl,
+                        instance: decoded_instance,
+                        ..
+                    } = decoded
+                    else {
+                        panic!("expected a Register request");
+                    };
+                    assert_eq!(decoded_ttl, wrap_ttl);
+                    assert_eq!(decoded_instance, instance);
+                }
+
+                let req = NodeEnrollRequest::Deregister {
+                    service_name: "sensor".into(),
+                    host: "host01".into(),
+                    instance,
+                    idempotency_key: "b6f0".into(),
+                };
+                assert_eq!(req, roundtrip(&req));
+            }
+        }
+
+        /// The identity's `service_name` and the spec's are filled
+        /// independently, so both survive unchanged even when they
+        /// differ: this crate neither reconciles nor rejects the pair.
+        #[test]
+        fn node_enroll_register_keeps_both_service_names() {
+            let req = NodeEnrollRequest::Register {
+                service_name: "sensor".into(),
+                delivery_mode: DeliveryMode::RemoteBootstrap,
+                host: "host01".into(),
+                instance: Some(1),
+                spec: ServiceSpec {
+                    component: "sensor-pkg".into(),
+                    service_name: "collector".into(),
+                    reload: ReloadHook("reload-sensor".into()),
+                    cert_group: None,
+                },
+                wrap_ttl: Duration::from_mins(10),
+                idempotency_key: "b6f0".into(),
+            };
+            let decoded = roundtrip(&req);
+            assert_eq!(req, decoded);
+
+            let NodeEnrollRequest::Register {
+                service_name, spec, ..
+            } = decoded
+            else {
+                panic!("expected a Register request");
+            };
+            assert_eq!(service_name, "sensor");
+            assert_eq!(spec.service_name, "collector");
+            assert_ne!(service_name, spec.service_name);
+        }
+
+        #[test]
+        fn serde_roundtrip_service_spec() {
+            for cert_group in [None, Some(CertGroup("internal".into()))] {
+                let spec = service_spec(cert_group);
+                assert_eq!(spec, roundtrip(&spec));
+            }
+        }
+
+        /// A newtype over `String` is encoded as its inner value, so
+        /// both opaque transport types cost nothing on the wire and a
+        /// later move to a modelled type is a source-level break only.
+        #[test]
+        fn reload_hook_and_cert_group_encode_as_bare_strings() {
+            let hook = ReloadHook("reload-sensor".into());
+            assert_eq!(hook, roundtrip(&hook));
+            assert_eq!(encode(&hook), encode(&"reload-sensor".to_string()));
+
+            let group = CertGroup("internal".into());
+            assert_eq!(group, roundtrip(&group));
+            assert_eq!(encode(&group), encode(&"internal".to_string()));
+        }
+
+        #[test]
+        fn serde_roundtrip_node_enroll_response() {
+            let resp = NodeEnrollResponse::Material(bootstrap_material());
+            assert_eq!(resp, roundtrip(&resp));
+
+            let resp = NodeEnrollResponse::Done;
+            assert_eq!(resp, roundtrip(&resp));
+
+            // A typed failure survives as a *response*, not merely as
+            // a bare error, including the two that carry a payload.
+            for err in [
+                NodeEnrollError::RegistrarUnavailable {
+                    reason: RegistrarUnavailableReason::PostMintUnrecordable,
+                },
+                NodeEnrollError::RegistrarBusy {
+                    retry_after: Duration::from_millis(2_500),
+                },
+            ] {
+                let resp = NodeEnrollResponse::Failed(err);
+                let decoded = roundtrip(&resp);
+                assert_eq!(resp, decoded);
+                assert!(matches!(decoded, NodeEnrollResponse::Failed(_)));
+            }
+
+            let resp = NodeEnrollResponse::Failed(NodeEnrollError::RegistrarUnavailable {
+                reason: RegistrarUnavailableReason::PostMintUnrecordable,
+            });
+            let NodeEnrollResponse::Failed(NodeEnrollError::RegistrarUnavailable { reason }) =
+                roundtrip(&resp)
+            else {
+                panic!("expected a registrar-unavailable failure response");
+            };
+            assert_eq!(reason, RegistrarUnavailableReason::PostMintUnrecordable);
+
+            let resp = NodeEnrollResponse::Failed(NodeEnrollError::RegistrarBusy {
+                retry_after: Duration::from_millis(2_500),
+            });
+            let NodeEnrollResponse::Failed(NodeEnrollError::RegistrarBusy { retry_after }) =
+                roundtrip(&resp)
+            else {
+                panic!("expected a registrar-busy failure response");
+            };
+            assert_eq!(retry_after, Duration::from_millis(2_500));
+        }
+
+        /// The granted deadline travels as received.  A grant shorter
+        /// than the requested `wrap_ttl` survives untouched, so a
+        /// consumer can never assume the two agree.
+        #[test]
+        fn node_enroll_material_carries_the_granted_deadline() {
+            const WRAP_TTL: Duration = Duration::from_hours(1);
+
+            let requested_at: jiff::Timestamp = "2026-01-02T03:00:00Z"
+                .parse()
+                .expect("literal is a valid timestamp");
+            let requested_deadline = requested_at
+                + jiff::SignedDuration::from_secs(
+                    i64::try_from(WRAP_TTL.as_secs()).expect("an hour fits in an i64"),
+                );
+
+            // The registrar clamped the requested hour to ten minutes.
+            let granted: jiff::Timestamp = "2026-01-02T03:10:00Z"
+                .parse()
+                .expect("literal is a valid timestamp");
+            assert!(granted < requested_deadline);
+
+            let resp = NodeEnrollResponse::Material(BootstrapMaterial {
+                expires_at: granted,
+                ..bootstrap_material()
+            });
+            let decoded = roundtrip(&resp);
+            assert_eq!(resp, decoded);
+
+            let NodeEnrollResponse::Material(material) = decoded else {
+                panic!("expected a Material response");
+            };
+            assert_eq!(material.expires_at, granted);
+            assert!(material.expires_at < requested_deadline);
+        }
+
+        /// `NodeEnrollResponse` derives `Debug`, so the `Material`
+        /// payload keeps `BootstrapMaterial`'s own redaction.
+        #[test]
+        fn node_enroll_response_debug_redacts_the_wrapped_secret() {
+            let resp = NodeEnrollResponse::Material(bootstrap_material());
+            let rendered = format!("{resp:?}");
+            assert!(!rendered.contains("s.9f3c1b"), "{rendered}");
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+            assert!(rendered.contains("sensor-installer"), "{rendered}");
+        }
+
+        /// Every one of the seven errors survives the wire and matches
+        /// only its own pattern.
+        #[test]
+        fn serde_roundtrip_node_enroll_error() {
+            for err in every_enroll_error() {
+                let decoded = roundtrip(&err);
+                assert_eq!(decoded, err);
+                for other in every_enroll_error() {
+                    assert_eq!(
+                        decoded == other,
+                        err == other,
+                        "{err:?} must be distinguishable from {other:?}"
+                    );
+                }
+            }
+
+            // The two payload-carrying variants keep their payloads.
+            for reason in every_unavailable_reason() {
+                let err = NodeEnrollError::RegistrarUnavailable { reason };
+                assert_eq!(err, roundtrip(&err));
+            }
+            let err = NodeEnrollError::RegistrarBusy {
+                retry_after: Duration::from_millis(1_250),
+            };
+            assert_eq!(err, roundtrip(&err));
+        }
+
+        /// `RegistrarBusy` is the only retryable failure, and the
+        /// delay comes back from the same call.
+        #[test]
+        fn node_enroll_retry_after_is_registrar_busy_alone() {
+            for err in every_enroll_error() {
+                let expected = match &err {
+                    NodeEnrollError::RegistrarBusy { retry_after } => Some(*retry_after),
+                    _ => None,
+                };
+                assert_eq!(err.retry_after(), expected, "{err:?}");
+                assert_eq!(roundtrip(&err).retry_after(), expected, "{err:?}");
+                assert_eq!(
+                    NodeEnrollResponse::Failed(err.clone()).retry_after(),
+                    expected,
+                    "{err:?}"
+                );
+            }
+
+            let busy = NodeEnrollError::RegistrarBusy {
+                retry_after: Duration::from_millis(4_500),
+            };
+            assert_eq!(busy.retry_after(), Some(Duration::from_millis(4_500)));
+
+            // A reason never makes `RegistrarUnavailable` retryable.
+            for reason in every_unavailable_reason() {
+                assert_eq!(
+                    NodeEnrollError::RegistrarUnavailable { reason }.retry_after(),
+                    None
+                );
+            }
+
+            // A success is not a retry candidate either.
+            assert_eq!(NodeEnrollResponse::Done.retry_after(), None);
+            assert_eq!(
+                NodeEnrollResponse::Material(bootstrap_material()).retry_after(),
+                None
+            );
+        }
+
+        /// A teardown is owed for exactly one reason of exactly one
+        /// variant.
+        #[test]
+        fn node_enroll_teardown_is_owed_only_after_a_mint() {
+            for err in every_enroll_error() {
+                assert!(!err.leaves_teardown_owed(), "{err:?}");
+                assert!(
+                    !NodeEnrollResponse::Failed(err.clone()).leaves_teardown_owed(),
+                    "{err:?}"
+                );
+            }
+
+            for reason in every_unavailable_reason() {
+                let err = NodeEnrollError::RegistrarUnavailable { reason };
+                let owed = reason == RegistrarUnavailableReason::PostMintUnrecordable;
+                assert_eq!(err.leaves_teardown_owed(), owed, "{reason:?}");
+                assert_eq!(roundtrip(&err).leaves_teardown_owed(), owed, "{reason:?}");
+                assert_eq!(
+                    NodeEnrollResponse::Failed(err).leaves_teardown_owed(),
+                    owed,
+                    "{reason:?}"
+                );
+            }
+
+            // A pre-derivation refusal never leaves a manager tearing
+            // down an identity that was never created.
+            assert!(!NodeEnrollError::ServiceLabelInvalid.leaves_teardown_owed());
+
+            assert!(!NodeEnrollResponse::Done.leaves_teardown_owed());
+            assert!(!NodeEnrollResponse::Material(bootstrap_material()).leaves_teardown_owed());
+        }
+
+        /// The reason set is closed: a value one past the last variant
+        /// is a decode error, not a silent fallback.
+        #[test]
+        fn registrar_unavailable_reason_roundtrips_and_rejects_unknown() {
+            for reason in every_unavailable_reason() {
+                assert_eq!(reason, roundtrip(&reason));
+            }
+
+            let one_past_the_end = 6u32.to_le_bytes();
+            let decoded: Result<RegistrarUnavailableReason, _> = decode(&one_past_the_end);
+            assert!(
+                decoded.is_err(),
+                "an unrecognized reason must fail the decode, not fall back"
+            );
+        }
+
+        /// Declaration order is the wire order: a later insertion,
+        /// rather than an append, breaks this test.
+        #[test]
+        fn node_enroll_error_variant_order_is_pinned() {
+            for (position, err) in every_enroll_error().iter().enumerate() {
+                assert_eq!(
+                    variant_index(&encode(err)),
+                    u32::try_from(position).expect("seven variants fit in a u32"),
+                    "{err:?}"
+                );
+            }
+            assert_eq!(
+                variant_index(&encode(&NodeEnrollError::ServiceLabelInvalid)),
+                6,
+                "the newest variant is appended, never grouped with the other Service* errors"
+            );
+        }
+
+        /// Declaration order is the wire order for the reason set too.
+        #[test]
+        fn registrar_unavailable_reason_variant_order_is_pinned() {
+            for (position, reason) in every_unavailable_reason().iter().enumerate() {
+                assert_eq!(
+                    variant_index(&encode(reason)),
+                    u32::try_from(position).expect("six variants fit in a u32"),
+                    "{reason:?}"
+                );
+            }
+        }
+
+        /// Declaration order is the wire order for the response too.
+        #[test]
+        fn node_enroll_response_variant_order_is_pinned() {
+            assert_eq!(
+                variant_index(&encode(&NodeEnrollResponse::Material(bootstrap_material()))),
+                0
+            );
+            assert_eq!(variant_index(&encode(&NodeEnrollResponse::Done)), 1);
+            assert_eq!(
+                variant_index(&encode(&NodeEnrollResponse::Failed(
+                    NodeEnrollError::ServiceSpecConflict
+                ))),
+                2
+            );
+        }
+
+        /// A manager synthesizes `RegistrarUnreachable` itself when the
+        /// registrar agent is not connected at all, so no registrar
+        /// response is needed to produce it.
+        #[test]
+        fn registrar_unreachable_is_constructed_without_a_response() {
+            let err = NodeEnrollError::RegistrarUnavailable {
+                reason: RegistrarUnavailableReason::RegistrarUnreachable,
+            };
+            assert!(matches!(
+                err,
+                NodeEnrollError::RegistrarUnavailable {
+                    reason: RegistrarUnavailableReason::RegistrarUnreachable
+                }
+            ));
+            assert_eq!(err.retry_after(), None);
+            assert!(!err.leaves_teardown_owed());
         }
     }
 }
