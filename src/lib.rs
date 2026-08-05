@@ -1346,10 +1346,22 @@ mod tests {
 
         assert!(matches!(
             res,
-            Err(crate::HandshakeError::IncompatibleProtocol(..))
+            Err(crate::HandshakeError::IncompatibleProtocol(ref version, ref req))
+                if version == PREVIOUS_PROTOCOL_VERSION
+                    && req == crate::MIN_PROTOCOL_VERSION_REQ
         ));
 
-        assert!(tokio::join!(handle).0.unwrap().is_err());
+        // Both branches return the same variant with the same payload, so the
+        // server side alone cannot say which one refused. The agent side can:
+        // a floor refusal echoes the requirement back, where the ceiling
+        // refusal below echoes `highest_protocol_version`.
+        let agent_res = tokio::join!(handle).0.unwrap();
+        assert!(matches!(
+            agent_res,
+            Err(crate::HandshakeError::IncompatibleProtocol(ref version, ref echoed))
+                if version == PREVIOUS_PROTOCOL_VERSION
+                    && echoed == crate::MIN_PROTOCOL_VERSION_REQ
+        ));
     }
 
     /// The ceiling half of the same window, pinned so that a consumer raising
@@ -1391,9 +1403,21 @@ mod tests {
 
         assert!(matches!(
             res,
-            Err(crate::HandshakeError::IncompatibleProtocol(..))
+            Err(crate::HandshakeError::IncompatibleProtocol(ref version, ref req))
+                if version == crate::PROTOCOL_VERSION
+                    && req == crate::MIN_PROTOCOL_VERSION_REQ
         ));
 
-        assert!(tokio::join!(handle).0.unwrap().is_err());
+        // The agent version clears the floor, so this can only be the ceiling
+        // refusing. What proves it is the string echoed back: the ceiling
+        // branch sends `highest_protocol_version`, where the floor branch
+        // sends the requirement.
+        let agent_res = tokio::join!(handle).0.unwrap();
+        assert!(matches!(
+            agent_res,
+            Err(crate::HandshakeError::IncompatibleProtocol(ref version, ref echoed))
+                if version == crate::PROTOCOL_VERSION
+                    && echoed == PREVIOUS_PROTOCOL_VERSION
+        ));
     }
 }
