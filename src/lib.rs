@@ -310,11 +310,9 @@ fn handle_handshake_recv_io_error(e: std::io::Error) -> HandshakeError {
 ///
 /// The derived `Deserialize`, by contrast, is **not** the conditional decode: it
 /// is positional like any other bincode decode and so demands the full tail,
-/// failing on the base-only frame an older agent sends. [`server::handshake`] is
+/// failing on the base-only frame an older agent sends. `server::handshake` is
 /// what applies the rule above, and a manager reads `AgentInfo` off the wire
 /// through it rather than through `oinq::frame::recv::<AgentInfo>`.
-///
-/// [`server::handshake`]: crate::server::handshake
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentInfo {
     #[serde(rename = "agent_name", alias = "app_name")]
@@ -329,16 +327,13 @@ pub struct AgentInfo {
     /// `client::ConnectionBuilder::new` — and this crate never fills it in.
     /// [`PROTOCOL_VERSION`] is the value this crate's surface corresponds to.
     ///
-    /// [`server::handshake`] enforces a window on it from both sides: a floor,
+    /// `server::handshake` enforces a window on it from both sides: a floor,
     /// the caller's `version_req`, and a ceiling, the caller's
     /// `highest_protocol_version`. A version outside either end answers
-    /// [`HandshakeError::IncompatibleProtocol`]. So a caller that passes a
+    /// `HandshakeError::IncompatibleProtocol`. So a caller that passes a
     /// crate version into either argument breaks its own handshake — a floor
     /// in the crate's namespace is vacuous against a protocol version, and a
     /// ceiling in it refuses every agent.
-    ///
-    /// [`server::handshake`]: crate::server::handshake
-    /// [`HandshakeError::IncompatibleProtocol`]: crate::HandshakeError::IncompatibleProtocol
     pub protocol_version: String,
     pub addr: SocketAddr,
     pub status: Status,
