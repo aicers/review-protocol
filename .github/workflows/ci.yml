@@ -136,8 +136,8 @@ jobs:
     name: Instructions
     uses: aicers/agent-instructions/.github/workflows/check-drift.yml@main
     with:
-      blocks: "workflow rust rust-tls changelog"
-      instructions-ref: v1
+      blocks: "workflow rust changelog"
+      instructions-ref: v2
 
   check:
     runs-on: ubuntu-latest
