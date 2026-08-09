@@ -129,15 +129,17 @@ jobs:
 
   # Ungated, like `markdown`, and for the same reason: AGENTS.md is itself
   # Markdown, so a documentation-only change is exactly the change that can
-  # edit a generated region. Pinned to a release tag rather than a branch —
-  # comparing against a moving branch would turn every upstream edit into a
-  # red build here, on pull requests that have nothing to do with it.
+  # edit a generated region.
+  #
+  # The release this repository is on, and the blocks it carries, are in
+  # `.agents/instructions.toml`, which this job reads. They are pinned to a
+  # release rather than tracking a branch: comparing against a moving branch
+  # would turn every upstream edit into a red build here, on pull requests
+  # that have nothing to do with it. `update-instructions.yml` is what moves
+  # the pin, and it does so in a pull request.
   instructions:
     name: Instructions
     uses: aicers/agent-instructions/.github/workflows/check-drift.yml@main
-    with:
-      blocks: "workflow rust changelog"
-      instructions-ref: v2
 
   check:
     runs-on: ubuntu-latest
