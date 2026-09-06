@@ -136,10 +136,10 @@ pub enum NodePackageRequest {
         /// and the state it writes, which are what keep two instances of
         /// one module from colliding (RFC-B §4). `None` for a component
         /// whose class has no instance dimension (the core components).
-        /// In v1 this is `Some(1)` for a module and `None` for a core
-        /// component: RFC-A §4 pins the number and defers allocating others,
-        /// so the field is carried from the first release and only the range
-        /// of accepted values widens later.
+        /// `Some(n)` for a module, where `n` is the number the manager
+        /// allocated (RFC-D1 §4g, bounded at `999` by the three-digit
+        /// identity segment), and `None` for a core component, which has no
+        /// instance dimension.
         /// The composed `registration_id` is NOT sent: that belongs to the
         /// enrollment plane and the registrar derives it (RFC-F §5.5).
         instance: Option<u32>,
@@ -171,6 +171,23 @@ pub enum NodePackageRequest {
         /// (RFC-B §8). REView sets it from the operator's choice; default
         /// `Rollback`.
         on_failure: FailurePolicy,
+        /// Listening addresses this instance must bind, by the
+        /// configuration key that carries each one.
+        ///
+        /// Populated by the manager for a component that declares
+        /// listening addresses; `None` for every component that binds
+        /// nothing. The agent writes these values into the rendered
+        /// configuration verbatim and never substitutes another: a bind
+        /// that fails is reported, not retried at a different address.
+        /// Honoured on a **first install only**; an `Install` that is an
+        /// update carrying a map is refused with
+        /// `InstallPreflight::BindAddrsOnUpdate`, not obeyed and not
+        /// dropped.
+        ///
+        /// Keyed by configuration key rather than by a component-specific
+        /// struct so a component that gains a listener needs no wire
+        /// change.
+        bind_addrs: Option<BTreeMap<String, SocketAddr>>,
     },
     /// Remove one installed instance (stop unit, remove artifacts).
     /// `instance` selects which, exactly as on `Install`.
@@ -185,6 +202,14 @@ pub enum NodePackageRequest {
     ListInstalled,
     /// Report install/lifecycle state of one installed instance.
     Status { target: String, instance: Option<u32> },
+    /// Report every local address in use on this host, so the manager can
+    /// choose bind addresses that do not collide (RFC-B §4, RFC-D2).
+    ///
+    /// Host-wide, so it carries no `target` and no `instance`: what may be
+    /// ALLOCATED is module-scoped, but what OCCUPIES a port is everything on
+    /// the machine. A separate request from `ListInstalled` because occupancy
+    /// is a different question asked at a different time.
+    ListHostPorts,
 }
 
 /// `Install` preflight — the agent's FIRST reply, sent AFTER the framed
@@ -205,6 +230,24 @@ pub enum InstallPreflight {
     // space (see §4). Carries the filesystem, the space required and the
     // space available so the report names a cause.
     InsufficientDiskSpace { filesystem: String, required: u64, available: u64 },
+    // the request is an UPDATE and it carried `bind_addrs`. Addresses are
+    // fixed at first install (RFC-B §4): obeying the map would revert what
+    // the operator set through the config plane, and dropping it would let
+    // the manager and the operator believe an address changed when it did
+    // not. Decidable from the request alone, so no bytes move; terminal and
+    // NOT retryable.
+    BindAddrsOnUpdate,
+    // the per-host `roxyd.toml` sink carries no product namespace, so the
+    // agent cannot compose a single managed path (RFC-B §4, §7). Terminal
+    // and NOT retryable: retrying cannot add a field to a file the agent
+    // does not write.
+    NamespaceUnconfigured,
+    // the agent does not advertise the enrollment capability, and this is a
+    // first install carrying `bootstrap_material`. Terminal for THIS attempt
+    // and NOT retryable — the agent answers identically until a different
+    // build is deployed — so the manager discharges the attempt's owed
+    // cleanup rather than holding it open (RFC-D2 §4d).
+    EnrollmentUnsupported,
 }
 
 // DECLARATION ORDER IS THE WIRE ENCODING (bincode encodes a variant as its
@@ -222,7 +265,9 @@ pub enum NodePackageResponse {
     Accepted,
     Installed(Vec<InstalledPackage>),  // for ListInstalled
     State(PackageState),               // for Status
-    // a typed apply failure. Success-shaped on the wire: a decode success
+    // a typed package-operation failure — an apply failure, but also a
+    // refusal from a non-apply request such as ListHostPorts
+    // (ObservationUnavailable). Success-shaped on the wire: a decode success
     // still means "the agent answered," and the manager classifies the
     // refusal by matching on the error rather than by parsing a string.
     Failed(NodePackageError),
@@ -232,6 +277,10 @@ pub enum NodePackageResponse {
     // agent that stays connected for weeks would otherwise never report its
     // new epoch (RFC-D2 §4a).
     TrustActive { active_epoch: u64 },
+    // for ListHostPorts. A DEDUPLICATED set of `(transport, port)` pairs:
+    // one entry per taken port, not per socket, and deduplicated across the
+    // socket tables and the container runtime's published ports alike.
+    HostPorts(Vec<HostPort>),
 }
 
 // Carried by NodePackageResponse::Failed, and reached by matching on a
@@ -259,6 +308,18 @@ pub enum NodePackageError {
         active_epoch: u64,
         supported: ManifestFormatRange,
     },
+    // a required occupancy read failed — a socket table, or a container
+    // runtime that is present and could not be queried — so NO occupancy is
+    // reported rather than a short list, which would be indistinguishable
+    // from a host with fewer listeners. RETRYABLE.
+    ObservationUnavailable,
+    // this instance is present on the host but the agent holds no
+    // installed-build record for it, so it cannot treat the apply as a first
+    // install without re-rendering configuration it did not write. Distinct
+    // from `MissingBootstrapMaterial`, which says "you forgot the material"
+    // when the truth is "this instance is not one I manage". Terminal and NOT
+    // retryable: the state is a standing property of the host (RFC-B §4).
+    UnmanagedInstancePresent,
 }
 
 /// What the agent does if the newly-applied version fails its health gate
@@ -290,10 +351,20 @@ pub struct PackageState {
     /// something else until the service restarts. Empty for a component
     /// that listens on nothing, which is every module except Giganto: the
     /// four agents dial out on an ephemeral port and bind no service address
-    /// (RFC-A §4). They are **reported, never accepted**: the manager
-    /// records them (RFC-D1) and never tells the agent what to bind. v1
-    /// chooses no addresses (RFC-B §4); the field exists so that when a
-    /// later release does choose them, the wire does not change.
+    /// (RFC-A §4).
+    ///
+    /// This field is **observed, never intent**: it records where the
+    /// instance IS, read from live sockets, and the agent never derives it
+    /// from the rendered configuration. That distinction is load-bearing —
+    /// an instance that failed to bind must read as not bound, and a value
+    /// derived from configuration would report the address it was TOLD to
+    /// use whether or not it got it.
+    ///
+    /// The manager now CHOOSES these addresses and sends them on `Install`
+    /// as `bind_addrs` (RFC-B §4, RFC-D2), which is a reversal of the
+    /// earlier "v1 chooses no ports" position. That does not make this field
+    /// intent: the manager knows what it assigned without reading it back,
+    /// and what this reports is whether the host agrees.
     pub bound_addrs: Vec<BoundAddr>,
 }
 
@@ -302,6 +373,30 @@ pub struct BoundAddr {
     /// can match it without positional assumptions — e.g. `graphql_srv_addr`.
     pub name: String,
     pub addr: String,  // host:port, as bound
+}
+
+/// One port taken on a host, as `ListHostPorts` reports it.
+///
+/// Deliberately NOT an address. The manager's conflict model is
+/// `(transport, port)` and address-blind by decision (RFC-D2): a wildcard
+/// bind conflicts with every specific one, wildcard is what these components
+/// use, and a precise model would need address-overlap rules the manager
+/// cannot verify against what is actually bound. An address carried here
+/// would be carried and never read.
+///
+/// Deliberately NOT one entry per socket either. With no owner netting
+/// anywhere in the design, nothing counts sockets: two `SO_REUSEPORT`
+/// sockets on one port make that port taken exactly once over.
+pub struct HostPort {
+    pub transport: Transport,
+    pub port: u16,
+}
+
+/// The transport a port is taken on. TCP and UDP are separate spaces, so one
+/// number may be taken on one and free on the other.
+pub enum Transport {
+    Tcp,
+    Udp,
 }
 
 /// Install/run state of one instance, as the agent observes it. The manager
@@ -380,7 +475,9 @@ pub enum Lifecycle {
        success — no bytes, no `enable --now`, and the operation recorded as a
        **successful update over a still-Failed service**. The only escape would
        be uninstall + reinstall, which drags in the two-step deregister, a
-       re-mint, and the re-registration block — a punishing path for what is
+       re-mint, and — unless the operator waits out the teardown — a
+       **different instance number**, since a number is not reusable while
+       its row still stands (RFC-D2 §4f). A punishing path for what is
        really "try that again." So the agent returns `AlreadyApplied` only when
        the build is installed **and** its current unit state is not `failed`;
        otherwise `Proceed`, and the diff engine makes the re-apply a cheap
@@ -685,7 +782,29 @@ pub enum NodeEnrollResponse {
     /// parsing a string.
     Failed(NodeEnrollError),
 }
-```
+
+/// NOTE ON THE JOIN TOKEN'S NAMESPACE. A bare host needs the product
+/// **namespace** before it can compose a single managed path, and it needs it
+/// at join steps 1 and 1b — before step 2 consumes this material (RFC-B §7).
+/// An earlier draft wrapped `BootstrapMaterial` in a signed envelope carrying
+/// the namespace as a claim, so it could be read without unwrapping. **That is
+/// withdrawn.** It was defending a pairing that does not exist: the enrolled
+/// identity carries no namespace segment at all — roxyd registers as
+/// `roxyd-<host>` and bootroot composes
+/// `<instance>.<service_name>.<host>.<domain>` — so there is nothing for a
+/// namespace claim to be bound to and nothing a mismatch could corrupt. A
+/// wrong namespace lays a host's files under the wrong tree, which is an
+/// operator error visible at once and fixed by re-running, not a
+/// cryptographic exposure. The envelope also could not be made sound: a bare
+/// host's only trust root is the release binary it hash-pinned, so verifying
+/// the signature would need a key in that binary, and a per-deployment key
+/// generated by a manager cannot be in a binary built before it existed.
+/// So the namespace travels as an explicit `roxyd join --namespace <ns>`
+/// argument, displayed by the same authenticated UI session that displays the
+/// binary's `sha256sum -c` line (RFC-B §7, RFC-E §6). It is not secret, so the
+/// argv objection that keeps the TOKEN off the command line does not reach it.
+/// This crate therefore carries no envelope type: `BootstrapMaterial` above is
+/// the whole of what the operator relays.
 
 Typed failures ride the **response**, not the `Result<_, String>` error
 channel, exactly as `node.package`'s apply errors ride
@@ -1128,6 +1247,33 @@ not a question.
 This crate owns wire types several other documents depend on by name, so each
 gets a criterion here rather than only a prose mention.
 
+- **`bind_addrs` round-trips, present and absent.** Encode/decode with a map
+  and with `None`; with two keys on the same port under different transports,
+  which the conflict model permits and which therefore must survive; and with
+  two keys on the same `SocketAddr`, which is legal on the wire and is refused
+  by the manager, not here.
+- **The appended variants are appended.** `InstallPreflight` gains
+  `BindAddrsOnUpdate`, `NamespaceUnconfigured` and `EnrollmentUnsupported`
+  after `InsufficientDiskSpace`; `NodePackageError` gains
+  `ObservationUnavailable` and `UnmanagedInstancePresent` after
+  `UnsupportedManifestFormat`; `NodePackageResponse` gains `HostPorts` after
+  `TrustActive`; `NodePackageRequest` gains `ListHostPorts` after `Status`. A
+  test pins each variant's index, because declaration order **is** the wire
+  encoding and an insertion in the middle silently renumbers every variant
+  after it.
+- **`ListHostPorts` answers a deduplicated set.** A response carrying the same
+  `(transport, port)` twice is not produced; the same port under TCP and UDP
+  is **two** entries. The type carries no address and no socket count, and a
+  test asserts the struct's shape so a later "just add the address" cannot
+  pass review by accident.
+- **No backward-compatible decode is claimed or tested.** The codec is
+  positional bincode 2, so a derived `Deserialize` gives no tail tolerance —
+  `AgentInfo`'s tolerance comes from a hand-written decoder that nothing else
+  inherits. There is also nothing to be compatible with: `NodePackageRequest`
+  and `PackageState` exist only on `origin/main` and in no released tag. This
+  is an unreleased type inside a **coordinated cutover**, and the cutover, not
+  a compatibility shim, is what the consuming repositories plan around.
+
 - **Codes 109/110 are added additively.** Codes 100–108 are untouched, the
   round-trip tests that pin the numeric mapping (`request.rs:1069`, `:1056`)
   still pass, and an agent that does not implement the new codes still falls
@@ -1142,8 +1288,10 @@ gets a criterion here rather than only a prose mention.
   `(target, version, commit)` (`TargetMismatch`) and that no wire field can
   substitute for the container's own manifest (RFC-A §4/§5).
 - **`instance` rides both families as `Option<u32>`.** A test asserts the wire
-  round-trips `None` and `Some(n)` and that v1's `Some(1)` needs no wire change
-  to become `Some(2)`.
+  round-trips `None` and `Some(n)` across the whole allocated range `1..=999`,
+  and that `Some(1000)` is not produced by any allocator this crate carries a
+  value for — the ceiling is the three-digit identity segment's (RFC-A §4),
+  not this crate's, so the wire simply carries what it is given.
 - **Seven typed enroll errors exist and are distinguishable:**
   `ServiceSpecConflict`, `ServiceNameCollision`, `ServiceInstanceMismatch`,
   `ServiceHostMismatch`, `RegistrarUnavailable { reason }`,
@@ -1194,8 +1342,18 @@ and RFC-D2 both consume its types — so it lands first.
    `#[serde(from/into = "u8")]` / `num_enum(default)` combination, the
    `service_id` entry, and the dispatch arm. Includes the streaming state
    machine and its preflight ACK.
+1b. **Bind addresses and host occupancy on the wire** (§4) —
+   `Install::bind_addrs`; the `ListHostPorts` request and the `HostPorts`
+   response with `HostPort` and `Transport`; the appended
+   `InstallPreflight::BindAddrsOnUpdate`, `NamespaceUnconfigured` and
+   `EnrollmentUnsupported`; the appended
+   `NodePackageError::ObservationUnavailable` and
+   `UnmanagedInstancePresent`; and the variant-index tests that pin every
+   enum's declaration order, since appending in the wrong place silently
+   renumbers the wire. Depends on 1.
+
 2. **`node.enroll` family + code 110** (§5) — `ServiceSpec`, `DeliveryMode`,
-   `BootstrapMaterial`, `Register`/`Deregister`, and the **six** typed enroll
+   `BootstrapMaterial`, `Register`/`Deregister`, and the **seven** typed enroll
    errors with `RegistrarUnavailable`'s closed reason set and
    `RegistrarBusy { retry_after }`. Depends on 1 only for the shared
    `service_id`/dispatch scaffolding.
