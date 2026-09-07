@@ -638,7 +638,8 @@ pub enum Lifecycle {
   — the agent reads exactly `size` bytes, so how the sender chunks is not
   observable to it (§7). Recovery is decided: restart-whole in v1.
 - **ServiceId:** `node.package`, `node.package.install`,
-  `node.package.remove`, `node.package.list`, `node.package.status`.
+  `node.package.remove`, `node.package.list`, `node.package.status`,
+  `node.package.list_host_ports`.
 
 ## 5. `node.enroll` (proposed code 110)
 

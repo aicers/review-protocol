@@ -2726,6 +2726,44 @@ pub mod node {
             assert_eq!(bind_addrs_of(&decoded), Some(&verbatim));
         }
 
+        /// Field POSITION is the wire contract just as variant order
+        /// is, so `bind_addrs` has to be the tail field of `Install`.
+        ///
+        /// The variant-index tests pin the enums; this pins the one
+        /// variant that gained a field.  Reordering the fields, or
+        /// inserting a later one ahead of `bind_addrs`, silently
+        /// renumbers the wire for every peer built against the old
+        /// order and breaks this test.
+        #[test]
+        fn node_package_install_field_order_is_pinned() {
+            let bind_addrs = BTreeMap::from([(
+                "graphql_srv_addr".to_string(),
+                "0.0.0.0:8442".parse::<SocketAddr>().expect("valid"),
+            )]);
+
+            // The variant index, then every field in declaration
+            // order, each encoded on its own.  bincode writes exactly
+            // this concatenation.
+            let expected = [
+                encode(&0_u32),
+                encode(&"giganto".to_string()),
+                encode(&Some(1_u32)),
+                encode(&"1.2.3".to_string()),
+                encode(&"0123456789abcdef".to_string()),
+                encode(&4_194_304_u64),
+                encode(&"b6f0".to_string()),
+                encode(&Option::<BootstrapMaterial>::None),
+                encode(&FailurePolicy::Rollback),
+                encode(&Some(bind_addrs.clone())),
+            ]
+            .concat();
+            assert_eq!(
+                encode(&install_with_bind_addrs(Some(bind_addrs))),
+                expected,
+                "`bind_addrs` is the tail field, after `on_failure`"
+            );
+        }
+
         /// Widening the accepted instance range later needs no wire
         /// change: distinct instances differ only in payload.
         #[test]
@@ -3140,6 +3178,7 @@ pub mod node {
                 NodePackageResponse::Accepted,
                 NodePackageResponse::Installed(Vec::new()),
                 NodePackageResponse::State(package_state(Lifecycle::Running, Vec::new())),
+                NodePackageResponse::HostPorts(Vec::new()),
             ]
             .into_iter()
             .chain(pre_existing_apply_errors().map(NodePackageResponse::Failed))
