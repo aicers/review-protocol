@@ -1249,10 +1249,10 @@ This crate owns wire types several other documents depend on by name, so each
 gets a criterion here rather than only a prose mention.
 
 - **`bind_addrs` round-trips, present and absent.** Encode/decode with a map
-  and with `None`; with two keys on the same port under different transports,
-  which the conflict model permits and which therefore must survive; and with
-  two keys on the same `SocketAddr`, which is legal on the wire and is refused
-  by the manager, not here.
+  and with `None`; with two keys whose ports differ, which the conflict model
+  permits and which therefore must survive; and with two keys on the same
+  `SocketAddr`, which is legal on the wire and is refused by the manager, not
+  here.
 - **The appended variants are appended.** `InstallPreflight` gains
   `BindAddrsOnUpdate`, `NamespaceUnconfigured` and `EnrollmentUnsupported`
   after `InsufficientDiskSpace`; `NodePackageError` gains
