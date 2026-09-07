@@ -3434,6 +3434,68 @@ mod tests {
         .await;
     }
 
+    /// A refused occupancy read reaches the manager as
+    /// `Failed(ObservationUnavailable)` — the same success-shaped
+    /// frame an apply failure rides, so the `Result` channel stays
+    /// reserved for transport and parse failures and the manager
+    /// classifies the refusal by matching rather than by parsing a
+    /// string.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_list_host_ports_observation_unavailable() {
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{NodePackageError, NodePackageRequest, NodePackageResponse};
+
+        /// Answers the unary path with the occupancy refusal, which
+        /// is the one thing this test drives.
+        struct RefusingHandler;
+
+        #[async_trait::async_trait]
+        impl super::Handler for RefusingHandler {
+            async fn node_package(
+                &mut self,
+                _req: NodePackageRequest,
+            ) -> Result<NodePackageResponse, String> {
+                Ok(NodePackageResponse::Failed(
+                    NodePackageError::ObservationUnavailable,
+                ))
+            }
+        }
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = RefusingHandler;
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let res: Result<NodePackageResponse, String> = crate::unary_request(
+            &mut client_send,
+            &mut client_recv,
+            u32::from(RequestCode::NodePackage),
+            NodePackageRequest::ListHostPorts,
+        )
+        .await
+        .expect("wire transport should succeed");
+
+        let resp = res.expect("a refusal is success-shaped, not the error channel");
+        assert_eq!(
+            resp,
+            NodePackageResponse::Failed(NodePackageError::ObservationUnavailable)
+        );
+        assert_eq!(resp.active_trust_epoch(), None);
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
     /// Sends the framed install request and returns the agent's
     /// preflight verdict frame.
     #[cfg(feature = "server")]
