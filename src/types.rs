@@ -1528,8 +1528,11 @@ pub mod node {
         pub commit: String,
     }
 
-    /// Typed apply failures, carried by
-    /// [`NodePackageResponse::Failed`].
+    /// Typed package-operation failures, carried by
+    /// [`NodePackageResponse::Failed`] — an apply failure, but also a
+    /// refusal from a non-apply request, such as
+    /// [`ObservationUnavailable`](Self::ObservationUnavailable) from
+    /// [`NodePackageRequest::ListHostPorts`].
     ///
     /// This is data, not an error type: the manager matches on it
     /// rather than printing it, so it implements neither

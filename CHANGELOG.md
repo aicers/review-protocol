@@ -27,8 +27,8 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   carries neither an address nor a socket count. The request is named by the
   new `node.package.list_host_ports` service identifier.
 - Added `InstallPreflight::BindAddrsOnUpdate`, `NamespaceUnconfigured` and
-  `EnrollmentUnsupported` — three refusals decided from the framed request
-  alone, so no package bytes move — together with the matching
+  `EnrollmentUnsupported` — three terminal refusals, each reached before any
+  package bytes move, together with the matching
   `server::node::TerminalPreflight` variants, so
   `server::Connection::node_package_install` hands each of them back as its own
   `InstallOutcome::Preflight` rather than behind a catch-all.
