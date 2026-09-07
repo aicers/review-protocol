@@ -532,8 +532,9 @@ impl<'a> Node<'a> {
     /// Sends a unary node package-management request to the agent.
     ///
     /// Accepts [`Remove`](NodePackageRequest::Remove),
-    /// [`ListInstalled`](NodePackageRequest::ListInstalled) and
-    /// [`Status`](NodePackageRequest::Status).  An
+    /// [`ListInstalled`](NodePackageRequest::ListInstalled),
+    /// [`Status`](NodePackageRequest::Status) and
+    /// [`ListHostPorts`](NodePackageRequest::ListHostPorts).  An
     /// [`Install`](NodePackageRequest::Install) is rejected — use
     /// [`package_install`](Self::package_install), which carries the
     /// payload the agent waits for.

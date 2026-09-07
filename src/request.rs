@@ -986,8 +986,9 @@ impl<T: Handler + ?Sized> NodeHandler for T {
 /// request is an [`Install`](NodePackageRequest::Install).
 ///
 /// The parsed request's variant decides the path.  `Remove`,
-/// `ListInstalled` and `Status` are answered with a single frame like
-/// every other family.  `Install` runs the three-step exchange: ask
+/// `ListInstalled`, `Status` and `ListHostPorts` are answered with a
+/// single frame like every other family.  `Install` runs the
+/// three-step exchange: ask
 /// the handler for a preflight verdict, write it, and — only on
 /// [`Proceed`](InstallPreflight::Proceed) — read exactly `size` bytes
 /// of payload before writing the single terminal response.

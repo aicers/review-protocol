@@ -483,8 +483,8 @@ impl Connection {
     ///
     /// The request targets the agent on this connection.  The
     /// specific operation is determined by the
-    /// [`NodePackageRequest`] variant: `Remove`, `ListInstalled` or
-    /// `Status`.
+    /// [`NodePackageRequest`] variant: `Remove`, `ListInstalled`,
+    /// `Status` or `ListHostPorts`.
     ///
     /// [`Install`](NodePackageRequest::Install) is **rejected** here
     /// rather than sent, because an install is not unary: the agent

@@ -3384,11 +3384,7 @@ pub mod node {
             };
             assert_eq!(decoded_ports, ports, "order and contents survive");
             assert_eq!(
-                decoded_ports
-                    .iter()
-                    .filter(|p| p.port == 8442)
-                    .collect::<Vec<_>>()
-                    .len(),
+                decoded_ports.iter().filter(|p| p.port == 8442).count(),
                 2,
                 "one port taken on both transports is two entries"
             );
