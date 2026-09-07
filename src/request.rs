@@ -426,9 +426,11 @@ pub trait NodeHandler: Send {
     /// Decides whether the agent will accept the package bytes of an
     /// [`Install`](NodePackageRequest::Install) request.
     ///
-    /// This is step 2 of the install exchange and is decided from the
-    /// framed request **alone** — from `idempotency_key` and
-    /// `(target, version, commit)` — before any bytes move.  An `Err`
+    /// This is step 2 of the install exchange and is decided
+    /// **before any bytes move** — from the framed request
+    /// (`idempotency_key`, `(target, version, commit)`,
+    /// `bind_addrs`, `bootstrap_material`) and from what the agent
+    /// already knows about itself, never from the payload.  An `Err`
     /// returned here is the terminal frame of the exchange: no
     /// package bytes are requested and
     /// [`node_package_install`](Self::node_package_install) is not
@@ -447,6 +449,22 @@ pub trait NodeHandler: Send {
     /// [`InsufficientDiskSpace`](InstallPreflight::InsufficientDiskSpace)
     /// is decided from `size` alone, so nothing on the host is
     /// touched before it is returned.
+    ///
+    /// [`BindAddrsOnUpdate`](InstallPreflight::BindAddrsOnUpdate),
+    /// [`NamespaceUnconfigured`](InstallPreflight::NamespaceUnconfigured)
+    /// and
+    /// [`EnrollmentUnsupported`](InstallPreflight::EnrollmentUnsupported)
+    /// are terminal in the same way.  The first refuses an update
+    /// that carried
+    /// [`bind_addrs`](NodePackageRequest::Install::bind_addrs), which
+    /// are honoured on a first install only; the second refuses when
+    /// the agent's own per-host configuration names no product
+    /// namespace, so it cannot compose a single managed path; and the
+    /// third refuses a first install carrying
+    /// [`bootstrap_material`](NodePackageRequest::Install::bootstrap_material)
+    /// when the agent does not advertise the enrollment capability.
+    /// Every verdict other than
+    /// [`Proceed`](InstallPreflight::Proceed) ends the exchange here.
     ///
     /// # Errors
     ///
