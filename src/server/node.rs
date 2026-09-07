@@ -103,8 +103,12 @@ pub enum NodePowerOutcome {
 /// the manager builds it from the step-2 frame and never surfaces
 /// `Proceed` here.
 ///
-/// Every verdict here is decided from the framed request alone, so
-/// no package bytes move before it is returned.
+/// Every verdict here is terminal and is reached before any package
+/// bytes move.  What each one is decided from differs: some read the
+/// framed request alone, while
+/// [`NamespaceUnconfigured`](Self::NamespaceUnconfigured) and
+/// [`EnrollmentUnsupported`](Self::EnrollmentUnsupported) also
+/// consult the agent's own configuration and capabilities.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TerminalPreflight {
     /// The build is already installed and its unit is not failed.

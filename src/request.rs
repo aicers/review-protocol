@@ -1041,9 +1041,9 @@ async fn dispatch_node_package<H: NodeHandler>(
         .await
         .map_err(HandlerError::SendError)?;
     if !proceed {
-        // `AlreadyApplied`, `InsufficientDiskSpace` and an `Err`
-        // verdict are each the terminal frame: no bytes move and no
-        // response follows.
+        // Every verdict other than `Proceed`, and an `Err` verdict,
+        // is the terminal frame: no bytes move and no response
+        // follows.
         return Ok(());
     }
 
