@@ -93,7 +93,7 @@ pub enum NodePowerOutcome {
     Response(NodePowerResponse),
 }
 
-/// The two *terminal* preflight verdicts of a package install.
+/// The *terminal* preflight verdicts of a package install.
 ///
 /// [`Proceed`](crate::types::node::InstallPreflight::Proceed) is
 /// deliberately absent — it is a continuation, not a terminal frame —
@@ -102,6 +102,9 @@ pub enum NodePowerOutcome {
 /// the wire [`InstallPreflight`](crate::types::node::InstallPreflight);
 /// the manager builds it from the step-2 frame and never surfaces
 /// `Proceed` here.
+///
+/// Every verdict here is decided from the framed request alone, so
+/// no package bytes move before it is returned.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TerminalPreflight {
     /// The build is already installed and its unit is not failed.
@@ -116,6 +119,22 @@ pub enum TerminalPreflight {
         /// The space in bytes currently available.
         available: u64,
     },
+    /// The request is an update and it carried
+    /// [`bind_addrs`](crate::types::node::NodePackageRequest::Install::bind_addrs).
+    /// Addresses are fixed at first install, so the map is neither
+    /// obeyed nor dropped.  Terminal and not retryable.
+    BindAddrsOnUpdate,
+    /// The agent's per-host configuration carries no product
+    /// namespace, so it cannot compose a single managed path.
+    /// Terminal and not retryable.
+    NamespaceUnconfigured,
+    /// The agent does not advertise the enrollment capability, and
+    /// this is a first install carrying
+    /// [`bootstrap_material`](crate::types::node::NodePackageRequest::Install::bootstrap_material).
+    /// Terminal for this attempt and not retryable, so the manager
+    /// discharges the attempt's owed cleanup rather than holding it
+    /// open.
+    EnrollmentUnsupported,
 }
 
 /// Which branch of the package-install exchange terminated, so that a
@@ -124,7 +143,7 @@ pub enum TerminalPreflight {
 pub enum InstallOutcome {
     /// The exchange ended at the preflight verdict.  No package bytes
     /// were sent.  The carried [`TerminalPreflight`] is by
-    /// construction `AlreadyApplied` or `InsufficientDiskSpace`, never
+    /// construction one of the terminal wire verdicts, never
     /// `Proceed`.
     Preflight(TerminalPreflight),
     /// The package bytes were streamed and the agent answered once
@@ -1420,6 +1439,7 @@ mod tests {
                     lifecycle: Lifecycle::Running,
                     bound_addrs: vec![],
                 })),
+                NodePackageRequest::ListHostPorts => Ok(NodePackageResponse::HostPorts(Vec::new())),
                 NodePackageRequest::Install { .. } => {
                     Err("an install must never reach the unary method".to_string())
                 }
@@ -1464,6 +1484,7 @@ mod tests {
             idempotency_key: "idem-1".into(),
             bootstrap_material: None,
             on_failure: FailurePolicy::Rollback,
+            bind_addrs: None,
         }
     }
 
