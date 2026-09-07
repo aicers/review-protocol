@@ -637,6 +637,21 @@ pub enum Lifecycle {
 - **Chunk size and backpressure are sender-side tuning, not wire contract**
   — the agent reads exactly `size` bytes, so how the sender chunks is not
   observable to it (§7). Recovery is decided: restart-whole in v1.
+- **[DECISION] The caller does not read `InstallPreflight` off the wire; it
+  receives `InstallOutcome`, and every TERMINAL preflight verdict must appear
+  in both.** `node_package_install` returns
+  `InstallOutcome::Preflight(TerminalPreflight)` when the exchange ends at
+  step (2) and `InstallOutcome::Applied(NodePackageResponse)` when bytes were
+  streamed, so a caller cannot mistake a preflight refusal for an applied
+  install. `TerminalPreflight` mirrors the terminal arms of `InstallPreflight`
+  and deliberately omits `Proceed`, which is a continuation rather than a
+  frame a caller can be handed.
+  **This is stated here because it is a second place to append.** A terminal
+  verdict added to the wire enum and not to `TerminalPreflight` reaches the
+  manager as something other than a preflight outcome — or not at all — and
+  the manager is the party that has to act on it (RFC-D2 §4b). The three this
+  document appends are all terminal, so all three are in both:
+  `BindAddrsOnUpdate`, `NamespaceUnconfigured` and `EnrollmentUnsupported`.
 - **ServiceId:** `node.package`, `node.package.install`,
   `node.package.remove`, `node.package.list`, `node.package.status`,
   `node.package.list_host_ports`.
@@ -1261,7 +1276,11 @@ gets a criterion here rather than only a prose mention.
   `TrustActive`; `NodePackageRequest` gains `ListHostPorts` after `Status`. A
   test pins each variant's index, because declaration order **is** the wire
   encoding and an insertion in the middle silently renumbers every variant
-  after it.
+  after it. **Each appended TERMINAL verdict also appears in
+  `TerminalPreflight`**, and a test asserts `node_package_install` returns it
+  as `InstallOutcome::Preflight(...)` with **no** package bytes sent — a
+  verdict that reaches the caller as a bare error is a verdict the manager
+  cannot act on.
 - **`ListHostPorts` answers a deduplicated set.** A response carrying the same
   `(transport, port)` twice is not produced; the same port under TCP and UDP
   is **two** entries. The type carries no address and no socket count, and a
