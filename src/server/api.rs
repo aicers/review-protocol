@@ -483,8 +483,8 @@ impl Connection {
     ///
     /// The request targets the agent on this connection.  The
     /// specific operation is determined by the
-    /// [`NodePackageRequest`] variant: `Remove`, `ListInstalled` or
-    /// `Status`.
+    /// [`NodePackageRequest`] variant: `Remove`, `ListInstalled`,
+    /// `Status` or `ListHostPorts`.
     ///
     /// [`Install`](NodePackageRequest::Install) is **rejected** here
     /// rather than sent, because an install is not unary: the agent
@@ -520,9 +520,15 @@ impl Connection {
     /// 1. The framed [`Install`](NodePackageRequest::Install) request
     ///    goes out.  No bytes yet.
     /// 2. The agent answers with exactly one preflight verdict.
-    ///    [`AlreadyApplied`](InstallPreflight::AlreadyApplied) and
-    ///    [`InsufficientDiskSpace`](InstallPreflight::InsufficientDiskSpace)
-    ///    are terminal: this method returns
+    ///    Every verdict other than
+    ///    [`Proceed`](InstallPreflight::Proceed) is terminal —
+    ///    [`AlreadyApplied`](InstallPreflight::AlreadyApplied),
+    ///    [`InsufficientDiskSpace`](InstallPreflight::InsufficientDiskSpace),
+    ///    [`BindAddrsOnUpdate`](InstallPreflight::BindAddrsOnUpdate),
+    ///    [`NamespaceUnconfigured`](InstallPreflight::NamespaceUnconfigured)
+    ///    and
+    ///    [`EnrollmentUnsupported`](InstallPreflight::EnrollmentUnsupported)
+    ///    — and this method returns the matching
     ///    [`InstallOutcome::Preflight`] without reading a byte of
     ///    `pkg`.
     /// 3. On [`Proceed`](InstallPreflight::Proceed), exactly the
@@ -1331,6 +1337,21 @@ impl Connection {
                     },
                 ));
             }
+            InstallPreflight::BindAddrsOnUpdate => {
+                return Ok(InstallOutcome::Preflight(
+                    TerminalPreflight::BindAddrsOnUpdate,
+                ));
+            }
+            InstallPreflight::NamespaceUnconfigured => {
+                return Ok(InstallOutcome::Preflight(
+                    TerminalPreflight::NamespaceUnconfigured,
+                ));
+            }
+            InstallPreflight::EnrollmentUnsupported => {
+                return Ok(InstallOutcome::Preflight(
+                    TerminalPreflight::EnrollmentUnsupported,
+                ));
+            }
             InstallPreflight::Proceed => {}
         }
 
@@ -1473,7 +1494,8 @@ fn install_size(req: &NodePackageRequest) -> anyhow::Result<u64> {
         NodePackageRequest::Install { size, .. } => Ok(*size),
         NodePackageRequest::Remove { .. }
         | NodePackageRequest::ListInstalled
-        | NodePackageRequest::Status { .. } => {
+        | NodePackageRequest::Status { .. }
+        | NodePackageRequest::ListHostPorts => {
             bail!("`node_package_install` accepts only an install request; use `node_package`")
         }
     }
@@ -1679,6 +1701,7 @@ mod tests {
                 NodePackageRequest::Status { .. } => Ok(NodePackageResponse::State(package_state(
                     Lifecycle::Running,
                 ))),
+                NodePackageRequest::ListHostPorts => Ok(NodePackageResponse::HostPorts(Vec::new())),
                 NodePackageRequest::Install { .. } => {
                     Err("an install must never reach the unary method".to_string())
                 }
@@ -1701,6 +1724,9 @@ mod tests {
                     required: 4_194_304,
                     available: 1_024,
                 }),
+                "bindonupdate" => Ok(InstallPreflight::BindAddrsOnUpdate),
+                "nonamespace" => Ok(InstallPreflight::NamespaceUnconfigured),
+                "noenroll" => Ok(InstallPreflight::EnrollmentUnsupported),
                 _ => Ok(InstallPreflight::Proceed),
             }
         }
@@ -2690,6 +2716,7 @@ mod tests {
             idempotency_key: "idem-1".into(),
             bootstrap_material: None,
             on_failure: FailurePolicy::Rollback,
+            bind_addrs: None,
         }
     }
 
@@ -3014,6 +3041,77 @@ mod tests {
         test_env.teardown(&server_conn);
     }
 
+    /// Each of the three refusals the bind-address design adds is
+    /// preserved as its own `InstallOutcome::Preflight`, and no
+    /// package bytes are sent for any of them.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_package_install_new_refusals_are_preflight_outcomes() {
+        use crate::server::node::{InstallOutcome, TerminalPreflight};
+
+        for (target, expected) in [
+            ("bindonupdate", TerminalPreflight::BindAddrsOnUpdate),
+            ("nonamespace", TerminalPreflight::NamespaceUnconfigured),
+            ("noenroll", TerminalPreflight::EnrollmentUnsupported),
+        ] {
+            let test_env = TEST_ENV.lock().await;
+            let (server_conn, client_conn) = test_env.setup().await;
+
+            RECEIVED_PACKAGE.lock().unwrap().clear();
+            let client_handle = spawn_agent(client_conn.clone());
+
+            let pkg = payload(4_096);
+            let mut source = pkg.as_slice();
+            let outcome = server_conn
+                .node_package_install(install_request(target, pkg.len() as u64), &mut source)
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                InstallOutcome::Preflight(expected),
+                "{target}: the typed verdict must survive as a preflight outcome"
+            );
+            assert_eq!(
+                source.len(),
+                pkg.len(),
+                "{target}: not a byte of `pkg` is read"
+            );
+            assert!(
+                RECEIVED_PACKAGE.lock().unwrap().is_empty(),
+                "{target}: no package bytes are sent after a terminal verdict"
+            );
+
+            let client_res = client_handle.await.unwrap();
+            assert!(client_res.is_ok());
+
+            test_env.teardown(&server_conn);
+        }
+    }
+
+    /// `ListHostPorts` reaches the agent's unary path and its answer
+    /// comes back through `node_package`.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn node_package_list_host_ports() {
+        use crate::types::node::{NodePackageRequest, NodePackageResponse};
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let client_handle = spawn_agent(client_conn.clone());
+
+        let resp = server_conn
+            .node_package(NodePackageRequest::ListHostPorts)
+            .await
+            .unwrap();
+        assert_eq!(resp, NodePackageResponse::HostPorts(Vec::new()));
+
+        let client_res = client_handle.await.unwrap();
+        assert!(client_res.is_ok());
+
+        test_env.teardown(&server_conn);
+    }
+
     /// A source holding more than `size` succeeds, and the surplus
     /// is left unread.
     #[cfg(all(feature = "client", feature = "server"))]
@@ -3157,6 +3255,7 @@ mod tests {
                 target: "sensor".into(),
                 instance: Some(1),
             },
+            NodePackageRequest::ListHostPorts,
         ];
         let pkg = payload(64);
         for req in unary {

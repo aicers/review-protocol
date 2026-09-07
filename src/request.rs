@@ -392,13 +392,25 @@ pub trait NodeHandler: Send {
 
     /// Handles a unary node package-management request:
     /// [`Remove`](NodePackageRequest::Remove),
-    /// [`ListInstalled`](NodePackageRequest::ListInstalled) or
-    /// [`Status`](NodePackageRequest::Status).
+    /// [`ListInstalled`](NodePackageRequest::ListInstalled),
+    /// [`Status`](NodePackageRequest::Status) or
+    /// [`ListHostPorts`](NodePackageRequest::ListHostPorts).
     ///
     /// [`Install`](NodePackageRequest::Install) never reaches this
     /// method — it carries a payload and is served by
     /// [`node_package_install_preflight`](Self::node_package_install_preflight)
     /// and [`node_package_install`](Self::node_package_install).
+    ///
+    /// [`ListHostPorts`](NodePackageRequest::ListHostPorts) is
+    /// answered with [`HostPorts`](NodePackageResponse::HostPorts)
+    /// carrying a **deduplicated** set of `(transport, port)` pairs
+    /// — one entry per taken port, not per socket, and deduplicated
+    /// across the sources the agent reads as well as within each of
+    /// them.  A handler whose occupancy read failed answers
+    /// [`Failed`](NodePackageResponse::Failed) with
+    /// [`ObservationUnavailable`](crate::types::node::NodePackageError::ObservationUnavailable)
+    /// rather than a short list, which would be indistinguishable
+    /// from a host with fewer listeners.
     ///
     /// # Errors
     ///
@@ -414,9 +426,11 @@ pub trait NodeHandler: Send {
     /// Decides whether the agent will accept the package bytes of an
     /// [`Install`](NodePackageRequest::Install) request.
     ///
-    /// This is step 2 of the install exchange and is decided from the
-    /// framed request **alone** — from `idempotency_key` and
-    /// `(target, version, commit)` — before any bytes move.  An `Err`
+    /// This is step 2 of the install exchange and is decided
+    /// **before any bytes move** — from the framed request
+    /// (`idempotency_key`, `(target, version, commit)`,
+    /// `bind_addrs`, `bootstrap_material`) and from what the agent
+    /// already knows about itself, never from the payload.  An `Err`
     /// returned here is the terminal frame of the exchange: no
     /// package bytes are requested and
     /// [`node_package_install`](Self::node_package_install) is not
@@ -435,6 +449,22 @@ pub trait NodeHandler: Send {
     /// [`InsufficientDiskSpace`](InstallPreflight::InsufficientDiskSpace)
     /// is decided from `size` alone, so nothing on the host is
     /// touched before it is returned.
+    ///
+    /// [`BindAddrsOnUpdate`](InstallPreflight::BindAddrsOnUpdate),
+    /// [`NamespaceUnconfigured`](InstallPreflight::NamespaceUnconfigured)
+    /// and
+    /// [`EnrollmentUnsupported`](InstallPreflight::EnrollmentUnsupported)
+    /// are terminal in the same way.  The first refuses an update
+    /// that carried
+    /// [`bind_addrs`](NodePackageRequest::Install::bind_addrs), which
+    /// are honoured on a first install only; the second refuses when
+    /// the agent's own per-host configuration names no product
+    /// namespace, so it cannot compose a single managed path; and the
+    /// third refuses a first install carrying
+    /// [`bootstrap_material`](NodePackageRequest::Install::bootstrap_material)
+    /// when the agent does not advertise the enrollment capability.
+    /// Every verdict other than
+    /// [`Proceed`](InstallPreflight::Proceed) ends the exchange here.
     ///
     /// # Errors
     ///
@@ -800,8 +830,9 @@ pub trait Handler: Send {
 
     /// Handles a unary node package-management request:
     /// [`Remove`](NodePackageRequest::Remove),
-    /// [`ListInstalled`](NodePackageRequest::ListInstalled) or
-    /// [`Status`](NodePackageRequest::Status).
+    /// [`ListInstalled`](NodePackageRequest::ListInstalled),
+    /// [`Status`](NodePackageRequest::Status) or
+    /// [`ListHostPorts`](NodePackageRequest::ListHostPorts).
     ///
     /// See [`NodeHandler::node_package`] for the full contract.
     ///
@@ -973,8 +1004,9 @@ impl<T: Handler + ?Sized> NodeHandler for T {
 /// request is an [`Install`](NodePackageRequest::Install).
 ///
 /// The parsed request's variant decides the path.  `Remove`,
-/// `ListInstalled` and `Status` are answered with a single frame like
-/// every other family.  `Install` runs the three-step exchange: ask
+/// `ListInstalled`, `Status` and `ListHostPorts` are answered with a
+/// single frame like every other family.  `Install` runs the
+/// three-step exchange: ask
 /// the handler for a preflight verdict, write it, and — only on
 /// [`Proceed`](InstallPreflight::Proceed) — read exactly `size` bytes
 /// of payload before writing the single terminal response.
@@ -994,7 +1026,8 @@ async fn dispatch_node_package<H: NodeHandler>(
         NodePackageRequest::Install { size, .. } => *size,
         NodePackageRequest::Remove { .. }
         | NodePackageRequest::ListInstalled
-        | NodePackageRequest::Status { .. } => {
+        | NodePackageRequest::Status { .. }
+        | NodePackageRequest::ListHostPorts => {
             let result = handler.node_package(req).await;
             return send_response(send, buf, result)
                 .await
@@ -1008,9 +1041,9 @@ async fn dispatch_node_package<H: NodeHandler>(
         .await
         .map_err(HandlerError::SendError)?;
     if !proceed {
-        // `AlreadyApplied`, `InsufficientDiskSpace` and an `Err`
-        // verdict are each the terminal frame: no bytes move and no
-        // response follows.
+        // Every verdict other than `Proceed`, and an `Err` verdict,
+        // is the terminal frame: no bytes move and no response
+        // follows.
         return Ok(());
     }
 
@@ -3063,6 +3096,7 @@ mod tests {
             idempotency_key: "idem-1".into(),
             bootstrap_material: None,
             on_failure: FailurePolicy::Rollback,
+            bind_addrs: None,
         }
     }
 
@@ -3089,6 +3123,29 @@ mod tests {
                 target: "sensor".into(),
                 instance: Some(2),
                 state: state(),
+            },
+        ]
+    }
+
+    /// The occupancy a `ListHostPorts` answer carries: the same port
+    /// under both transports, which is two legitimate entries rather
+    /// than a duplicate, plus one port taken on TCP alone.
+    #[cfg(feature = "server")]
+    fn host_ports() -> Vec<crate::types::node::HostPort> {
+        use crate::types::node::{HostPort, Transport};
+
+        vec![
+            HostPort {
+                transport: Transport::Tcp,
+                port: 8442,
+            },
+            HostPort {
+                transport: Transport::Udp,
+                port: 8442,
+            },
+            HostPort {
+                transport: Transport::Tcp,
+                port: 38371,
             },
         ]
     }
@@ -3127,6 +3184,9 @@ mod tests {
                     lifecycle: Lifecycle::Stopped,
                     bound_addrs: vec![],
                 })),
+                NodePackageRequest::ListHostPorts => {
+                    Ok(NodePackageResponse::HostPorts(host_ports()))
+                }
                 NodePackageRequest::Install { .. } => {
                     Err("an install must never reach the unary method".to_string())
                 }
@@ -3149,6 +3209,9 @@ mod tests {
                     required: 4_194_304,
                     available: 1_024,
                 }),
+                "bindonupdate" => Ok(InstallPreflight::BindAddrsOnUpdate),
+                "nonamespace" => Ok(InstallPreflight::NamespaceUnconfigured),
+                "noenroll" => Ok(InstallPreflight::EnrollmentUnsupported),
                 _ => Ok(InstallPreflight::Proceed),
             }
         }
@@ -3362,6 +3425,93 @@ mod tests {
             }),
         )
         .await;
+    }
+
+    /// `ListHostPorts` is unary through `handle`, and carries the
+    /// same port under both transports as two entries.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_list_host_ports_roundtrip() {
+        use crate::types::node::{NodePackageRequest, NodePackageResponse};
+        package_unary_roundtrip(
+            NodePackageRequest::ListHostPorts,
+            NodePackageResponse::HostPorts(host_ports()),
+        )
+        .await;
+    }
+
+    /// `ListHostPorts` is unary through `handle_node` too.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_package_list_host_ports_roundtrip() {
+        use crate::types::node::{NodePackageRequest, NodePackageResponse};
+        package_unary_roundtrip_handle_node(
+            NodePackageRequest::ListHostPorts,
+            NodePackageResponse::HostPorts(host_ports()),
+        )
+        .await;
+    }
+
+    /// A refused occupancy read reaches the manager as
+    /// `Failed(ObservationUnavailable)` — the same success-shaped
+    /// frame an apply failure rides, so the `Result` channel stays
+    /// reserved for transport and parse failures and the manager
+    /// classifies the refusal by matching rather than by parsing a
+    /// string.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_list_host_ports_observation_unavailable() {
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{NodePackageError, NodePackageRequest, NodePackageResponse};
+
+        /// Answers the unary path with the occupancy refusal, which
+        /// is the one thing this test drives.
+        struct RefusingHandler;
+
+        #[async_trait::async_trait]
+        impl super::Handler for RefusingHandler {
+            async fn node_package(
+                &mut self,
+                _req: NodePackageRequest,
+            ) -> Result<NodePackageResponse, String> {
+                Ok(NodePackageResponse::Failed(
+                    NodePackageError::ObservationUnavailable,
+                ))
+            }
+        }
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = RefusingHandler;
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let res: Result<NodePackageResponse, String> = crate::unary_request(
+            &mut client_send,
+            &mut client_recv,
+            u32::from(RequestCode::NodePackage),
+            NodePackageRequest::ListHostPorts,
+        )
+        .await
+        .expect("wire transport should succeed");
+
+        let resp = res.expect("a refusal is success-shaped, not the error channel");
+        assert_eq!(
+            resp,
+            NodePackageResponse::Failed(NodePackageError::ObservationUnavailable)
+        );
+        assert_eq!(resp.active_trust_epoch(), None);
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
     }
 
     /// Sends the framed install request and returns the agent's
@@ -3624,6 +3774,70 @@ mod tests {
 
         let server_res = server_task.await.unwrap();
         assert!(server_res.is_ok());
+    }
+
+    /// The three refusals the bind-address design adds are each the
+    /// terminal frame: no payload is requested and no response
+    /// follows the verdict.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_install_new_refusals_are_terminal() {
+        use std::time::Duration;
+
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{InstallPreflight, NodePackageResponse};
+
+        for (target, expected) in [
+            ("bindonupdate", InstallPreflight::BindAddrsOnUpdate),
+            ("nonamespace", InstallPreflight::NamespaceUnconfigured),
+            ("noenroll", InstallPreflight::EnrollmentUnsupported),
+        ] {
+            let _lock = TOKEN.lock().await;
+            let channel = channel().await;
+
+            let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+            let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+            let handler = PackageHandler::default();
+            let received = handler.received.clone();
+            let server_task = tokio::spawn(async move {
+                let mut handler = handler;
+                super::handle(&mut handler, &mut server_send, &mut server_recv).await
+            });
+
+            let verdict = send_install_request(
+                &mut client_send,
+                &mut client_recv,
+                install_request(target, 4_194_304),
+            )
+            .await
+            .expect("the verdict should be Ok");
+            assert_eq!(verdict, expected);
+
+            let mut buf = Vec::new();
+            let extra = tokio::time::timeout(
+                Duration::from_millis(200),
+                oinq::frame::recv::<Result<NodePackageResponse, String>>(
+                    &mut client_recv,
+                    &mut buf,
+                ),
+            )
+            .await;
+            assert!(
+                extra.is_err(),
+                "{target}: the verdict is the terminal frame; nothing follows it"
+            );
+            assert!(
+                received.lock().unwrap().is_empty(),
+                "{target}: no payload should have been requested"
+            );
+
+            drop(client_send);
+            drop(client_recv);
+
+            let server_res = server_task.await.unwrap();
+            assert!(server_res.is_ok());
+        }
     }
 
     /// A payload that stops short leaves the agent with an error

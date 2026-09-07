@@ -291,6 +291,8 @@ pub const NODE_PACKAGE_INSTALL: ServiceId = ServiceId::new("node.package", "inst
 pub const NODE_PACKAGE_REMOVE: ServiceId = ServiceId::new("node.package", "remove");
 pub const NODE_PACKAGE_LIST: ServiceId = ServiceId::new("node.package", "list");
 pub const NODE_PACKAGE_STATUS: ServiceId = ServiceId::new("node.package", "status");
+pub const NODE_PACKAGE_LIST_HOST_PORTS: ServiceId =
+    ServiceId::new("node.package", "list_host_ports");
 
 // ── node.enroll ────────────────────────────────────────────────
 
@@ -540,6 +542,7 @@ impl NodePackageRequest {
             Self::Remove { .. } => NODE_PACKAGE_REMOVE,
             Self::ListInstalled => NODE_PACKAGE_LIST,
             Self::Status { .. } => NODE_PACKAGE_STATUS,
+            Self::ListHostPorts => NODE_PACKAGE_LIST_HOST_PORTS,
         }
     }
 }
@@ -747,6 +750,7 @@ pub fn all() -> &'static [ServiceId] {
         NODE_PACKAGE_REMOVE,
         NODE_PACKAGE_LIST,
         NODE_PACKAGE_STATUS,
+        NODE_PACKAGE_LIST_HOST_PORTS,
         // node.enroll
         NODE_ENROLL_REGISTER,
         NODE_ENROLL_DEREGISTER,
@@ -852,6 +856,10 @@ mod tests {
         assert_eq!(NODE_PACKAGE_REMOVE.to_string(), "node.package.remove");
         assert_eq!(NODE_PACKAGE_LIST.to_string(), "node.package.list");
         assert_eq!(NODE_PACKAGE_STATUS.to_string(), "node.package.status");
+        assert_eq!(
+            NODE_PACKAGE_LIST_HOST_PORTS.to_string(),
+            "node.package.list_host_ports"
+        );
     }
 
     #[test]
@@ -1207,6 +1215,7 @@ mod tests {
                 idempotency_key: "k".into(),
                 bootstrap_material: None,
                 on_failure: FailurePolicy::Rollback,
+                bind_addrs: None,
             }
             .service_id(),
             NODE_PACKAGE_INSTALL
@@ -1232,12 +1241,17 @@ mod tests {
             .service_id(),
             NODE_PACKAGE_STATUS
         );
+        assert_eq!(
+            NodePackageRequest::ListHostPorts.service_id(),
+            NODE_PACKAGE_LIST_HOST_PORTS
+        );
 
         for id in [
             NODE_PACKAGE_INSTALL,
             NODE_PACKAGE_REMOVE,
             NODE_PACKAGE_LIST,
             NODE_PACKAGE_STATUS,
+            NODE_PACKAGE_LIST_HOST_PORTS,
         ] {
             assert!(!id.is_family());
             assert!(all().contains(&id));

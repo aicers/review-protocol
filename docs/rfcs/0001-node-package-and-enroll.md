@@ -638,7 +638,8 @@ pub enum Lifecycle {
   — the agent reads exactly `size` bytes, so how the sender chunks is not
   observable to it (§7). Recovery is decided: restart-whole in v1.
 - **ServiceId:** `node.package`, `node.package.install`,
-  `node.package.remove`, `node.package.list`, `node.package.status`.
+  `node.package.remove`, `node.package.list`, `node.package.status`,
+  `node.package.list_host_ports`.
 
 ## 5. `node.enroll` (proposed code 110)
 
@@ -1248,10 +1249,10 @@ This crate owns wire types several other documents depend on by name, so each
 gets a criterion here rather than only a prose mention.
 
 - **`bind_addrs` round-trips, present and absent.** Encode/decode with a map
-  and with `None`; with two keys on the same port under different transports,
-  which the conflict model permits and which therefore must survive; and with
-  two keys on the same `SocketAddr`, which is legal on the wire and is refused
-  by the manager, not here.
+  and with `None`; with two keys whose ports differ, which the conflict model
+  permits and which therefore must survive; and with two keys on the same
+  `SocketAddr`, which is legal on the wire and is refused by the manager, not
+  here.
 - **The appended variants are appended.** `InstallPreflight` gains
   `BindAddrsOnUpdate`, `NamespaceUnconfigured` and `EnrollmentUnsupported`
   after `InsufficientDiskSpace`; `NodePackageError` gains

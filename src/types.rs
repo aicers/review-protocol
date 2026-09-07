@@ -515,7 +515,7 @@ pub struct EventMessage {
 /// serialization encoding are **not** part of the public contract and
 /// may change without notice.
 pub mod node {
-    use std::{fmt, time::Duration};
+    use std::{collections::BTreeMap, fmt, net::SocketAddr, time::Duration};
 
     use num_enum::{FromPrimitive, IntoPrimitive};
     use serde::{Deserialize, Serialize};
@@ -1003,9 +1003,19 @@ pub mod node {
     /// `target`/`version`/`commit` fields exist only to be compared
     /// against it.
     ///
+    /// # Wire compatibility
+    ///
+    /// bincode encodes enum variants by declaration order and struct
+    /// fields by declaration position, so any later variant must be
+    /// **appended** at the end and any later field of a variant must
+    /// be appended after that variant's last field.  Never insert
+    /// either in the middle or reorder the existing ones.
+    ///
     /// # Examples
     ///
     /// ```
+    /// use std::{collections::BTreeMap, net::SocketAddr};
+    ///
     /// use review_protocol::types::node::{FailurePolicy, NodePackageRequest};
     ///
     /// let req = NodePackageRequest::Install {
@@ -1017,6 +1027,10 @@ pub mod node {
     ///     idempotency_key: "b6f0…".into(),
     ///     bootstrap_material: None,
     ///     on_failure: FailurePolicy::Rollback,
+    ///     bind_addrs: Some(BTreeMap::from([(
+    ///         "graphql_srv_addr".to_string(),
+    ///         "0.0.0.0:8442".parse::<SocketAddr>().unwrap(),
+    ///     )])),
     /// };
     /// assert!(matches!(req, NodePackageRequest::Install { .. }));
     /// ```
@@ -1085,6 +1099,28 @@ pub mod node {
             bootstrap_material: Option<BootstrapMaterial>,
             /// What the agent does when the apply fails.
             on_failure: FailurePolicy,
+            /// The listening addresses this instance must bind, by
+            /// the configuration key that carries each one.
+            ///
+            /// Populated by the manager for a component that
+            /// declares listening addresses; `None` for every
+            /// component that binds nothing.  The agent writes these
+            /// values into the rendered configuration **verbatim**
+            /// and never substitutes another: a bind that fails is
+            /// reported, not retried at a different address.
+            ///
+            /// Honoured on a **first install only**.  An `Install`
+            /// that is an update carrying a map is refused with
+            /// [`InstallPreflight::BindAddrsOnUpdate`], not obeyed
+            /// and not dropped: obeying it would revert what the
+            /// operator set through the config plane, and dropping
+            /// it would let the manager and the operator believe an
+            /// address changed when it did not.
+            ///
+            /// Keyed by configuration key rather than by a
+            /// component-specific struct, so a component that gains
+            /// a listener needs no wire change.
+            bind_addrs: Option<BTreeMap<String, SocketAddr>>,
         },
         /// Remove one installed instance.
         Remove {
@@ -1106,6 +1142,20 @@ pub mod node {
             /// when the component's class has no instance dimension.
             instance: Option<u32>,
         },
+        /// Report every local port in use on this host, so the
+        /// manager can choose bind addresses that do not collide.
+        ///
+        /// Host-wide, so it carries no `target` and no `instance`:
+        /// what may be *allocated* is module-scoped, but what
+        /// *occupies* a port is everything on the machine.  A
+        /// separate request from [`ListInstalled`](Self::ListInstalled)
+        /// because occupancy is a different question asked at a
+        /// different time.
+        ///
+        /// Answered with [`NodePackageResponse::HostPorts`], or
+        /// refused with
+        /// [`NodePackageError::ObservationUnavailable`].
+        ListHostPorts,
     }
 
     /// What the agent does when an apply fails.
@@ -1119,6 +1169,12 @@ pub mod node {
 
     /// The outcome of the checks an agent runs before it accepts
     /// package bytes.
+    ///
+    /// # Wire compatibility
+    ///
+    /// bincode encodes enum variants by declaration order, so any
+    /// later variant must be **appended** at the end.  Never insert
+    /// a variant in the middle or reorder the existing ones.
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub enum InstallPreflight {
         /// The agent is ready to receive the package bytes.
@@ -1134,14 +1190,43 @@ pub mod node {
             /// The space in bytes currently available.
             available: u64,
         },
+        /// The request is an update and it carried
+        /// [`bind_addrs`](NodePackageRequest::Install::bind_addrs).
+        ///
+        /// Addresses are fixed at first install: obeying the map
+        /// would revert what the operator set through the config
+        /// plane, and dropping it would let the manager and the
+        /// operator believe an address changed when it did not.
+        /// Decidable from the request alone, so no bytes move;
+        /// terminal and **not** retryable.
+        BindAddrsOnUpdate,
+        /// The agent's per-host configuration carries no product
+        /// namespace, so it cannot compose a single managed path.
+        ///
+        /// Terminal and **not** retryable: retrying cannot add a
+        /// field to a file the agent does not write.
+        NamespaceUnconfigured,
+        /// The agent does not advertise the enrollment capability,
+        /// and this is a first install carrying
+        /// [`bootstrap_material`](NodePackageRequest::Install::bootstrap_material).
+        ///
+        /// Terminal for **this attempt** and not retryable — the
+        /// agent answers identically until a different build is
+        /// deployed — so the manager discharges the attempt's owed
+        /// cleanup rather than holding it open.
+        EnrollmentUnsupported,
     }
 
     /// Response from a package-management operation.
     ///
     /// [`Installed`](Self::Installed) answers
     /// [`NodePackageRequest::ListInstalled`], [`State`](Self::State)
-    /// answers [`NodePackageRequest::Status`], and
-    /// [`Failed`](Self::Failed) carries a typed apply failure.
+    /// answers [`NodePackageRequest::Status`],
+    /// [`HostPorts`](Self::HostPorts) answers
+    /// [`NodePackageRequest::ListHostPorts`], and
+    /// [`Failed`](Self::Failed) carries a typed package-operation
+    /// failure — an apply failure, but also a refusal from a
+    /// non-apply request.
     /// [`TrustActive`](Self::TrustActive) is the terminal success of a
     /// [reserved `"trust"` target](crate::types::node) apply, the one
     /// outcome that reports an epoch rather than a package result.
@@ -1190,10 +1275,16 @@ pub mod node {
         Installed(Vec<InstalledPackage>),
         /// The state of the queried instance.
         State(PackageState),
-        /// A typed apply failure.  Success-shaped on the wire — a
-        /// decode success still means "the agent answered"; the
-        /// `Result<_, String>` channel is left to transport and
-        /// parse failures.
+        /// A typed package-operation failure — an apply failure, but
+        /// also a refusal from a non-apply request, such as
+        /// [`ObservationUnavailable`](NodePackageError::ObservationUnavailable)
+        /// from [`NodePackageRequest::ListHostPorts`].
+        ///
+        /// Success-shaped on the wire — a decode success still means
+        /// "the agent answered", and the manager classifies the
+        /// refusal by matching on the error rather than by parsing a
+        /// string; the `Result<_, String>` channel is left to
+        /// transport and parse failures.
         Failed(NodePackageError),
         /// Terminal success of a [reserved `"trust"`
         /// target](crate::types::node) apply.
@@ -1219,6 +1310,67 @@ pub mod node {
             /// after this apply.
             active_epoch: u64,
         },
+        /// The ports taken on this host, answering
+        /// [`NodePackageRequest::ListHostPorts`].
+        ///
+        /// A **deduplicated** set of `(transport, port)` pairs: one
+        /// entry per taken port, not per socket, and deduplicated
+        /// across the sources the agent reads as well as within each
+        /// of them.  The same port under TCP and under UDP is two
+        /// legitimate entries, not a duplicate.
+        ///
+        /// `Vec<HostPort>` cannot enforce that, and this crate
+        /// produces no occupancy — it only carries it.  Producing
+        /// the set without duplicates is the answering agent's
+        /// obligation.
+        HostPorts(Vec<HostPort>),
+    }
+
+    /// One port taken on a host, as
+    /// [`NodePackageRequest::ListHostPorts`] reports it.
+    ///
+    /// Deliberately **not an address**.  The manager's conflict
+    /// model is `(transport, port)` and address-blind by decision: a
+    /// wildcard bind conflicts with every specific one, wildcard is
+    /// what these components use, and a precise model would need
+    /// address-overlap rules the manager cannot verify against what
+    /// is actually bound.  An address carried here would be carried
+    /// and never read.
+    ///
+    /// Deliberately **not one entry per socket** either.  With no
+    /// owner netting anywhere in the design, nothing counts sockets:
+    /// two `SO_REUSEPORT` sockets on one port make that port taken
+    /// exactly once over.
+    ///
+    /// [`Ord`] and [`Hash`](std::hash::Hash) are derived so that a
+    /// producing agent can collect into a `BTreeSet` or `HashSet`
+    /// and satisfy the deduplication contract of
+    /// [`NodePackageResponse::HostPorts`] without a hand-written
+    /// key.
+    #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+    pub struct HostPort {
+        /// The transport the port is taken on.
+        pub transport: Transport,
+        /// The port number.
+        pub port: u16,
+    }
+
+    /// The transport a port is taken on.
+    ///
+    /// TCP and UDP are separate spaces, so one number may be taken
+    /// on one and free on the other.
+    ///
+    /// # Wire compatibility
+    ///
+    /// bincode encodes enum variants by declaration order, so any
+    /// later variant must be **appended** at the end.  Never insert
+    /// a variant in the middle or reorder the existing ones.
+    #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+    pub enum Transport {
+        /// TCP.
+        Tcp,
+        /// UDP.
+        Udp,
     }
 
     /// One installed package instance and its state.
@@ -1242,8 +1394,25 @@ pub mod node {
         pub commit: String,
         /// Where the instance is in its lifecycle.
         pub lifecycle: Lifecycle,
-        /// The addresses the instance is bound to, each named by its
-        /// configuration key.
+        /// The addresses the instance is **actually listening on**,
+        /// each named by its configuration key.
+        ///
+        /// This field is **observed, never intent**: it records
+        /// where the instance IS, read from the host's live sockets,
+        /// and the agent never derives it from the rendered
+        /// configuration.  That distinction is load-bearing — an
+        /// instance that failed to bind must read as *not bound*,
+        /// and a value derived from configuration would report the
+        /// address it was told to use whether or not it got it.
+        ///
+        /// The manager chooses these addresses and sends them on
+        /// [`Install`](NodePackageRequest::Install) as
+        /// [`bind_addrs`](NodePackageRequest::Install::bind_addrs).
+        /// That does not make this field intent: the manager knows
+        /// what it assigned without reading it back, and what this
+        /// reports is whether the host agrees.
+        ///
+        /// Empty for a component that listens on nothing.
         pub bound_addrs: Vec<BoundAddr>,
     }
 
@@ -1256,7 +1425,13 @@ pub mod node {
     pub struct BoundAddr {
         /// The configuration key the address came from.
         pub name: String,
-        /// The address as configured.
+        /// The address as **observed** on the host's live sockets,
+        /// as `host:port`.
+        ///
+        /// Never derived from the rendered configuration: an
+        /// instance that failed to bind must read as not bound,
+        /// whereas a value taken from configuration would report the
+        /// address it was told to use whether or not it got it.
         pub addr: String,
     }
 
@@ -1353,8 +1528,11 @@ pub mod node {
         pub commit: String,
     }
 
-    /// Typed apply failures, carried by
-    /// [`NodePackageResponse::Failed`].
+    /// Typed package-operation failures, carried by
+    /// [`NodePackageResponse::Failed`] — an apply failure, but also a
+    /// refusal from a non-apply request, such as
+    /// [`ObservationUnavailable`](Self::ObservationUnavailable) from
+    /// [`NodePackageRequest::ListHostPorts`].
     ///
     /// This is data, not an error type: the manager matches on it
     /// rather than printing it, so it implements neither
@@ -1464,6 +1642,26 @@ pub mod node {
             /// values this agent can decode.
             supported: ManifestFormatRange,
         },
+        /// A required occupancy read failed — a socket table, or a
+        /// container runtime that is present and could not be
+        /// queried — so **no** occupancy is reported rather than a
+        /// short list, which would be indistinguishable from a host
+        /// with fewer listeners.
+        ///
+        /// Answers [`NodePackageRequest::ListHostPorts`], not an
+        /// apply.  **Retryable.**
+        ObservationUnavailable,
+        /// The instance is present on the host but the agent holds
+        /// no installed-build record for it, so it cannot treat the
+        /// apply as a first install without re-rendering
+        /// configuration it did not write.
+        ///
+        /// Distinct from
+        /// [`MissingBootstrapMaterial`](Self::MissingBootstrapMaterial),
+        /// which says "you forgot the material" when the truth is
+        /// "this instance is not one I manage".  Terminal and **not**
+        /// retryable: the state is a standing property of the host.
+        UnmanagedInstancePresent,
     }
 
     impl NodePackageError {
@@ -1496,7 +1694,9 @@ pub mod node {
                 Self::TargetMismatch { .. }
                 | Self::MissingBootstrapMaterial
                 | Self::BootstrapMaterialExpired
-                | Self::InsufficientDiskSpace { .. } => None,
+                | Self::InsufficientDiskSpace { .. }
+                | Self::ObservationUnavailable
+                | Self::UnmanagedInstancePresent => None,
             }
         }
     }
@@ -1552,7 +1752,11 @@ pub mod node {
                 // Listed explicitly rather than caught by `_`, so a future
                 // epoch-carrying variant fails the build instead of silently
                 // reading as `None`.
-                Self::Done | Self::Accepted | Self::Installed(_) | Self::State(_) => None,
+                Self::Done
+                | Self::Accepted
+                | Self::Installed(_)
+                | Self::State(_)
+                | Self::HostPorts(_) => None,
             }
         }
     }
@@ -2398,6 +2602,7 @@ pub mod node {
                             idempotency_key: "b6f0".into(),
                             bootstrap_material: material.clone(),
                             on_failure,
+                            bind_addrs: None,
                         };
                         assert_eq!(req, roundtrip(&req));
                     }
@@ -2419,6 +2624,147 @@ pub mod node {
 
             let req = NodePackageRequest::ListInstalled;
             assert_eq!(req, roundtrip(&req));
+
+            let req = NodePackageRequest::ListHostPorts;
+            assert_eq!(req, roundtrip(&req));
+        }
+
+        /// Helper: an `Install` carrying `bind_addrs`, with every
+        /// other field fixed.
+        fn install_with_bind_addrs(
+            bind_addrs: Option<BTreeMap<String, SocketAddr>>,
+        ) -> NodePackageRequest {
+            NodePackageRequest::Install {
+                target: "giganto".into(),
+                instance: Some(1),
+                version: "1.2.3".into(),
+                commit: "0123456789abcdef".into(),
+                size: 4_194_304,
+                idempotency_key: "b6f0".into(),
+                bootstrap_material: None,
+                on_failure: FailurePolicy::Rollback,
+                bind_addrs,
+            }
+        }
+
+        /// Helper: the `bind_addrs` map of an `Install`.
+        fn bind_addrs_of(req: &NodePackageRequest) -> Option<&BTreeMap<String, SocketAddr>> {
+            let NodePackageRequest::Install { bind_addrs, .. } = req else {
+                panic!("expected an install");
+            };
+            bind_addrs.as_ref()
+        }
+
+        /// `bind_addrs` survives the wire both ways, and the map's
+        /// contents survive unchanged: this crate carries what the
+        /// manager assigned and validates none of it.
+        #[test]
+        fn node_package_install_bind_addrs_roundtrip() {
+            // Absent: the shape a component that binds nothing takes.
+            let req = install_with_bind_addrs(None);
+            let decoded = roundtrip(&req);
+            assert_eq!(req, decoded);
+            assert_eq!(bind_addrs_of(&decoded), None);
+
+            // An empty map is distinct from `None` and stays so.
+            let req = install_with_bind_addrs(Some(BTreeMap::new()));
+            let decoded = roundtrip(&req);
+            assert_eq!(req, decoded);
+            assert_eq!(bind_addrs_of(&decoded), Some(&BTreeMap::new()));
+
+            // Two keys whose ports differ: what the conflict model
+            // permits, and what a component with two listeners
+            // actually gets.
+            let distinct = BTreeMap::from([
+                (
+                    "graphql_srv_addr".to_string(),
+                    "0.0.0.0:8442".parse::<SocketAddr>().expect("valid"),
+                ),
+                (
+                    "ingest_srv_addr".to_string(),
+                    "0.0.0.0:38370".parse::<SocketAddr>().expect("valid"),
+                ),
+            ]);
+            let req = install_with_bind_addrs(Some(distinct.clone()));
+            let decoded = roundtrip(&req);
+            assert_eq!(req, decoded);
+            assert_eq!(bind_addrs_of(&decoded), Some(&distinct));
+
+            // Two keys on the SAME `SocketAddr`. Legal on the wire and
+            // refused by the manager, not here: this crate carries the
+            // map and neither rejects nor collapses it.
+            let same = BTreeMap::from([
+                (
+                    "graphql_srv_addr".to_string(),
+                    "0.0.0.0:8442".parse::<SocketAddr>().expect("valid"),
+                ),
+                (
+                    "publish_srv_addr".to_string(),
+                    "0.0.0.0:8442".parse::<SocketAddr>().expect("valid"),
+                ),
+            ]);
+            let req = install_with_bind_addrs(Some(same.clone()));
+            let decoded = roundtrip(&req);
+            assert_eq!(req, decoded);
+            let decoded_map = bind_addrs_of(&decoded).expect("the map survives");
+            assert_eq!(decoded_map, &same);
+            assert_eq!(decoded_map.len(), 2, "neither key is collapsed into one");
+
+            // The address itself is carried verbatim, IPv6 and a
+            // specific IPv4 address included: nothing here rewrites
+            // an address into a wildcard or back.
+            let verbatim = BTreeMap::from([
+                (
+                    "graphql_srv_addr".to_string(),
+                    "[::1]:8442".parse::<SocketAddr>().expect("valid"),
+                ),
+                (
+                    "ingest_srv_addr".to_string(),
+                    "10.1.2.3:38370".parse::<SocketAddr>().expect("valid"),
+                ),
+            ]);
+            let req = install_with_bind_addrs(Some(verbatim.clone()));
+            let decoded = roundtrip(&req);
+            assert_eq!(req, decoded);
+            assert_eq!(bind_addrs_of(&decoded), Some(&verbatim));
+        }
+
+        /// Field POSITION is the wire contract just as variant order
+        /// is, so `bind_addrs` has to be the tail field of `Install`.
+        ///
+        /// The variant-index tests pin the enums; this pins the one
+        /// variant that gained a field.  Reordering the fields, or
+        /// inserting a later one ahead of `bind_addrs`, silently
+        /// renumbers the wire for every peer built against the old
+        /// order and breaks this test.
+        #[test]
+        fn node_package_install_field_order_is_pinned() {
+            let bind_addrs = BTreeMap::from([(
+                "graphql_srv_addr".to_string(),
+                "0.0.0.0:8442".parse::<SocketAddr>().expect("valid"),
+            )]);
+
+            // The variant index, then every field in declaration
+            // order, each encoded on its own.  bincode writes exactly
+            // this concatenation.
+            let expected = [
+                encode(&0_u32),
+                encode(&"giganto".to_string()),
+                encode(&Some(1_u32)),
+                encode(&"1.2.3".to_string()),
+                encode(&"0123456789abcdef".to_string()),
+                encode(&4_194_304_u64),
+                encode(&"b6f0".to_string()),
+                encode(&Option::<BootstrapMaterial>::None),
+                encode(&FailurePolicy::Rollback),
+                encode(&Some(bind_addrs.clone())),
+            ]
+            .concat();
+            assert_eq!(
+                encode(&install_with_bind_addrs(Some(bind_addrs))),
+                expected,
+                "`bind_addrs` is the tail field, after `on_failure`"
+            );
         }
 
         /// Widening the accepted instance range later needs no wire
@@ -2434,6 +2780,7 @@ pub mod node {
                 idempotency_key: "b6f0".into(),
                 bootstrap_material: None,
                 on_failure: FailurePolicy::Rollback,
+                bind_addrs: None,
             };
 
             let one = install(1);
@@ -2464,6 +2811,71 @@ pub mod node {
                 available: 1_048_576,
             };
             assert_eq!(preflight, roundtrip(&preflight));
+
+            for preflight in [
+                InstallPreflight::BindAddrsOnUpdate,
+                InstallPreflight::NamespaceUnconfigured,
+                InstallPreflight::EnrollmentUnsupported,
+            ] {
+                assert_eq!(preflight, roundtrip(&preflight));
+            }
+        }
+
+        /// Declaration order is the wire order: a later insertion,
+        /// rather than an append, breaks this test.
+        #[test]
+        fn install_preflight_variant_order_is_pinned() {
+            assert_eq!(variant_index(&encode(&InstallPreflight::Proceed)), 0);
+            assert_eq!(variant_index(&encode(&InstallPreflight::AlreadyApplied)), 1);
+            assert_eq!(
+                variant_index(&encode(&InstallPreflight::InsufficientDiskSpace {
+                    filesystem: "/var".into(),
+                    required: 8_388_608,
+                    available: 1_048_576,
+                })),
+                2
+            );
+            assert_eq!(
+                variant_index(&encode(&InstallPreflight::BindAddrsOnUpdate)),
+                3
+            );
+            assert_eq!(
+                variant_index(&encode(&InstallPreflight::NamespaceUnconfigured)),
+                4
+            );
+            assert_eq!(
+                variant_index(&encode(&InstallPreflight::EnrollmentUnsupported)),
+                5
+            );
+        }
+
+        /// Declaration order is the wire order for the request too.
+        #[test]
+        fn node_package_request_variant_order_is_pinned() {
+            assert_eq!(variant_index(&encode(&install_with_bind_addrs(None))), 0);
+            assert_eq!(
+                variant_index(&encode(&NodePackageRequest::Remove {
+                    target: "sensor".into(),
+                    instance: Some(1),
+                    idempotency_key: "b6f0".into(),
+                })),
+                1
+            );
+            assert_eq!(
+                variant_index(&encode(&NodePackageRequest::ListInstalled)),
+                2
+            );
+            assert_eq!(
+                variant_index(&encode(&NodePackageRequest::Status {
+                    target: "sensor".into(),
+                    instance: Some(1),
+                })),
+                3
+            );
+            assert_eq!(
+                variant_index(&encode(&NodePackageRequest::ListHostPorts)),
+                4
+            );
         }
 
         #[test]
@@ -2494,6 +2906,9 @@ pub mod node {
             assert_eq!(resp, roundtrip(&resp));
 
             let resp = NodePackageResponse::Failed(NodePackageError::MissingBootstrapMaterial);
+            assert_eq!(resp, roundtrip(&resp));
+
+            let resp = NodePackageResponse::HostPorts(Vec::new());
             assert_eq!(resp, roundtrip(&resp));
         }
 
@@ -2581,6 +2996,7 @@ pub mod node {
                 idempotency_key: "b6f0".into(),
                 bootstrap_material: Some(material),
                 on_failure: FailurePolicy::Rollback,
+                bind_addrs: None,
             };
             let rendered = format!("{req:?}");
             assert!(!rendered.contains("s.9f3c1b"), "{rendered}");
@@ -2628,6 +3044,18 @@ pub mod node {
                 supported: ManifestFormatRange { min: 1, max: 3 },
             };
             assert_eq!(err, roundtrip(&err));
+
+            for err in [
+                NodePackageError::ObservationUnavailable,
+                NodePackageError::UnmanagedInstancePresent,
+            ] {
+                assert_eq!(err, roundtrip(&err));
+                // A non-apply refusal travels in the same success-shaped
+                // frame as an apply failure, and reports no trust epoch.
+                let resp = NodePackageResponse::Failed(err.clone());
+                assert_eq!(resp, roundtrip(&resp));
+                assert_eq!(resp.active_trust_epoch(), None);
+            }
         }
 
         /// Every apply error that predates the reserved `"trust"` target, one
@@ -2753,6 +3181,7 @@ pub mod node {
                 NodePackageResponse::Accepted,
                 NodePackageResponse::Installed(Vec::new()),
                 NodePackageResponse::State(package_state(Lifecycle::Running, Vec::new())),
+                NodePackageResponse::HostPorts(Vec::new()),
             ]
             .into_iter()
             .chain(pre_existing_apply_errors().map(NodePackageResponse::Failed))
@@ -2888,6 +3317,94 @@ pub mod node {
                 })),
                 5
             );
+            assert_eq!(
+                variant_index(&encode(&NodePackageResponse::HostPorts(Vec::new()))),
+                6
+            );
+        }
+
+        /// Declaration order is the wire order for the transport too.
+        #[test]
+        fn transport_variant_order_is_pinned() {
+            assert_eq!(variant_index(&encode(&Transport::Tcp)), 0);
+            assert_eq!(variant_index(&encode(&Transport::Udp)), 1);
+        }
+
+        /// `HostPort` carries a transport and a port and nothing
+        /// else: no address, and no socket count.
+        ///
+        /// The exhaustive destructuring is the assertion — a field
+        /// added later stops this from compiling, so a "just add the
+        /// address" cannot pass review by accident.  The encoded
+        /// length pins the same thing on the wire.
+        #[test]
+        fn host_port_carries_transport_and_port_only() {
+            let host_port = HostPort {
+                transport: Transport::Tcp,
+                port: 8442,
+            };
+            let HostPort { transport, port } = host_port;
+            assert_eq!(transport, Transport::Tcp);
+            assert_eq!(port, 8442);
+
+            assert_eq!(host_port, roundtrip(&host_port));
+            assert_eq!(
+                encode(&host_port).len(),
+                encode(&(Transport::Tcp, 8442_u16)).len(),
+                "a `HostPort` is exactly its transport and its port"
+            );
+        }
+
+        /// A `HostPorts` answer round-trips, and the same port under
+        /// both transports is two legitimate entries rather than a
+        /// duplicate: TCP and UDP are separate spaces.
+        ///
+        /// That a response is PRODUCED without duplicates is not
+        /// testable here — `Vec<HostPort>` cannot enforce uniqueness,
+        /// and this crate produces no occupancy, it only carries it.
+        #[test]
+        fn host_ports_response_roundtrip_keeps_both_transports() {
+            let ports = vec![
+                HostPort {
+                    transport: Transport::Tcp,
+                    port: 8442,
+                },
+                HostPort {
+                    transport: Transport::Udp,
+                    port: 8442,
+                },
+                HostPort {
+                    transport: Transport::Tcp,
+                    port: 38_370,
+                },
+            ];
+            let resp = NodePackageResponse::HostPorts(ports.clone());
+            let decoded = roundtrip(&resp);
+            assert_eq!(resp, decoded);
+
+            let NodePackageResponse::HostPorts(decoded_ports) = decoded else {
+                panic!("expected a host-ports answer");
+            };
+            assert_eq!(decoded_ports, ports, "order and contents survive");
+            assert_eq!(
+                decoded_ports.iter().filter(|p| p.port == 8442).count(),
+                2,
+                "one port taken on both transports is two entries"
+            );
+            assert_eq!(
+                decoded_ports
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                ports.len(),
+                "the entries are distinct as `(transport, port)` pairs"
+            );
+
+            // The empty answer is a host with nothing taken, not an
+            // error.
+            let resp = NodePackageResponse::HostPorts(Vec::new());
+            assert_eq!(resp, roundtrip(&resp));
         }
 
         /// Declaration order is the wire order: a later insertion,
@@ -2934,6 +3451,14 @@ pub mod node {
                     supported: ManifestFormatRange { min: 1, max: 3 },
                 })),
                 5
+            );
+            assert_eq!(
+                variant_index(&encode(&NodePackageError::ObservationUnavailable)),
+                6
+            );
+            assert_eq!(
+                variant_index(&encode(&NodePackageError::UnmanagedInstancePresent)),
+                7
             );
         }
 

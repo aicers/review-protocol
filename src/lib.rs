@@ -36,7 +36,10 @@
 //! configuration-oriented ones.
 //!
 //! **`node.package` (request code 109)** manages the components installed on
-//! a node. `Remove`, `ListInstalled` and `Status` are unary. `Install` is
+//! a node. `Remove`, `ListInstalled`, `Status` and `ListHostPorts` are unary.
+//! `ListHostPorts` reports the host's taken `(transport, port)` pairs, so a
+//! manager can choose bind addresses that do not collide; it is host-wide and
+//! carries no target. `Install` is
 //! not: its payload does not travel in the request message but streams
 //! afterwards. The manager sends the framed request, the agent answers with one
 //! `InstallPreflight` verdict, and only on `Proceed` does the manager stream

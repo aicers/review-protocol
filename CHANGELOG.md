@@ -7,6 +7,48 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Added `bind_addrs` to `NodePackageRequest::Install`, an
+  `Option<BTreeMap<String, SocketAddr>>` carrying the listening addresses the
+  instance must bind, keyed by the configuration key that holds each one, so a
+  component that gains a listener needs no wire change. `None` for a component
+  that binds nothing. The agent writes the values into the rendered
+  configuration verbatim and never substitutes another; the map is honoured on
+  a first install only. Every `Install` an existing caller constructs now has
+  to set the field.
+- Added `NodePackageRequest::ListHostPorts`, answered with
+  `NodePackageResponse::HostPorts` carrying the new `HostPort` and `Transport`
+  types, so a manager can learn which `(transport, port)` pairs a host already
+  has taken and choose bind addresses that do not collide. Occupancy is
+  host-wide, so the request carries no target and no instance, and the answer
+  is a deduplicated set — one entry per taken port, not per socket, with the
+  same port under TCP and UDP counting as two entries. `HostPort` deliberately
+  carries neither an address nor a socket count. The request is named by the
+  new `node.package.list_host_ports` service identifier.
+- Added `InstallPreflight::BindAddrsOnUpdate`, `NamespaceUnconfigured` and
+  `EnrollmentUnsupported` — three terminal refusals, each reached before any
+  package bytes move, together with the matching
+  `server::node::TerminalPreflight` variants, so
+  `server::Connection::node_package_install` hands each of them back as its own
+  `InstallOutcome::Preflight` rather than behind a catch-all.
+- Added `NodePackageError::ObservationUnavailable` and
+  `UnmanagedInstancePresent`. The first refuses a `ListHostPorts` whose
+  occupancy read failed, so no occupancy is reported rather than a short list
+  indistinguishable from a host with fewer listeners; the second reports an
+  instance that is present on the host but that the agent holds no
+  installed-build record for.
+
+### Changed
+
+- `NodePackageResponse::Failed` now also carries a refusal from a non-apply
+  request, such as `ObservationUnavailable` from `ListHostPorts`, so it is no
+  longer an apply-only outcome.
+- `PackageState::bound_addrs` and `BoundAddr::addr` now document what they
+  always meant: they are observed, never intent, read from the host's live
+  sockets and never derived from the rendered configuration. An instance that
+  failed to bind therefore reads as not bound.
+
 ## [0.20.0] - 2026-08-05
 
 ### Added
