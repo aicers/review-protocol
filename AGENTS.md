@@ -512,7 +512,8 @@ only compiles in a narrower configuration.
 sets on both `ubuntu-latest` and `macOS-latest`.
 
 `CI Gate` is the required status check, not the individual jobs. A
-documentation-only change skips the Rust jobs but still runs `Markdown`
-and `Instructions` — the latter because `AGENTS.md` is itself Markdown,
-so a docs-only change is exactly the one that can edit a generated
-region.
+documentation-only change skips the Rust jobs but still runs `Markdown`,
+which lints the tree and then runs the shared instruction-block drift
+check as its last step. The drift check lives there because `AGENTS.md`
+is itself Markdown, so a docs-only change is exactly the one that can
+edit a generated region — and a gated job would skip the check on it.
