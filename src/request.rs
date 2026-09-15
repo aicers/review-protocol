@@ -4471,6 +4471,7 @@ mod tests {
             expires_at: "2026-01-02T03:04:05.123456789Z"
                 .parse()
                 .expect("literal is a valid timestamp"),
+            bootstrap_artifact: br#"{"registration_id":"sensor-7f2a"}"#.to_vec(),
         }
     }
 

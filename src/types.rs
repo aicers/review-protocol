@@ -1034,6 +1034,11 @@ pub mod node {
     /// };
     /// assert!(matches!(req, NodePackageRequest::Install { .. }));
     /// ```
+    // A request is decoded once per stream and handed straight to its
+    // handler, never held in bulk, so the size of `Install` costs
+    // nothing; boxing its `bootstrap_material` to satisfy the lint
+    // would instead change a public field type for every caller.
+    #[allow(clippy::large_enum_variant)]
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub enum NodePackageRequest {
         /// Install or update a package.  The signed `.pkg` bytes
@@ -1478,8 +1483,9 @@ pub mod node {
     /// family returns it from its register call and
     /// [`NodePackageRequest::Install`] relays it.
     ///
-    /// [`Debug`] is hand-written rather than derived, so that
-    /// `wrapped_secret_id` cannot reach a log through it.
+    /// [`Debug`] is hand-written rather than derived, so that neither
+    /// `wrapped_secret_id` nor `bootstrap_artifact` can reach a log
+    /// through it.
     #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
     pub struct BootstrapMaterial {
         /// The role the wrapped secret authenticates as.
@@ -1496,12 +1502,37 @@ pub mod node {
         /// TTL.
         #[serde(with = "jiff::fmt::serde::timestamp::nanosecond::required")]
         pub expires_at: jiff::Timestamp,
+        /// The bootstrap artifact bootroot produced for this
+        /// enrollment — its own `bootstrap.json` — carried verbatim.
+        ///
+        /// The bytes are opaque to this crate: they are transported,
+        /// never parsed, and never validated.  The artifact carries
+        /// members the other fields do not, such as the registration
+        /// identifier, and those are derived by the registrar alone;
+        /// relaying what bootroot produced keeps a single producer and
+        /// a single consumer, and a later addition to the artifact
+        /// needs no wire change here.
+        ///
+        /// The member is required rather than optional, deliberately.
+        /// No peer exchanged this type when it was added, so requiring
+        /// it broke nothing that existed.  And a value carrying the
+        /// other members without the artifact is not a weaker form of
+        /// enrollment material but an unusable one: they cannot be
+        /// turned into a bootstrap invocation on their own.  An
+        /// optional member would admit that meaningless value and
+        /// make every consumer handle it.
+        ///
+        /// The artifact accompanies the live one-time credential in
+        /// `wrapped_secret_id`, so it is redacted from the [`Debug`]
+        /// output the same way and must not be logged.
+        pub bootstrap_artifact: Vec<u8>,
     }
 
-    /// `wrapped_secret_id` is a live one-time credential, so it is
-    /// redacted rather than derived: `BootstrapMaterial` travels
-    /// inside [`NodePackageRequest::Install`], whose derived `Debug`
-    /// would otherwise print the secret into a caller's logs.
+    /// `wrapped_secret_id` is a live one-time credential, and
+    /// `bootstrap_artifact` accompanies it, so both are redacted
+    /// rather than derived: `BootstrapMaterial` travels inside
+    /// [`NodePackageRequest::Install`], whose derived `Debug` would
+    /// otherwise print them into a caller's logs.
     impl fmt::Debug for BootstrapMaterial {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("BootstrapMaterial")
@@ -1509,6 +1540,7 @@ pub mod node {
                 .field("wrapped_secret_id", &"<redacted>")
                 .field("ca_anchor", &self.ca_anchor)
                 .field("expires_at", &self.expires_at)
+                .field("bootstrap_artifact", &"<redacted>")
                 .finish()
         }
     }
@@ -2564,6 +2596,21 @@ pub mod node {
             u32::from_le_bytes(head)
         }
 
+        /// A marker inside the artifact that must never reach a
+        /// `Debug` rendering.
+        const ARTIFACT_MARKER: &str = "svc-7f2a";
+
+        /// Helper: bootstrap artifact bytes that are not valid UTF-8,
+        /// so that a round trip proves the member is carried as opaque
+        /// bytes rather than as text.
+        fn bootstrap_artifact() -> Vec<u8> {
+            let mut artifact =
+                format!("{{\"registration_id\":\"{ARTIFACT_MARKER}\"}}").into_bytes();
+            artifact.extend_from_slice(&[0xff, 0xfe, 0x00, 0xc3, 0x28]);
+            assert!(std::str::from_utf8(&artifact).is_err());
+            artifact
+        }
+
         /// Helper: a `BootstrapMaterial` with a fixed, sub-second
         /// deadline.
         fn bootstrap_material() -> BootstrapMaterial {
@@ -2574,6 +2621,7 @@ pub mod node {
                 expires_at: "2026-01-02T03:04:05.123456789Z"
                     .parse()
                     .expect("literal is a valid timestamp"),
+                bootstrap_artifact: bootstrap_artifact(),
             }
         }
 
@@ -2977,15 +3025,65 @@ pub mod node {
             assert_eq!(decoded.expires_at.subsec_nanosecond(), 123_456_789);
         }
 
-        /// The wrapped credential never reaches a log through a
-        /// `Debug` of the material or of the request carrying it.
+        /// The bootstrap artifact is opaque bytes: a value that is not
+        /// UTF-8 survives the wire byte for byte.
+        #[test]
+        fn bootstrap_material_artifact_survives_byte_identical() {
+            let material = bootstrap_material();
+            let decoded = roundtrip(&material);
+            assert_eq!(decoded.bootstrap_artifact, bootstrap_artifact());
+            assert_eq!(encode(&decoded), encode(&material));
+        }
+
+        /// A payload that omits the artifact is refused, not decoded
+        /// as a present-but-empty one.
+        #[test]
+        fn bootstrap_material_without_artifact_is_refused() {
+            let material = bootstrap_material();
+            let without_artifact = [
+                encode(&material.role_id),
+                encode(&material.wrapped_secret_id),
+                encode(&material.ca_anchor),
+                encode(&material.expires_at.as_nanosecond()),
+            ]
+            .concat();
+            let with_artifact = [
+                without_artifact.clone(),
+                encode(&material.bootstrap_artifact),
+            ]
+            .concat();
+            assert_eq!(
+                encode(&material),
+                with_artifact,
+                "`bootstrap_artifact` is the tail field, after `expires_at`"
+            );
+
+            assert!(decode::<BootstrapMaterial>(&without_artifact).is_err());
+        }
+
+        /// Neither the wrapped credential nor the bootstrap artifact
+        /// that accompanies it reaches a log through a `Debug` of the
+        /// material or of the request carrying it.
         #[test]
         fn bootstrap_material_debug_redacts_the_wrapped_secret() {
+            let artifact = bootstrap_artifact();
+            let assert_redacted = |rendered: &str| {
+                assert!(!rendered.contains("s.9f3c1b"), "{rendered}");
+                assert!(!rendered.contains(ARTIFACT_MARKER), "{rendered}");
+                assert!(!rendered.contains("registration_id"), "{rendered}");
+                assert!(
+                    !rendered.contains(&String::from_utf8_lossy(&artifact).into_owned()),
+                    "{rendered}"
+                );
+                assert!(!rendered.contains(&format!("{artifact:?}")), "{rendered}");
+            };
+
             let material = bootstrap_material();
             let rendered = format!("{material:?}");
-            assert!(!rendered.contains("s.9f3c1b"), "{rendered}");
+            assert_redacted(&rendered);
             assert!(rendered.contains("<redacted>"), "{rendered}");
             assert!(rendered.contains("sensor-installer"), "{rendered}");
+            assert!(rendered.contains("bootstrap_artifact"), "{rendered}");
 
             let req = NodePackageRequest::Install {
                 target: "sensor".into(),
@@ -2999,7 +3097,7 @@ pub mod node {
                 bind_addrs: None,
             };
             let rendered = format!("{req:?}");
-            assert!(!rendered.contains("s.9f3c1b"), "{rendered}");
+            assert_redacted(&rendered);
             assert!(rendered.contains("<redacted>"), "{rendered}");
         }
 
@@ -3733,6 +3831,7 @@ pub mod node {
             let resp = NodeEnrollResponse::Material(bootstrap_material());
             let rendered = format!("{resp:?}");
             assert!(!rendered.contains("s.9f3c1b"), "{rendered}");
+            assert!(!rendered.contains(ARTIFACT_MARKER), "{rendered}");
             assert!(rendered.contains("<redacted>"), "{rendered}");
             assert!(rendered.contains("sensor-installer"), "{rendered}");
         }
