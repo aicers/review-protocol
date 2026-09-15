@@ -41,6 +41,13 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `BootstrapMaterial` now carries a required `bootstrap_artifact: Vec<u8>`:
+  bootroot's own `bootstrap.json` for the enrollment, relayed verbatim and
+  never parsed or validated, so the enrolling agent can invoke bootroot with
+  exactly what the registrar produced. Like `wrapped_secret_id`, it is
+  redacted from `Debug` output. Every `BootstrapMaterial` an existing caller
+  constructs now has to set the field, and the wire encoding gains it as the
+  last member.
 - `NodePackageResponse::Failed` now also carries a refusal from a non-apply
   request, such as `ObservationUnavailable` from `ListHostPorts`, so it is no
   longer an apply-only outcome.
