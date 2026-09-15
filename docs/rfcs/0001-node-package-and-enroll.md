@@ -769,22 +769,38 @@ pub enum DeliveryMode {
     RemoteBootstrap,  // bootroot-remote enrollment via the on-host agent
 }
 
-/// What the target consumes to obtain its certificate — bootroot's existing
-/// `bootstrap.json` shape (`bootroot-remote/bootstrap.rs`): the AppRole
-/// `role_id`, the response-wrapped `secret_id`, and the CA anchor. This is
-/// the SERVICE's enrollment material and is unrelated to how the registrar
-/// itself authenticates to bootroot (RFC-F §4). `expires_at` is the GRANTED
-/// absolute deadline after any registrar clamp of the requested `wrap_ttl`.
+/// What the target consumes to obtain its certificate: the AppRole
+/// `role_id`, the response-wrapped `secret_id`, the CA anchor, and
+/// bootroot's own `bootstrap.json` for the enrollment
+/// (`bootroot-remote/bootstrap.rs`), carried verbatim as
+/// `bootstrap_artifact`. This is the SERVICE's enrollment material and is
+/// unrelated to how the registrar itself authenticates to bootroot
+/// (RFC-F §4). `expires_at` is the GRANTED absolute deadline after any
+/// registrar clamp of the requested `wrap_ttl`.
+///
+/// The first four members alone cannot be turned into a `bootroot-remote
+/// bootstrap` invocation: the artifact's schema also requires
+/// `registration_id`, `openbao_url` and `kv_mount`, and `registration_id`
+/// comes from the identity derivation single-sourced in RFC-A §4. So the
+/// registrar relays the artifact bootroot produced rather than this crate
+/// growing those members, which would make every consumer a second
+/// implementation of that derivation. The bytes are opaque here — never
+/// parsed or validated — and redacted from `Debug` like
+/// `wrapped_secret_id`. The member is required: no peer exchanged this type
+/// when it was added, and a value without the artifact is not weaker
+/// material but unusable material.
 pub struct BootstrapMaterial {
     role_id: String,
     wrapped_secret_id: String,
     ca_anchor: Vec<u8>,
     expires_at: jiff::Timestamp,
+    bootstrap_artifact: Vec<u8>,
 }
 
 pub enum NodeEnrollResponse {
     /// Wrapped bootstrap material the target consumes to obtain its cert
-    /// (role_id + wrapped secret_id + CA anchor), i.e. bootstrap.json.
+    /// (role_id + wrapped secret_id + CA anchor + bootroot's verbatim
+    /// bootstrap.json).
     /// Carries `expires_at`: the GRANTED absolute deadline of the wrapped
     /// secret_id, after the registrar has applied any clamp to the requested
     /// `wrap_ttl`. The manager persists it (RFC-D1 §4d) so the expiry clock
