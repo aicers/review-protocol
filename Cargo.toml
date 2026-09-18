@@ -34,7 +34,7 @@ rcgen = ["dep:rcgen"]
 [dependencies]
 anyhow = { version = "1", optional = true }
 async-trait = { version = "0.1", optional = true }
-bincode = { version = "2", features = ["serde"], optional = true }
+bincode = { version = "3", features = ["serde"], optional = true }
 ipnet = { version = "2", features = ["serde"] }
 jiff = { version = "0.2.15", features = ["serde"] }
 num_enum = { version = "0.7" }
