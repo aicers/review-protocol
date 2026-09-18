@@ -4,8 +4,6 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
-    # Compatible releases already fit the manifest; Cargo.lock is not tracked.
-    versioning-strategy: "increase-if-necessary"
     open-pull-requests-limit: 5
 
   - package-ecosystem: "github-actions"
