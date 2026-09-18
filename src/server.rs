@@ -511,17 +511,16 @@ impl Connection {
 ///
 /// # Errors
 ///
-/// Returns `HandshakeError` if the handshake failed.
-///
-/// # Panics
-///
-/// * panic if it failed to parse version requirement string.
+/// Returns `HandshakeError` if the configured protocol-version window is
+/// invalid or the handshake failed.
 pub async fn handshake(
     conn: &quinn::Connection,
     addr: SocketAddr,
     version_req: &str,
     highest_protocol_version: &str,
 ) -> Result<AgentInfo, HandshakeError> {
+    let (version_req, highest_protocol_version) =
+        parse_protocol_window(version_req, highest_protocol_version)?;
     let (mut send, mut recv) = conn
         .accept_bi()
         .await
@@ -537,7 +536,6 @@ pub async fn handshake(
         .map_err(handle_handshake_recv_io_error)?;
     let mut agent_info = decode_agent_info(&buf).map_err(|_| HandshakeError::InvalidMessage)?;
     agent_info.addr = addr;
-    let version_req = VersionReq::parse(version_req).expect("valid version requirement");
     let protocol_version = Version::parse(&agent_info.protocol_version).map_err(|_| {
         HandshakeError::IncompatibleProtocol(
             agent_info.protocol_version.clone(),
@@ -545,8 +543,6 @@ pub async fn handshake(
         )
     })?;
     if version_req.matches(&protocol_version) {
-        let highest_protocol_version =
-            Version::parse(highest_protocol_version).expect("valid semver");
         if protocol_version <= highest_protocol_version {
             send_ok(&mut send, &mut buf, highest_protocol_version.to_string())
                 .await
@@ -572,6 +568,17 @@ pub async fn handshake(
             version_req.to_string(),
         ))
     }
+}
+
+#[cfg(feature = "server")]
+fn parse_protocol_window(
+    version_req: &str,
+    highest_protocol_version: &str,
+) -> Result<(VersionReq, Version), HandshakeError> {
+    let version_req = VersionReq::parse(version_req).map_err(|_| HandshakeError::InvalidMessage)?;
+    let highest_protocol_version =
+        Version::parse(highest_protocol_version).map_err(|_| HandshakeError::InvalidMessage)?;
+    Ok((version_req, highest_protocol_version))
 }
 
 #[cfg(feature = "server")]
@@ -646,6 +653,19 @@ mod tests {
     use crate::EventStreamHandler;
     #[cfg(feature = "server")]
     use crate::types::EventMessage;
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn invalid_handshake_version_configuration_is_rejected() {
+        assert!(matches!(
+            super::parse_protocol_window("not a version requirement", crate::PROTOCOL_VERSION),
+            Err(crate::HandshakeError::InvalidMessage)
+        ));
+        assert!(matches!(
+            super::parse_protocol_window(crate::MIN_PROTOCOL_VERSION_REQ, "not a version"),
+            Err(crate::HandshakeError::InvalidMessage)
+        ));
+    }
 
     #[cfg(feature = "server")]
     struct TestEventHandler {
