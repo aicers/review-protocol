@@ -5,58 +5,7 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-
-- Added `bind_addrs` to `NodePackageRequest::Install`, an
-  `Option<BTreeMap<String, SocketAddr>>` carrying the listening addresses the
-  instance must bind, keyed by the configuration key that holds each one, so a
-  component that gains a listener needs no wire change. `None` for a component
-  that binds nothing. The agent writes the values into the rendered
-  configuration verbatim and never substitutes another; the map is honoured on
-  a first install only. Every `Install` an existing caller constructs now has
-  to set the field.
-- Added `NodePackageRequest::ListHostPorts`, answered with
-  `NodePackageResponse::HostPorts` carrying the new `HostPort` and `Transport`
-  types, so a manager can learn which `(transport, port)` pairs a host already
-  has taken and choose bind addresses that do not collide. Occupancy is
-  host-wide, so the request carries no target and no instance, and the answer
-  is a deduplicated set — one entry per taken port, not per socket, with the
-  same port under TCP and UDP counting as two entries. `HostPort` deliberately
-  carries neither an address nor a socket count. The request is named by the
-  new `node.package.list_host_ports` service identifier.
-- Added `InstallPreflight::BindAddrsOnUpdate`, `NamespaceUnconfigured` and
-  `EnrollmentUnsupported` — three terminal refusals, each reached before any
-  package bytes move, together with the matching
-  `server::node::TerminalPreflight` variants, so
-  `server::Connection::node_package_install` hands each of them back as its own
-  `InstallOutcome::Preflight` rather than behind a catch-all.
-- Added `NodePackageError::ObservationUnavailable` and
-  `UnmanagedInstancePresent`. The first refuses a `ListHostPorts` whose
-  occupancy read failed, so no occupancy is reported rather than a short list
-  indistinguishable from a host with fewer listeners; the second reports an
-  instance that is present on the host but that the agent holds no
-  installed-build record for.
-
-### Changed
-
-- `BootstrapMaterial` now carries a required `bootstrap_artifact: Vec<u8>`:
-  bootroot's own `bootstrap.json` for the enrollment, relayed verbatim and
-  never parsed or validated, so the enrolling agent can invoke bootroot with
-  exactly what the registrar produced. Like `wrapped_secret_id`, it is
-  redacted from `Debug` output. Every `BootstrapMaterial` an existing caller
-  constructs now has to set the field, and the wire encoding gains it as the
-  last member.
-- `NodePackageResponse::Failed` now also carries a refusal from a non-apply
-  request, such as `ObservationUnavailable` from `ListHostPorts`, so it is no
-  longer an apply-only outcome.
-- `PackageState::bound_addrs` and `BoundAddr::addr` now document what they
-  always meant: they are observed, never intent, read from the host's live
-  sockets and never derived from the rendered configuration. An instance that
-  failed to bind therefore reads as not bound.
-
-## [0.20.0] - 2026-08-05
+## [0.20.0] - 2026-10-01
 
 ### Added
 
@@ -87,30 +36,58 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Added the `node.package` wire vocabulary: the `NodePackageRequest`,
   `NodePackageResponse`, `NodePackageError`, `InstallPreflight`,
   `InstalledPackage`, `PackageState`, `PackageIdentity`, `BoundAddr`,
-  `BootstrapMaterial`, `Lifecycle` and `FailurePolicy` types in
-  `types::node`, together with the `node.package`, `node.package.install`,
-  `node.package.remove`, `node.package.list` and `node.package.status`
-  service identifiers and `NodePackageRequest::service_id()`. `Lifecycle`
-  travels as its `u8` discriminant and decodes an unrecognized value to
+  `BootstrapMaterial`, `Lifecycle`, `FailurePolicy`, `HostPort` and
+  `Transport` types in `types::node`, together with the `node.package`,
+  `node.package.install`, `node.package.remove`, `node.package.list`,
+  `node.package.status` and `node.package.list_host_ports` service
+  identifiers and `NodePackageRequest::service_id()`. `Lifecycle` travels as
+  its `u8` discriminant and decodes an unrecognized value to
   `Lifecycle::Unknown`, so a newer agent can report a state an older reader
-  has never heard of. Apply failures are carried by
+  has never heard of. `NodePackageRequest::Install` carries `bind_addrs`, an
+  `Option<BTreeMap<String, SocketAddr>>` holding the listening addresses the
+  instance must bind, keyed by the configuration key that holds each one, so
+  a component that gains a listener needs no wire change; it is `None` for a
+  component that binds nothing. The agent writes the values into the
+  rendered configuration verbatim and never substitutes another, and honours
+  the map on a first install only. `PackageState::bound_addrs` and
+  `BoundAddr::addr` are observed, never intent: they are read from the
+  host's live sockets and never derived from the rendered configuration, so
+  an instance that failed to bind reads as not bound. Failures are carried by
   `NodePackageResponse::Failed` as structured data rather than through the
-  string error channel, so a caller classifies them by pattern-matching.
-  `BootstrapMaterial` redacts its wrapped one-time credential from its
-  `Debug` output, so logging a request that relays it cannot leak it.
+  string error channel, so a caller classifies them by pattern-matching; it
+  carries apply failures and also refusals from non-apply requests, such as
+  `ObservationUnavailable` from `ListHostPorts`.
+  `NodePackageError::UnmanagedInstancePresent` reports an instance that is
+  present on the host but that the agent holds no installed-build record for.
+  `BootstrapMaterial` carries `bootstrap_artifact`, bootroot's own
+  `bootstrap.json` for the enrollment, relayed verbatim and never parsed or
+  validated, so the enrolling agent can invoke bootroot with exactly what
+  bootroot produced. `BootstrapMaterial` redacts both that artifact and its
+  wrapped one-time credential from its `Debug` output, so logging a request
+  that relays it cannot leak either.
 - Added the `node.package` request family (request code 109) to both agent
   dispatch entry points and to the manager API. On the agent side,
   `request::Handler` and `request::NodeHandler` gain `node_package` for the
-  unary `Remove`, `ListInstalled` and `Status` operations, plus
-  `node_package_install_preflight` and `node_package_install` for `Install`;
-  each defaults to `Err("not supported")`, so an agent that implements none
-  of them answers every `node.package` request that way. On the manager
-  side, `server::Connection::node_package` and
+  unary `Remove`, `ListInstalled`, `Status` and `ListHostPorts` operations,
+  plus `node_package_install_preflight` and `node_package_install` for
+  `Install`; each defaults to `Err("not supported")`, so an agent that
+  implements none of them answers every `node.package` request that way. On
+  the manager side, `server::Connection::node_package` and
   `server::Connection::node_package_install` — mirrored onto the
   `server::node::Node` handle as `package` and `package_install`, each with
   the family's `_authorized` and `_with_context` variants — call them. Each
   entry point rejects the other's variants before opening a stream, so an
-  `Install` is never sent without its payload.
+  `Install` is never sent without its payload. `ListHostPorts`, answered with
+  `NodePackageResponse::HostPorts`, lets a manager learn which
+  `(transport, port)` pairs a host already has taken and choose bind
+  addresses that do not collide. Occupancy is host-wide, so the request
+  carries no target and no instance, and the answer is a deduplicated set —
+  one `HostPort` per taken port, not per socket, with the same port under TCP
+  and UDP counting as two entries. `HostPort` deliberately carries neither an
+  address nor a socket count. When the occupancy read fails, the request is
+  refused with `NodePackageError::ObservationUnavailable`, so no occupancy is
+  reported rather than a short list indistinguishable from a host with fewer
+  listeners.
 - Added the package-install streaming exchange. `Install` is not unary: the
   agent answers the framed request with one `InstallPreflight` verdict, and
   only on `Proceed` does the manager stream the `.pkg` bytes as
@@ -121,11 +98,16 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   `server::node::InstallOutcome` and `server::node::TerminalPreflight` keep
   the two terminal shapes apart: `TerminalPreflight` has no `Proceed` arm,
   so a continuation cannot be mistaken for a refusal.
+  `InstallPreflight::BindAddrsOnUpdate`, `NamespaceUnconfigured` and
+  `EnrollmentUnsupported` are terminal refusals, each reached before any
+  package bytes move and each with a matching `TerminalPreflight` variant, so
+  `server::Connection::node_package_install` hands each of them back as its
+  own `InstallOutcome::Preflight` rather than behind a catch-all.
 - Enabled `tokio`'s `io-util` feature under this crate's `server` feature.
   `server::Connection::node_package_install` takes its byte source as
   `tokio::io::AsyncRead`, whose `AsyncReadExt` combinators live behind
   `io-util`. No new crate enters the dependency tree, and the `client`
-  feature still pulls in no `tokio`.
+  feature enables neither this crate's `tokio` feature nor `io-util`.
 - Added the reserved `"trust"` package target and the three outcomes a trust
   apply reports. `NodePackageRequest::Install` with `target = "trust"` delivers
   a release-signing trust-set generation — the public keys by key id, the
@@ -145,8 +127,9 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   Manager-to-Agent command directed at the registrar agent. The
   `NodeEnrollRequest`, `NodeEnrollResponse`, `NodeEnrollError`, `ServiceSpec`,
   `ReloadHook`, `CertGroup`, `DeliveryMode` and `RegistrarUnavailableReason`
-  types in `types::node` carry it, `Register` returning the existing
-  `BootstrapMaterial` and `Deregister` returning `NodeEnrollResponse::Done`.
+  types in `types::node` carry it, `Register` returning the
+  `BootstrapMaterial` described above as `NodeEnrollResponse::Material` and
+  `Deregister` returning `NodeEnrollResponse::Done`.
   The request carries the identity's parts — a plain `service_name`, a `host`
   and an `instance` — never a composed name, and `ReloadHook` and `CertGroup`
   are opaque newtypes over `String` that this crate never parses or validates.
@@ -200,10 +183,15 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Renamed handshake metadata fields from `app_name` / `version` to
-  `agent_name` / `agent_version` in `ConnectionBuilder` and `AgentInfo`.
+- Renamed the `AgentInfo` fields `app_name` / `version` to `agent_name` /
+  `agent_version`.
 - `AgentInfo` now has five more public fields, so code that builds one with a
   struct literal must initialize them.
+- `AgentInfo`'s derived `Deserialize` now expects all five tail fields, so
+  decoding one directly, such as through `oinq::frame::recv::<AgentInfo>`,
+  fails on the shorter frame an agent built against an earlier version sends.
+  `server::handshake` applies the conditional decode and accepts that frame,
+  so a manager should read `AgentInfo` through it.
 - `AgentInfo` and `Status` now implement `PartialEq` and `Eq`.
 
 ### Removed
@@ -988,31 +976,30 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - `client::handshake` implements the application-level handshake process for the
   client after a QUIC connection is established.
 
-[Unreleased]: https://github.com/petabi/review-protocol/compare/0.20.0...main
-[0.20.0]: https://github.com/petabi/review-protocol/compare/0.19.0...0.20.0
-[0.19.0]: https://github.com/petabi/review-protocol/compare/0.18.1...0.19.0
-[0.18.1]: https://github.com/petabi/review-protocol/compare/0.18.0...0.18.1
-[0.18.0]: https://github.com/petabi/review-protocol/compare/0.17.0...0.18.0
-[0.17.0]: https://github.com/petabi/review-protocol/compare/0.16.0...0.17.0
-[0.16.0]: https://github.com/petabi/review-protocol/compare/0.15.0...0.16.0
-[0.15.0]: https://github.com/petabi/review-protocol/compare/0.14.0...0.15.0
-[0.14.0]: https://github.com/petabi/review-protocol/compare/0.13.0...0.14.0
-[0.13.0]: https://github.com/petabi/review-protocol/compare/0.12.1...0.13.0
-[0.12.1]: https://github.com/petabi/review-protocol/compare/0.12.0...0.12.1
-[0.12.0]: https://github.com/petabi/review-protocol/compare/0.11.0...0.12.0
-[0.11.0]: https://github.com/petabi/review-protocol/compare/0.10.0...0.11.0
-[0.10.0]: https://github.com/petabi/review-protocol/compare/0.9.0...0.10.0
-[0.9.0]: https://github.com/petabi/review-protocol/compare/0.8.1...0.9.0
-[0.8.1]: https://github.com/petabi/review-protocol/compare/0.8.0...0.8.1
-[0.8.0]: https://github.com/petabi/review-protocol/compare/0.7.0...0.8.0
-[0.7.0]: https://github.com/petabi/review-protocol/compare/0.6.0...0.7.0
-[0.6.0]: https://github.com/petabi/review-protocol/compare/0.5.0...0.6.0
-[0.5.0]: https://github.com/petabi/review-protocol/compare/0.4.2...0.5.0
-[0.4.2]: https://github.com/petabi/review-protocol/compare/0.4.1...0.4.2
-[0.4.1]: https://github.com/petabi/review-protocol/compare/0.4.0...0.4.1
-[0.4.0]: https://github.com/petabi/review-protocol/compare/0.3.0...0.4.0
-[0.3.0]: https://github.com/petabi/review-protocol/compare/0.2.0...0.3.0
-[0.2.0]: https://github.com/petabi/review-protocol/compare/0.1.2...0.2.0
-[0.1.2]: https://github.com/petabi/review-protocol/compare/0.1.1...0.1.2
-[0.1.1]: https://github.com/petabi/review-protocol/compare/0.1.0...0.1.1
-[0.1.0]: https://github.com/petabi/review-protocol/tree/0.1.0
+[0.20.0]: https://github.com/aicers/review-protocol/compare/0.19.0...0.20.0
+[0.19.0]: https://github.com/aicers/review-protocol/compare/0.18.1...0.19.0
+[0.18.1]: https://github.com/aicers/review-protocol/compare/0.18.0...0.18.1
+[0.18.0]: https://github.com/aicers/review-protocol/compare/0.17.0...0.18.0
+[0.17.0]: https://github.com/aicers/review-protocol/compare/0.16.0...0.17.0
+[0.16.0]: https://github.com/aicers/review-protocol/compare/0.15.0...0.16.0
+[0.15.0]: https://github.com/aicers/review-protocol/compare/0.14.0...0.15.0
+[0.14.0]: https://github.com/aicers/review-protocol/compare/0.13.0...0.14.0
+[0.13.0]: https://github.com/aicers/review-protocol/compare/0.12.1...0.13.0
+[0.12.1]: https://github.com/aicers/review-protocol/compare/0.12.0...0.12.1
+[0.12.0]: https://github.com/aicers/review-protocol/compare/0.11.0...0.12.0
+[0.11.0]: https://github.com/aicers/review-protocol/compare/0.10.0...0.11.0
+[0.10.0]: https://github.com/aicers/review-protocol/compare/0.9.0...0.10.0
+[0.9.0]: https://github.com/aicers/review-protocol/compare/0.8.1...0.9.0
+[0.8.1]: https://github.com/aicers/review-protocol/compare/0.8.0...0.8.1
+[0.8.0]: https://github.com/aicers/review-protocol/compare/0.7.0...0.8.0
+[0.7.0]: https://github.com/aicers/review-protocol/compare/0.6.0...0.7.0
+[0.6.0]: https://github.com/aicers/review-protocol/compare/0.5.0...0.6.0
+[0.5.0]: https://github.com/aicers/review-protocol/compare/0.4.2...0.5.0
+[0.4.2]: https://github.com/aicers/review-protocol/compare/0.4.1...0.4.2
+[0.4.1]: https://github.com/aicers/review-protocol/compare/0.4.0...0.4.1
+[0.4.0]: https://github.com/aicers/review-protocol/compare/0.3.0...0.4.0
+[0.3.0]: https://github.com/aicers/review-protocol/compare/0.2.0...0.3.0
+[0.2.0]: https://github.com/aicers/review-protocol/compare/0.1.2...0.2.0
+[0.1.2]: https://github.com/aicers/review-protocol/compare/0.1.1...0.1.2
+[0.1.1]: https://github.com/aicers/review-protocol/compare/0.1.0...0.1.1
+[0.1.0]: https://github.com/aicers/review-protocol/tree/0.1.0
