@@ -334,7 +334,7 @@ async fn test_protocol_compatibility() {
     let events = events_ref.lock().unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].kind, EventKind::BlocklistConn);
-    assert!(!events[0].fields.is_empty());
+    assert_ne!(events[0].fields, [] as [u8; 0]);
 
     test_env.teardown(&server_conn_for_teardown);
 }
