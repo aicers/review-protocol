@@ -1113,7 +1113,7 @@ mod tests {
     #[test]
     fn all_covers_families() {
         let ids = all();
-        assert!(!ids.is_empty());
+        assert_ne!(ids, []);
         // Family-level
         assert!(ids.contains(&NODE_POWER));
         // Node method-level
