@@ -123,7 +123,8 @@ pub enum NodePackageRequest {
     /// component ("review"/"aice-web-next"/"roxyd"). The signed `.pkg`
     /// bytes follow on the same bi-stream (see streaming). The request
     /// carries routing, size, and — on a first install — the enrollment
-    /// material, but deliberately NOT the manifest or signature: the
+    /// material and, for a templated component, a configuration-template
+    /// id (§4a), but deliberately NOT the manifest or signature: the
     /// single source of trust is the manifest + signature INSIDE the
     /// `.pkg` (bootler RFC 0004 §4-§5); see verification below.
     Install {
@@ -188,6 +189,16 @@ pub enum NodePackageRequest {
         /// struct so a component that gains a listener needs no wire
         /// change.
         bind_addrs: Option<BTreeMap<String, SocketAddr>>,
+        /// The id of a deploy-core configuration template the agent
+        /// renders as this instance's configuration file (§4a, bootler
+        /// RFC 0004 §4). `None` for every component except the one whose
+        /// catalog requires a template (today only `reconverge`).
+        /// Honoured on a **first install only**: an update carrying an id
+        /// is refused with `InstallPreflight::ConfigTemplateOnUpdate`,
+        /// and an id the agent's catalog does not hold for `target` with
+        /// `InstallPreflight::UnknownConfigTemplate`. Appended LAST:
+        /// declaration position is the wire encoding.
+        config_template: Option<String>,
     },
     /// Remove one installed instance (stop unit, remove artifacts).
     /// `instance` selects which, exactly as on `Install`.
@@ -248,6 +259,19 @@ pub enum InstallPreflight {
     // build is deployed — so the manager discharges the attempt's owed
     // cleanup rather than holding it open (RFC-D2 §4d).
     EnrollmentUnsupported,
+    // the request is an UPDATE and it carried `config_template` (§4a). A
+    // template is rendered once, at first install: obeying it would
+    // overwrite the configuration the instance has run with since, and
+    // dropping it would let the manager believe a template was applied
+    // when it was not. Decided before any bytes move, from the request
+    // and the installed-build record; terminal and NOT retryable.
+    ConfigTemplateOnUpdate,
+    // a first install whose `config_template` names an id the agent's
+    // compiled-in catalog does not hold for `target` (§4a). Carries the
+    // id so the manager's report names it. Decided before any bytes;
+    // terminal and NOT retryable — the agent answers identically until a
+    // build linking a catalog that holds the id is deployed.
+    UnknownConfigTemplate { id: String },
 }
 
 // DECLARATION ORDER IS THE WIRE ENCODING (bincode encodes a variant as its
@@ -649,12 +673,93 @@ pub enum Lifecycle {
   **This is stated here because it is a second place to append.** A terminal
   verdict added to the wire enum and not to `TerminalPreflight` reaches the
   manager as something other than a preflight outcome — or not at all — and
-  the manager is the party that has to act on it (RFC-D2 §4b). The three this
-  document appends are all terminal, so all three are in both:
-  `BindAddrsOnUpdate`, `NamespaceUnconfigured` and `EnrollmentUnsupported`.
+  the manager is the party that has to act on it (RFC-D2 §4b). The five this
+  document appends are all terminal, so all five are in both:
+  `BindAddrsOnUpdate`, `NamespaceUnconfigured`, `EnrollmentUnsupported`, and
+  — by the §4a amendment — `ConfigTemplateOnUpdate` and
+  `UnknownConfigTemplate { id }`.
 - **ServiceId:** `node.package`, `node.package.install`,
   `node.package.remove`, `node.package.list`, `node.package.status`,
   `node.package.list_host_ports`.
+
+### 4a. Amendment (2026-10-05): configuration template on `Install`
+
+Verified against `aicers/review-protocol` `origin/main` @ `8f25b20`:
+`NodePackageRequest::Install` ends at `bind_addrs` and `InstallPreflight` at
+`EnrollmentUnsupported` (`src/types.rs`), and `TerminalPreflight` ends at
+`EnrollmentUnsupported` (`src/server/node.rs`).
+
+**Why.** The agent writes a module's configuration file once, on first
+install, holding only the manager-assigned bind addresses, and the rest was
+assumed to come from the component's built-in defaults. For the Unsupervised
+Engine (`reconverge`) that premise is false: it cannot start from such a file,
+and which of its detector settings an operator should choose is an open
+product policy. Until that policy is decided, its first-install configuration
+comes from a small catalog of named templates the product owner maintains in
+deploy-core (bootler RFC 0004 §4). This crate carries only the chosen
+template's **id**; the template body never crosses the wire.
+
+**Counterparty context — what the id names.** deploy-core's
+`config_template` module is a compile-time catalog of `ConfigTemplate
+{ component, id, name, description, body }`; the manager and the agent both
+link it. Its invariants, which this crate relies on but does not enforce: an
+id matches `[a-z0-9][a-z0-9-]{0,62}` and is unique within its component; a
+template holds no secret; and a template's content never changes under an
+existing id (changed content gets a new id), so a manager and an agent linking
+different deploy-core versions never render different files for one id. The
+catalog also names the components that **require** a template — only
+`reconverge`; every other component neither requires nor has one. On a first
+install carrying an id, the agent renders that template with its host values
+and writes the result as the instance's configuration under its existing
+render-once rule; it also refuses, before any mutation, a request that carries
+both `config_template` and `bind_addrs` (the one templated component binds
+nothing). Both rules are the agent's (RFC-B), not this crate's.
+
+- **[DECISION] `Install` gains `config_template: Option<String>`, appended as
+  its LAST field.** It carries the id, verbatim: this crate never parses,
+  defaults or validates it, exactly as it treats `instance`. The manager sets
+  it for a component whose catalog requires a template and leaves it `None`
+  for every other one; it is set on a first install only and never on an
+  update (RFC-D2). The field is honoured on a **first install only**.
+- **[DECISION] Two terminal preflight verdicts are appended to
+  `InstallPreflight`, after `EnrollmentUnsupported`, in this order:**
+  1. **`ConfigTemplateOnUpdate`** — the request is an update and carries an
+     id. It mirrors `BindAddrsOnUpdate`'s reasoning: the template is rendered
+     once, so obeying it would overwrite the configuration the instance has
+     run with, and dropping it would let the manager believe a template was
+     applied when it was not.
+  2. **`UnknownConfigTemplate { id: String }`** — a first install whose id
+     the agent's catalog does not hold for `target`. That covers an id for a
+     component that has no templates at all, and the empty string. It carries
+     the id it refuses so the manager's report names the id without
+     correlating back to the attempt. The id is the manager's own value
+     coming back to it, so unlike `ServiceLabelInvalid` (§5), which echoes
+     nothing, this verdict carries it. `Some("")` is an id like any other and
+     is refused here: it deliberately does not follow the `bind_addrs` idiom
+     that reads an empty map as absent.
+
+  Both are decided before any bytes move, from the framed request and what
+  the agent already holds — its installed-build record, which says whether
+  this is an update, and its compiled-in catalog — never from the payload and
+  never from host state the request could change. Both are terminal and
+  **not** retryable: re-sending the same request gets the same answer. An
+  update carrying an unknown id is `ConfigTemplateOnUpdate`, because a
+  template is never honoured on an update and its id is therefore not
+  examined.
+- **[DECISION] Both verdicts are also appended to `TerminalPreflight`**, in
+  the same order and with the same payload, so `node_package_install` returns
+  each as `InstallOutcome::Preflight(...)` with no package bytes sent (the
+  §4 rule that every terminal verdict appears in both).
+- **[DECISION] No capability tag guards the field.** The manager and the
+  agents that understand it ship together in the first version, so there is
+  no older peer to route around. The accepted first-version risk is an agent
+  built before this amendment: it decodes the request with `oinq`'s
+  `parse_args` (`borrow_decode_from_slice`, which discards bytes past the
+  decoded value; `oinq` 0.13.1 `src/request.rs`), so it reads `Install`
+  through `bind_addrs`, **silently drops** a trailing `config_template`, and
+  installs with a bind-address-only file. This is a description of the risk,
+  not a compatibility claim: §8's "no backward-compatible decode" stands, and
+  nothing tests or relies on the older decode.
 
 ## 5. `node.enroll` (proposed code 110)
 
@@ -1134,6 +1239,11 @@ classified as transient and retried.
   supported", so the window is what turns a per-request failure into a
   handshake-time refusal, not what creates the safety.
 
+- **[DECISION] `Install::config_template` is NOT capability-gated** (§4a). The
+  routing above gates request *codes*; a field appended to `Install` adds no
+  code and no tag. The manager and agents ship together in the first version,
+  and an older agent's silent drop of the trailing field is the accepted risk
+  §4a states.
 - Both `client` (agent) and `server` (manager) feature sides gain the
   new request/handler surface.
 
@@ -1284,9 +1394,16 @@ gets a criterion here rather than only a prose mention.
   permits and which therefore must survive; and with two keys on the same
   `SocketAddr`, which is legal on the wire and is refused by the manager, not
   here.
+- **`config_template` round-trips, present and absent, as `Install`'s last
+  field** (§4a). Encode/decode with `None` and with `Some(id)`; the existing
+  `node_package_install_field_order_is_pinned` test (`src/types.rs`) gains
+  `config_template` as the tail field after `bind_addrs`, so reordering or
+  inserting a field before it fails.
 - **The appended variants are appended.** `InstallPreflight` gains
   `BindAddrsOnUpdate`, `NamespaceUnconfigured` and `EnrollmentUnsupported`
-  after `InsufficientDiskSpace`; `NodePackageError` gains
+  after `InsufficientDiskSpace`, then `ConfigTemplateOnUpdate` and
+  `UnknownConfigTemplate { id }` after `EnrollmentUnsupported` (§4a), and
+  `UnknownConfigTemplate` round-trips its `id`; `NodePackageError` gains
   `ObservationUnavailable` and `UnmanagedInstancePresent` after
   `UnsupportedManifestFormat`; `NodePackageResponse` gains `HostPorts` after
   `TrustActive`; `NodePackageRequest` gains `ListHostPorts` after `Status`. A
@@ -1402,6 +1519,11 @@ and RFC-D2 both consume its types — so it lands first.
    conditional-tail decode and its round-trip tests. Independent of 1–3.
 5. **Version negotiation bump** (§6) — raise the advertised version and the
    server-side `VersionReq`. Depends on 1–4.
+6. **Configuration template on `Install`** (§4a amendment) —
+   `Install::config_template` appended last; `ConfigTemplateOnUpdate` and
+   `UnknownConfigTemplate { id }` appended to both `InstallPreflight` and
+   `TerminalPreflight`, with the §8 round-trip and variant-index tests. No
+   capability tag and no version bump. Depends on 1b.
 
 Cross-repo: RFC-B implements the agent side of 1–3 and populates 4; RFC-D2
 implements the manager side and consumes every type here. Nothing in this
