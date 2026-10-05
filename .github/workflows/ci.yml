@@ -227,13 +227,18 @@ jobs:
           tool: cargo-llvm-cov
       - name: Generate code coverage
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      - name: Install Codecov CLI
+        run: python3 -m pip install --user codecov-cli
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v7
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-        with:
-          files: lcov.info
-          fail_ci_if_error: true
+        # The ingest and API endpoints have expired TLS certificates. Upload
+        # directly to the legacy endpoint, whose certificate remains valid;
+        # upload-coverage would first call the API even with --legacy enabled.
+        # Keep TLS verification and fail CI if the upload does not succeed.
+        run: >-
+          codecovcli --auto-load-params-from githubactions
+          do-upload --legacy --file lcov.info --disable-search --fail-on-error
 
   # `always()`, deliberately, and not `!cancelled()`: a cancelled run would
   # otherwise skip this job, and GitHub counts a skipped required check as a
