@@ -5,6 +5,30 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added `NodePackageRequest::Install::config_template`, the id of a deploy-core
+  configuration template the agent renders as the instance's configuration on a
+  first install. It is carried verbatim and never validated by this crate.
+- Added `InstallPreflight::ConfigTemplateOnUpdate` and
+  `InstallPreflight::UnknownConfigTemplate { id }`, terminal refusals reached
+  before any package bytes move. Each has a matching
+  `server::node::TerminalPreflight` variant that
+  `server::Connection::node_package_install` returns as its own
+  `InstallOutcome::Preflight`.
+
+### Changed
+
+- `NodePackageRequest::Install` has a new field, so code that builds one with a
+  struct literal must initialize `config_template` (`None` keeps today's
+  behaviour). `InstallPreflight` and `server::node::TerminalPreflight` have two
+  more variants, so an exhaustive match on either must handle them.
+  `PROTOCOL_VERSION` and `MIN_PROTOCOL_VERSION_REQ` are unchanged and no
+  capability tag guards the field, so a manager must not send `config_template`
+  to an agent built against 0.20.0, which silently ignores it.
+
 ## [0.20.0] - 2026-10-01
 
 ### Added
@@ -976,6 +1000,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - `client::handshake` implements the application-level handshake process for the
   client after a QUIC connection is established.
 
+[Unreleased]: https://github.com/aicers/review-protocol/compare/0.20.0...main
 [0.20.0]: https://github.com/aicers/review-protocol/compare/0.19.0...0.20.0
 [0.19.0]: https://github.com/aicers/review-protocol/compare/0.18.1...0.19.0
 [0.18.1]: https://github.com/aicers/review-protocol/compare/0.18.0...0.18.1

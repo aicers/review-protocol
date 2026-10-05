@@ -108,7 +108,11 @@ pub enum NodePowerOutcome {
 /// framed request alone, while
 /// [`NamespaceUnconfigured`](Self::NamespaceUnconfigured) and
 /// [`EnrollmentUnsupported`](Self::EnrollmentUnsupported) also
-/// consult the agent's own configuration and capabilities.
+/// consult the agent's own configuration and capabilities,
+/// respectively. [`ConfigTemplateOnUpdate`](Self::ConfigTemplateOnUpdate)
+/// also consults the agent's installed-build record, and
+/// [`UnknownConfigTemplate`](Self::UnknownConfigTemplate) its compiled-in
+/// template catalog.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TerminalPreflight {
     /// The build is already installed and its unit is not failed.
@@ -139,6 +143,25 @@ pub enum TerminalPreflight {
     /// discharges the attempt's owed cleanup rather than holding it
     /// open.
     EnrollmentUnsupported,
+    /// The request is an update and it carried
+    /// [`config_template`](crate::types::node::NodePackageRequest::Install::config_template).
+    /// Templates are rendered once, at first install: obeying it would
+    /// overwrite the instance's configuration, and dropping it would let
+    /// the manager believe it was applied. Decided before any bytes move
+    /// from the request and the agent's installed-build record. Terminal
+    /// and not retryable; the id is never examined, so an unknown id also
+    /// gets this verdict rather than [`UnknownConfigTemplate`](Self::UnknownConfigTemplate).
+    ConfigTemplateOnUpdate,
+    /// A first install names an id the agent's compiled-in catalog does
+    /// not hold for `target`, including a component with no templates and
+    /// the empty string. Decided before any bytes move from the request
+    /// and that catalog. Terminal and not retryable: the answer remains
+    /// identical until a build linking a catalog that holds the id is deployed.
+    UnknownConfigTemplate {
+        /// The refused id, returned unchanged so the manager can name it
+        /// without correlating back to the attempt.
+        id: String,
+    },
 }
 
 /// Which branch of the package-install exchange terminated, so that a
@@ -1490,6 +1513,7 @@ mod tests {
             bootstrap_material: None,
             on_failure: FailurePolicy::Rollback,
             bind_addrs: None,
+            config_template: None,
         }
     }
 

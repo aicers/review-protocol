@@ -1216,6 +1216,7 @@ mod tests {
                 bootstrap_material: None,
                 on_failure: FailurePolicy::Rollback,
                 bind_addrs: None,
+                config_template: None,
             }
             .service_id(),
             NODE_PACKAGE_INSTALL
