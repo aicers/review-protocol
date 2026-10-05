@@ -996,8 +996,9 @@ pub mod node {
     /// packages on a node.
     ///
     /// [`Install`](Self::Install) carries the routing and sizing
-    /// information for a package whose signed `.pkg` bytes follow on
-    /// the same bi-stream.  It deliberately carries neither the
+    /// information and, for a templated component, the configuration-template
+    /// id for a package whose signed `.pkg` bytes follow on the same
+    /// bi-stream.  It deliberately carries neither the
     /// manifest nor the signature: the single source of trust is the
     /// manifest and signature *inside* the `.pkg`, and the
     /// `target`/`version`/`commit` fields exist only to be compared
@@ -1031,6 +1032,7 @@ pub mod node {
     ///         "graphql_srv_addr".to_string(),
     ///         "0.0.0.0:8442".parse::<SocketAddr>().unwrap(),
     ///     )])),
+    ///     config_template: None,
     /// };
     /// assert!(matches!(req, NodePackageRequest::Install { .. }));
     /// ```
@@ -1044,7 +1046,8 @@ pub mod node {
         /// Install or update a package.  The signed `.pkg` bytes
         /// follow on the same bi-stream; the request carries
         /// routing, size and — on a first install — the enrollment
-        /// material, but deliberately NOT the manifest or signature.
+        /// material and configuration-template id for a templated
+        /// component, but deliberately NOT the manifest or signature.
         Install {
             /// The component this package places on the host.
             ///
@@ -1126,6 +1129,31 @@ pub mod node {
             /// component-specific struct, so a component that gains
             /// a listener needs no wire change.
             bind_addrs: Option<BTreeMap<String, SocketAddr>>,
+            /// The id of a deploy-core configuration template that the
+            /// agent renders as this instance's configuration file.
+            ///
+            /// `None` for every component except one whose catalog requires
+            /// a template (today only `reconverge`). The manager sets it on
+            /// a first install only and never on an update. Catalog ids are
+            /// unique within their component and match
+            /// `[a-z0-9][a-z0-9-]{0,62}`; templates hold no secret, and their
+            /// content never changes under an existing id. These are
+            /// deploy-core's invariants, not checks performed by this crate.
+            ///
+            /// Carried verbatim: this crate never parses, defaults or
+            /// validates it. Deliberately unlike the `bind_addrs` idiom,
+            /// `Some("")` is an id like any other, refused by the agent as
+            /// unknown rather than collapsed to `None`.
+            ///
+            /// Honoured on a **first install only**. An update carrying an
+            /// id is refused with [`InstallPreflight::ConfigTemplateOnUpdate`]
+            /// without examining the id. On a first install, an id the
+            /// agent's catalog does not hold for `target` is refused with
+            /// [`InstallPreflight::UnknownConfigTemplate`].
+            ///
+            /// Appended last, after `bind_addrs`, because declaration
+            /// position is the wire encoding.
+            config_template: Option<String>,
         },
         /// Remove one installed instance.
         Remove {
@@ -1220,6 +1248,33 @@ pub mod node {
         /// deployed — so the manager discharges the attempt's owed
         /// cleanup rather than holding it open.
         EnrollmentUnsupported,
+        /// The request is an update and it carried
+        /// [`config_template`](NodePackageRequest::Install::config_template).
+        ///
+        /// A template is rendered once, at first install: obeying it would
+        /// overwrite the configuration the instance has run with since,
+        /// and dropping it would let the manager believe a template was
+        /// applied when it was not. Decided before any bytes move, from
+        /// the request and the agent's installed-build record; terminal
+        /// and **not** retryable. The id is never examined on an update,
+        /// so even an unknown id gets this verdict rather than
+        /// [`UnknownConfigTemplate`](Self::UnknownConfigTemplate).
+        ConfigTemplateOnUpdate,
+        /// A first install whose
+        /// [`config_template`](NodePackageRequest::Install::config_template)
+        /// names an id the agent's compiled-in catalog does not hold for
+        /// `target`, including a component with no templates and the empty
+        /// string.
+        ///
+        /// Decided before any bytes move, from the request and the agent's
+        /// compiled-in template catalog; terminal and **not** retryable.
+        /// The agent answers identically until a build linking a catalog
+        /// that holds the id is deployed.
+        UnknownConfigTemplate {
+            /// The refused id, returned unchanged so the manager can name
+            /// it without correlating back to the attempt.
+            id: String,
+        },
     }
 
     /// Response from a package-management operation.
@@ -2651,6 +2706,7 @@ pub mod node {
                             bootstrap_material: material.clone(),
                             on_failure,
                             bind_addrs: None,
+                            config_template: Some("reconverge-baseline".into()),
                         };
                         assert_eq!(req, roundtrip(&req));
                     }
@@ -2682,6 +2738,14 @@ pub mod node {
         fn install_with_bind_addrs(
             bind_addrs: Option<BTreeMap<String, SocketAddr>>,
         ) -> NodePackageRequest {
+            install_with_config_template(bind_addrs, None)
+        }
+
+        /// Helper: an `Install` carrying both configuration inputs.
+        fn install_with_config_template(
+            bind_addrs: Option<BTreeMap<String, SocketAddr>>,
+            config_template: Option<String>,
+        ) -> NodePackageRequest {
             NodePackageRequest::Install {
                 target: "giganto".into(),
                 instance: Some(1),
@@ -2692,6 +2756,7 @@ pub mod node {
                 bootstrap_material: None,
                 on_failure: FailurePolicy::Rollback,
                 bind_addrs,
+                config_template,
             }
         }
 
@@ -2777,20 +2842,51 @@ pub mod node {
             assert_eq!(bind_addrs_of(&decoded), Some(&verbatim));
         }
 
+        /// The template id is carried verbatim, including an empty id,
+        /// and may coexist with bind addresses on the wire.
+        #[test]
+        fn node_package_install_config_template_roundtrip() {
+            for config_template in [
+                None,
+                Some("reconverge-baseline".into()),
+                Some(String::new()),
+            ] {
+                for bind_addrs in [
+                    None,
+                    Some(BTreeMap::from([(
+                        "graphql_srv_addr".to_string(),
+                        "0.0.0.0:8442".parse::<SocketAddr>().expect("valid"),
+                    )])),
+                ] {
+                    let req = install_with_config_template(bind_addrs, config_template.clone());
+                    let decoded = roundtrip(&req);
+                    assert_eq!(req, decoded);
+                    let NodePackageRequest::Install {
+                        config_template: decoded_id,
+                        ..
+                    } = decoded
+                    else {
+                        panic!("expected an install");
+                    };
+                    assert_eq!(decoded_id, config_template);
+                }
+            }
+        }
+
         /// Field POSITION is the wire contract just as variant order
-        /// is, so `bind_addrs` has to be the tail field of `Install`.
+        /// is, so `config_template` has to be the tail field of `Install`,
+        /// after `bind_addrs`.
         ///
-        /// The variant-index tests pin the enums; this pins the one
-        /// variant that gained a field.  Reordering the fields, or
-        /// inserting a later one ahead of `bind_addrs`, silently
-        /// renumbers the wire for every peer built against the old
-        /// order and breaks this test.
+        /// Reordering fields or inserting a later one ahead of
+        /// `config_template` changes the wire encoding and breaks this test.
         #[test]
         fn node_package_install_field_order_is_pinned() {
             let bind_addrs = BTreeMap::from([(
                 "graphql_srv_addr".to_string(),
                 "0.0.0.0:8442".parse::<SocketAddr>().expect("valid"),
             )]);
+
+            let id = "reconverge-baseline".to_string();
 
             // The variant index, then every field in declaration
             // order, each encoded on its own.  bincode writes exactly
@@ -2806,12 +2902,13 @@ pub mod node {
                 encode(&Option::<BootstrapMaterial>::None),
                 encode(&FailurePolicy::Rollback),
                 encode(&Some(bind_addrs.clone())),
+                encode(&Some(id.clone())),
             ]
             .concat();
             assert_eq!(
-                encode(&install_with_bind_addrs(Some(bind_addrs))),
+                encode(&install_with_config_template(Some(bind_addrs), Some(id))),
                 expected,
-                "`bind_addrs` is the tail field, after `on_failure`"
+                "`config_template` is the tail field, after `bind_addrs`"
             );
         }
 
@@ -2829,6 +2926,7 @@ pub mod node {
                 bootstrap_material: None,
                 on_failure: FailurePolicy::Rollback,
                 bind_addrs: None,
+                config_template: None,
             };
 
             let one = install(1);
@@ -2864,6 +2962,11 @@ pub mod node {
                 InstallPreflight::BindAddrsOnUpdate,
                 InstallPreflight::NamespaceUnconfigured,
                 InstallPreflight::EnrollmentUnsupported,
+                InstallPreflight::ConfigTemplateOnUpdate,
+                InstallPreflight::UnknownConfigTemplate {
+                    id: "no-such-template".into(),
+                },
+                InstallPreflight::UnknownConfigTemplate { id: String::new() },
             ] {
                 assert_eq!(preflight, roundtrip(&preflight));
             }
@@ -2894,6 +2997,16 @@ pub mod node {
             assert_eq!(
                 variant_index(&encode(&InstallPreflight::EnrollmentUnsupported)),
                 5
+            );
+            assert_eq!(
+                variant_index(&encode(&InstallPreflight::ConfigTemplateOnUpdate)),
+                6
+            );
+            assert_eq!(
+                variant_index(&encode(&InstallPreflight::UnknownConfigTemplate {
+                    id: "no-such-template".into(),
+                })),
+                7
             );
         }
 
@@ -3095,6 +3208,7 @@ pub mod node {
                 bootstrap_material: Some(material),
                 on_failure: FailurePolicy::Rollback,
                 bind_addrs: None,
+                config_template: None,
             };
             let rendered = format!("{req:?}");
             assert_redacted(&rendered);

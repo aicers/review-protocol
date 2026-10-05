@@ -525,9 +525,10 @@ impl Connection {
     ///    [`AlreadyApplied`](InstallPreflight::AlreadyApplied),
     ///    [`InsufficientDiskSpace`](InstallPreflight::InsufficientDiskSpace),
     ///    [`BindAddrsOnUpdate`](InstallPreflight::BindAddrsOnUpdate),
-    ///    [`NamespaceUnconfigured`](InstallPreflight::NamespaceUnconfigured)
-    ///    and
-    ///    [`EnrollmentUnsupported`](InstallPreflight::EnrollmentUnsupported)
+    ///    [`NamespaceUnconfigured`](InstallPreflight::NamespaceUnconfigured),
+    ///    [`EnrollmentUnsupported`](InstallPreflight::EnrollmentUnsupported),
+    ///    [`ConfigTemplateOnUpdate`](InstallPreflight::ConfigTemplateOnUpdate)
+    ///    and [`UnknownConfigTemplate`](InstallPreflight::UnknownConfigTemplate)
     ///    — and this method returns the matching
     ///    [`InstallOutcome::Preflight`] without reading a byte of
     ///    `pkg`.
@@ -1352,6 +1353,16 @@ impl Connection {
                     TerminalPreflight::EnrollmentUnsupported,
                 ));
             }
+            InstallPreflight::ConfigTemplateOnUpdate => {
+                return Ok(InstallOutcome::Preflight(
+                    TerminalPreflight::ConfigTemplateOnUpdate,
+                ));
+            }
+            InstallPreflight::UnknownConfigTemplate { id } => {
+                return Ok(InstallOutcome::Preflight(
+                    TerminalPreflight::UnknownConfigTemplate { id },
+                ));
+            }
             InstallPreflight::Proceed => {}
         }
 
@@ -1727,6 +1738,10 @@ mod tests {
                 "bindonupdate" => Ok(InstallPreflight::BindAddrsOnUpdate),
                 "nonamespace" => Ok(InstallPreflight::NamespaceUnconfigured),
                 "noenroll" => Ok(InstallPreflight::EnrollmentUnsupported),
+                "templateonupdate" => Ok(InstallPreflight::ConfigTemplateOnUpdate),
+                "unknowntemplate" => Ok(InstallPreflight::UnknownConfigTemplate {
+                    id: "no-such-template".into(),
+                }),
                 _ => Ok(InstallPreflight::Proceed),
             }
         }
@@ -2718,6 +2733,7 @@ mod tests {
             bootstrap_material: None,
             on_failure: FailurePolicy::Rollback,
             bind_addrs: None,
+            config_template: None,
         }
     }
 
@@ -3042,8 +3058,8 @@ mod tests {
         test_env.teardown(&server_conn);
     }
 
-    /// Each of the three refusals the bind-address design adds is
-    /// preserved as its own `InstallOutcome::Preflight`, and no
+    /// Each bind-address or configuration-template refusal is preserved
+    /// as its own `InstallOutcome::Preflight`, and no
     /// package bytes are sent for any of them.
     #[cfg(all(feature = "client", feature = "server"))]
     #[tokio::test]
@@ -3054,6 +3070,16 @@ mod tests {
             ("bindonupdate", TerminalPreflight::BindAddrsOnUpdate),
             ("nonamespace", TerminalPreflight::NamespaceUnconfigured),
             ("noenroll", TerminalPreflight::EnrollmentUnsupported),
+            (
+                "templateonupdate",
+                TerminalPreflight::ConfigTemplateOnUpdate,
+            ),
+            (
+                "unknowntemplate",
+                TerminalPreflight::UnknownConfigTemplate {
+                    id: "no-such-template".into(),
+                },
+            ),
         ] {
             let test_env = TEST_ENV.lock().await;
             let (server_conn, client_conn) = test_env.setup().await;

@@ -429,8 +429,9 @@ pub trait NodeHandler: Send {
     /// This is step 2 of the install exchange and is decided
     /// **before any bytes move** — from the framed request
     /// (`idempotency_key`, `(target, version, commit)`,
-    /// `bind_addrs`, `bootstrap_material`) and from what the agent
-    /// already knows about itself, never from the payload.  An `Err`
+    /// `bind_addrs`, `bootstrap_material`, `config_template`) and from
+    /// what the agent already knows about itself, never from the payload.
+    /// An `Err`
     /// returned here is the terminal frame of the exchange: no
     /// package bytes are requested and
     /// [`node_package_install`](Self::node_package_install) is not
@@ -451,9 +452,10 @@ pub trait NodeHandler: Send {
     /// touched before it is returned.
     ///
     /// [`BindAddrsOnUpdate`](InstallPreflight::BindAddrsOnUpdate),
-    /// [`NamespaceUnconfigured`](InstallPreflight::NamespaceUnconfigured)
-    /// and
-    /// [`EnrollmentUnsupported`](InstallPreflight::EnrollmentUnsupported)
+    /// [`NamespaceUnconfigured`](InstallPreflight::NamespaceUnconfigured),
+    /// [`EnrollmentUnsupported`](InstallPreflight::EnrollmentUnsupported),
+    /// [`ConfigTemplateOnUpdate`](InstallPreflight::ConfigTemplateOnUpdate)
+    /// and [`UnknownConfigTemplate`](InstallPreflight::UnknownConfigTemplate)
     /// are terminal in the same way.  The first refuses an update
     /// that carried
     /// [`bind_addrs`](NodePackageRequest::Install::bind_addrs), which
@@ -463,6 +465,11 @@ pub trait NodeHandler: Send {
     /// third refuses a first install carrying
     /// [`bootstrap_material`](NodePackageRequest::Install::bootstrap_material)
     /// when the agent does not advertise the enrollment capability.
+    /// `ConfigTemplateOnUpdate` refuses an update that carried
+    /// [`config_template`](NodePackageRequest::Install::config_template),
+    /// honoured on a first install only; the id is never examined on an
+    /// update, even if it is unknown. `UnknownConfigTemplate` refuses a
+    /// first install whose id the agent's catalog does not hold for `target`.
     /// Every verdict other than
     /// [`Proceed`](InstallPreflight::Proceed) ends the exchange here.
     ///
@@ -3097,6 +3104,7 @@ mod tests {
             bootstrap_material: None,
             on_failure: FailurePolicy::Rollback,
             bind_addrs: None,
+            config_template: None,
         }
     }
 
@@ -3212,6 +3220,10 @@ mod tests {
                 "bindonupdate" => Ok(InstallPreflight::BindAddrsOnUpdate),
                 "nonamespace" => Ok(InstallPreflight::NamespaceUnconfigured),
                 "noenroll" => Ok(InstallPreflight::EnrollmentUnsupported),
+                "templateonupdate" => Ok(InstallPreflight::ConfigTemplateOnUpdate),
+                "unknowntemplate" => Ok(InstallPreflight::UnknownConfigTemplate {
+                    id: "no-such-template".into(),
+                }),
                 _ => Ok(InstallPreflight::Proceed),
             }
         }
@@ -3776,7 +3788,7 @@ mod tests {
         assert!(server_res.is_ok());
     }
 
-    /// The three refusals the bind-address design adds are each the
+    /// Each bind-address or configuration-template refusal is the
     /// terminal frame: no payload is requested and no response
     /// follows the verdict.
     #[tokio::test]
@@ -3791,6 +3803,13 @@ mod tests {
             ("bindonupdate", InstallPreflight::BindAddrsOnUpdate),
             ("nonamespace", InstallPreflight::NamespaceUnconfigured),
             ("noenroll", InstallPreflight::EnrollmentUnsupported),
+            ("templateonupdate", InstallPreflight::ConfigTemplateOnUpdate),
+            (
+                "unknowntemplate",
+                InstallPreflight::UnknownConfigTemplate {
+                    id: "no-such-template".into(),
+                },
+            ),
         ] {
             let _lock = TOKEN.lock().await;
             let channel = channel().await;
