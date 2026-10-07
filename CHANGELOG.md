@@ -5,6 +5,22 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added `HandshakeError::InvalidVersionArgument(String)` for invalid manager
+  version arguments. Adding this variant breaks exhaustive matches on
+  `HandshakeError`; downstream callers must handle it.
+
+### Fixed
+
+- `server::handshake` validates `version_req` and `highest_protocol_version`
+  before accepting an agent handshake stream and returns an error identifying
+  the invalid argument and value instead of panicking, even if the agent sends
+  nothing. No argument-error response is sent to the agent and the connection
+  remains open; the manager is responsible for connection cleanup.
+
 ## [0.21.0] - 2026-10-05
 
 ### Added
@@ -1000,6 +1016,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - `client::handshake` implements the application-level handshake process for the
   client after a QUIC connection is established.
 
+[Unreleased]: https://github.com/aicers/review-protocol/compare/0.21.0...HEAD
 [0.21.0]: https://github.com/aicers/review-protocol/compare/0.20.0...0.21.0
 [0.20.0]: https://github.com/aicers/review-protocol/compare/0.19.0...0.20.0
 [0.19.0]: https://github.com/aicers/review-protocol/compare/0.18.1...0.19.0

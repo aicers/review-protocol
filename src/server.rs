@@ -511,17 +511,30 @@ impl Connection {
 ///
 /// # Errors
 ///
-/// Returns `HandshakeError` if the handshake failed.
+/// Returns [`HandshakeError::InvalidVersionArgument`] if `version_req` is not a
+/// valid semver requirement or `highest_protocol_version` is not a valid semver
+/// version. Both arguments are validated before accepting the agent's handshake
+/// stream. For an invalid argument, no response is sent on the agent handshake
+/// and the connection is left open; the manager is responsible for connection
+/// cleanup. The agent may wait until the manager closes the connection or the
+/// agent times out.
 ///
-/// # Panics
-///
-/// * panic if it failed to parse version requirement string.
+/// Returns another [`HandshakeError`] if receiving, decoding, or responding to
+/// the handshake fails, or the agent's protocol version is incompatible.
 pub async fn handshake(
     conn: &quinn::Connection,
     addr: SocketAddr,
     version_req: &str,
     highest_protocol_version: &str,
 ) -> Result<AgentInfo, HandshakeError> {
+    let version_req = VersionReq::parse(version_req).map_err(|e| {
+        HandshakeError::InvalidVersionArgument(format!("version_req {version_req:?}: {e}"))
+    })?;
+    let highest_protocol_version = Version::parse(highest_protocol_version).map_err(|e| {
+        HandshakeError::InvalidVersionArgument(format!(
+            "highest_protocol_version {highest_protocol_version:?}: {e}"
+        ))
+    })?;
     let (mut send, mut recv) = conn
         .accept_bi()
         .await
@@ -537,7 +550,6 @@ pub async fn handshake(
         .map_err(handle_handshake_recv_io_error)?;
     let mut agent_info = decode_agent_info(&buf).map_err(|_| HandshakeError::InvalidMessage)?;
     agent_info.addr = addr;
-    let version_req = VersionReq::parse(version_req).expect("valid version requirement");
     let protocol_version = Version::parse(&agent_info.protocol_version).map_err(|_| {
         HandshakeError::IncompatibleProtocol(
             agent_info.protocol_version.clone(),
@@ -545,8 +557,6 @@ pub async fn handshake(
         )
     })?;
     if version_req.matches(&protocol_version) {
-        let highest_protocol_version =
-            Version::parse(highest_protocol_version).expect("valid semver");
         if protocol_version <= highest_protocol_version {
             send_ok(&mut send, &mut buf, highest_protocol_version.to_string())
                 .await
@@ -639,6 +649,151 @@ pub async fn notify_config_update(conn: &quinn::Connection) -> anyhow::Result<()
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "client", feature = "server"))]
+    mod handshake {
+        use std::{net::SocketAddr, time::Duration};
+
+        use crate::{
+            HandshakeError, Status,
+            test::{TOKEN, channel},
+        };
+
+        const INVALID_VERSION: &str = "not-semver";
+        const VALID_VERSION: &str = "1.0.0";
+        const VERSION_REQ: &str = ">=1.0.0";
+        const TIMEOUT: Duration = Duration::from_secs(1);
+
+        fn assert_invalid_argument(error: HandshakeError, argument: &str) {
+            let HandshakeError::InvalidVersionArgument(message) = error else {
+                panic!("expected InvalidVersionArgument, got {error:?}");
+            };
+            assert!(message.contains(argument), "{message}");
+            assert!(message.contains(INVALID_VERSION), "{message}");
+        }
+
+        async fn invalid_argument_with_agent(
+            version_req: &str,
+            highest_protocol_version: &str,
+            agent_version: &'static str,
+            argument: &str,
+        ) {
+            let _lock = TOKEN.lock().await;
+            let channel = channel().await;
+            let (server, client) = (channel.server, channel.client);
+            let handle = tokio::spawn(async move {
+                crate::client::handshake(
+                    &client.conn,
+                    "test-agent",
+                    VALID_VERSION,
+                    agent_version,
+                    Status::Ready,
+                )
+                .await
+            });
+
+            let result = crate::server::handshake(
+                &server.conn,
+                SocketAddr::from(([0, 0, 0, 0], 0)),
+                version_req,
+                highest_protocol_version,
+            )
+            .await;
+
+            let close_reason = server.conn.close_reason();
+            server.conn.close(0_u32.into(), b"test complete");
+            let agent_result = handle.await.expect("agent task should not panic");
+
+            assert!(close_reason.is_none());
+            assert_invalid_argument(result.expect_err("invalid argument must fail"), argument);
+            assert!(agent_result.is_err());
+        }
+
+        #[tokio::test]
+        async fn invalid_version_req() {
+            invalid_argument_with_agent(
+                INVALID_VERSION,
+                VALID_VERSION,
+                VALID_VERSION,
+                "version_req",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn invalid_highest_protocol_version_with_compatible_agent() {
+            invalid_argument_with_agent(
+                VERSION_REQ,
+                INVALID_VERSION,
+                VALID_VERSION,
+                "highest_protocol_version",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn invalid_highest_protocol_version_with_incompatible_agent() {
+            invalid_argument_with_agent(
+                VERSION_REQ,
+                INVALID_VERSION,
+                "0.9.0",
+                "highest_protocol_version",
+            )
+            .await;
+        }
+
+        async fn invalid_argument_without_handshake_stream(
+            version_req: &str,
+            highest_protocol_version: &str,
+            argument: &str,
+        ) {
+            let _lock = TOKEN.lock().await;
+            // The setup stream has already been accepted; the client opens no
+            // further stream for an application handshake.
+            let channel = channel().await;
+            let result = tokio::time::timeout(
+                TIMEOUT,
+                crate::server::handshake(
+                    &channel.server.conn,
+                    SocketAddr::from(([0, 0, 0, 0], 0)),
+                    version_req,
+                    highest_protocol_version,
+                ),
+            )
+            .await;
+
+            let close_reason = channel.server.conn.close_reason();
+            channel.server.conn.close(0_u32.into(), b"test complete");
+
+            assert!(close_reason.is_none());
+            assert_invalid_argument(
+                result
+                    .expect("invalid argument must fail without waiting for a stream")
+                    .expect_err("invalid argument must fail"),
+                argument,
+            );
+        }
+
+        #[tokio::test]
+        async fn invalid_version_req_without_handshake_stream() {
+            invalid_argument_without_handshake_stream(
+                INVALID_VERSION,
+                VALID_VERSION,
+                "version_req",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn invalid_highest_protocol_version_without_handshake_stream() {
+            invalid_argument_without_handshake_stream(
+                VERSION_REQ,
+                INVALID_VERSION,
+                "highest_protocol_version",
+            )
+            .await;
+        }
+    }
+
     #[cfg(feature = "server")]
     use std::io;
 
