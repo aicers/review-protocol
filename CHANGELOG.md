@@ -7,6 +7,12 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Added `HandshakeError::InvalidVersionArgument(String)` for invalid manager
+  version arguments. Adding this variant breaks exhaustive matches on
+  `HandshakeError`; downstream callers must handle it.
+
 ### Changed
 
 - An agent that recognizes a request code but cannot decode the request's
@@ -17,6 +23,14 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   review-protocol releases, rather than an unexpected end of file. The frame
   carries no part of the request or the decode error. The request's handler is
   still not called, and the dispatcher still returns `HandlerError::RecvError`.
+
+### Fixed
+
+- `server::handshake` validates `version_req` and `highest_protocol_version`
+  before accepting an agent handshake stream and returns an error identifying
+  the invalid argument and value instead of panicking, even if the agent sends
+  nothing. No argument-error response is sent to the agent and the connection
+  remains open; the manager is responsible for connection cleanup.
 
 ## [0.21.0] - 2026-10-05
 
