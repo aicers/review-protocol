@@ -10,16 +10,15 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Added `HandshakeError::InvalidVersionArgument(String)` for invalid manager
-  version arguments. Adding this variant breaks exhaustive matches on
-  `HandshakeError`; downstream callers must handle it.
+  version arguments.
 
 ### Fixed
 
-- `server::handshake` validates `version_req` and `highest_protocol_version`
-  before accepting an agent handshake stream and returns an error identifying
-  the invalid argument and value instead of panicking, even if the agent sends
-  nothing. No argument-error response is sent to the agent and the connection
-  remains open; the manager is responsible for connection cleanup.
+- `server::handshake` now validates `version_req` and `highest_protocol_version`
+  before accepting an agent handshake stream and returns
+  `HandshakeError::InvalidVersionArgument` identifying the invalid argument and
+  its value. Previously, parsing invalid arguments caused a panic, and validation
+  could remain blocked waiting for the agent to send a handshake message.
 
 ## [0.21.0] - 2026-10-05
 
@@ -1016,7 +1015,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - `client::handshake` implements the application-level handshake process for the
   client after a QUIC connection is established.
 
-[Unreleased]: https://github.com/aicers/review-protocol/compare/0.21.0...HEAD
+[Unreleased]: https://github.com/aicers/review-protocol/compare/0.21.0...main
 [0.21.0]: https://github.com/aicers/review-protocol/compare/0.20.0...0.21.0
 [0.20.0]: https://github.com/aicers/review-protocol/compare/0.19.0...0.20.0
 [0.19.0]: https://github.com/aicers/review-protocol/compare/0.18.1...0.19.0
