@@ -5,6 +5,19 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- An agent that recognizes a request code but cannot decode the request's
+  arguments, through either `request::handle` or `request::handle_node`, now
+  answers with an error frame naming the request code before closing the
+  stream, instead of closing it silently. The manager therefore reports that
+  error, which suggests the two sides may be built against different
+  review-protocol releases, rather than an unexpected end of file. The frame
+  carries no part of the request or the decode error. The request's handler is
+  still not called, and the dispatcher still returns `HandlerError::RecvError`.
+
 ## [0.21.0] - 2026-10-05
 
 ### Added
@@ -1000,6 +1013,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - `client::handshake` implements the application-level handshake process for the
   client after a QUIC connection is established.
 
+[Unreleased]: https://github.com/aicers/review-protocol/compare/0.21.0...main
 [0.21.0]: https://github.com/aicers/review-protocol/compare/0.20.0...0.21.0
 [0.20.0]: https://github.com/aicers/review-protocol/compare/0.19.0...0.20.0
 [0.19.0]: https://github.com/aicers/review-protocol/compare/0.18.1...0.19.0
