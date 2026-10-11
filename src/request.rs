@@ -4711,6 +4711,36 @@ mod tests {
         assert_eq!(server_err.kind(), ProtocolErrorKind::InvalidArgs);
     }
 
+    /// The same through `handle`.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_undecodable_node_power_answers_error_frame() {
+        use crate::ProtocolErrorKind;
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::NodePowerResponse;
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = NoopHandler;
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let code = u32::from(RequestCode::NodePower);
+        let mut buf = Vec::new();
+        oinq::message::send_request(&mut client_send, &mut buf, code, "not-a-power-request")
+            .await
+            .unwrap();
+        assert_undecodable_answer::<NodePowerResponse>(&mut client_recv, code).await;
+
+        let server_err = server_task.await.unwrap().unwrap_err();
+        assert_eq!(server_err.kind(), ProtocolErrorKind::InvalidArgs);
+    }
+
     /// An undecodable `ReloadTi` through `handle` is answered with the
     /// error frame and still classifies as `InvalidArgs`.
     #[tokio::test]
