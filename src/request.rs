@@ -1068,6 +1068,48 @@ async fn dispatch_node_package<H: NodeHandler>(
         .map_err(HandlerError::SendError)
 }
 
+/// The text of the error frame that answers request `code` when its
+/// arguments cannot be decoded.
+///
+/// It is fixed apart from the code, deliberately: the decode error can
+/// quote the offending value, and the body can carry material such as
+/// [`BootstrapMaterial`](crate::types::node::BootstrapMaterial) whose
+/// `Debug` this crate redacts, while the manager logs what it receives.
+fn undecodable_args_message(code: u32) -> String {
+    format!(
+        "request code {code}: the arguments could not be decoded; the manager and the agent may \
+         be built against different review-protocol releases"
+    )
+}
+
+/// Decodes the arguments of request `code`, answering on the wire when
+/// they cannot be decoded.
+///
+/// On failure one error frame naming `code` is sent before the error is
+/// returned, so the manager reads a cause rather than an unexpected end
+/// of file.  The returned error is the decode error, classified as
+/// `classify` when one is given; a failure to send the frame is
+/// discarded so that it cannot replace it.
+async fn decode_args<'de, T: serde::Deserialize<'de>>(
+    send: &mut quinn::SendStream,
+    code: u32,
+    body: &'de [u8],
+    classify: Option<crate::ProtocolErrorKind>,
+) -> Result<T, HandlerError> {
+    let e = match parse_args::<T>(body) {
+        Ok(args) => return Ok(args),
+        Err(e) => e,
+    };
+    let e = match classify {
+        Some(kind) => crate::protocol_error::DispatchError::from_io(kind, &e),
+        None => e,
+    };
+    // `body` borrows the dispatcher's buffer, so the frame gets its own.
+    let mut buf = Vec::new();
+    let _ = oinq::message::send_err(send, &mut buf, undecodable_args_message(code)).await;
+    Err(HandlerError::RecvError(e))
+}
+
 /// Handles only node-family requests to an agent.
 ///
 /// This is a node-only dispatch entry point that accepts
@@ -1086,7 +1128,10 @@ async fn dispatch_node_package<H: NodeHandler>(
 ///
 /// # Errors
 ///
-/// * `HandlerError::RecvError` if the request could not be received
+/// * `HandlerError::RecvError` if the request could not be received,
+///   or if its arguments could not be decoded; in the latter case an
+///   error frame naming the request code is sent first, and the
+///   handler is not called
 /// * `HandlerError::SendError` if the response could not be sent
 #[allow(clippy::too_many_lines)]
 pub async fn handle_node<H: NodeHandler>(
@@ -1109,48 +1154,43 @@ pub async fn handle_node<H: NodeHandler>(
         let req = RequestCode::from_primitive(code);
         match req {
             RequestCode::NodeService => {
-                let req =
-                    parse_args::<NodeServiceRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeServiceRequest>(send, code, body, None).await?;
                 let result = handler.node_service(req).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::NodeNetworkInterface => {
-                let req = parse_args::<NodeNetworkInterfaceRequest>(body)
-                    .map_err(HandlerError::RecvError)?;
+                let req =
+                    decode_args::<NodeNetworkInterfaceRequest>(send, code, body, None).await?;
                 let result = handler.node_network_interface(req).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::NodeHostname => {
-                let req =
-                    parse_args::<NodeHostnameRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeHostnameRequest>(send, code, body, None).await?;
                 let result = handler.node_hostname(req).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::NodeTimeSync => {
-                let req =
-                    parse_args::<NodeTimeSyncRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeTimeSyncRequest>(send, code, body, None).await?;
                 let result = handler.node_time_sync(req).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::NodeLogging => {
-                let req =
-                    parse_args::<NodeLoggingRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeLoggingRequest>(send, code, body, None).await?;
                 let result = handler.node_logging(req).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::NodeRemoteAccess => {
-                let req =
-                    parse_args::<NodeRemoteAccessRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeRemoteAccessRequest>(send, code, body, None).await?;
                 let result = handler.node_remote_access(req).await;
                 send_response(send, &mut buf, result)
                     .await
@@ -1160,12 +1200,13 @@ pub async fn handle_node<H: NodeHandler>(
                 // Classify parse failures as InvalidArgs so that
                 // HandlerError::kind() returns the correct
                 // category.
-                let req = parse_args::<NodePowerRequest>(body).map_err(|e| {
-                    HandlerError::RecvError(crate::protocol_error::DispatchError::from_io(
-                        crate::ProtocolErrorKind::InvalidArgs,
-                        &e,
-                    ))
-                })?;
+                let req = decode_args::<NodePowerRequest>(
+                    send,
+                    code,
+                    body,
+                    Some(crate::ProtocolErrorKind::InvalidArgs),
+                )
+                .await?;
                 let expects_response = node_power_expects_response(&req);
                 let result = handler.node_power(req).await;
                 if expects_response {
@@ -1175,28 +1216,25 @@ pub async fn handle_node<H: NodeHandler>(
                 }
             }
             RequestCode::NodeObservation => {
-                let req =
-                    parse_args::<NodeObservationRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeObservationRequest>(send, code, body, None).await?;
                 let result = handler.node_observation(req).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::NodeVersion => {
-                let req =
-                    parse_args::<NodeVersionRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeVersionRequest>(send, code, body, None).await?;
                 let result = handler.node_version(req).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::NodePackage => {
-                let req =
-                    parse_args::<NodePackageRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodePackageRequest>(send, code, body, None).await?;
                 dispatch_node_package(handler, send, recv, &mut buf, req).await?;
             }
             RequestCode::NodeEnroll => {
-                let req = parse_args::<NodeEnrollRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeEnrollRequest>(send, code, body, None).await?;
                 let result = handler.node_enroll(req).await;
                 send_response(send, &mut buf, result)
                     .await
@@ -1235,7 +1273,10 @@ pub async fn handle_node<H: NodeHandler>(
 ///
 /// # Errors
 ///
-/// * `HandlerError::RecvError` if the request could not be received
+/// * `HandlerError::RecvError` if the request could not be received,
+///   or if its arguments could not be decoded; in the latter case an
+///   error frame naming the request code is sent first, and the
+///   handler is not called
 /// * `HandlerError::SendError` if the response could not be sent
 #[allow(clippy::too_many_lines)]
 pub async fn handle<H: Handler>(
@@ -1287,12 +1328,13 @@ pub async fn handle<H: Handler>(
             RequestCode::ReloadTi => {
                 // Classify parse failures as InvalidArgs so that
                 // HandlerError::kind() returns the correct category.
-                let version = parse_args::<&str>(body).map_err(|e| {
-                    HandlerError::RecvError(crate::protocol_error::DispatchError::from_io(
-                        crate::ProtocolErrorKind::InvalidArgs,
-                        &e,
-                    ))
-                })?;
+                let version = decode_args::<&str>(
+                    send,
+                    code,
+                    body,
+                    Some(crate::ProtocolErrorKind::InvalidArgs),
+                )
+                .await?;
                 let result = handler.reload_ti(version).await;
                 send_response(send, &mut buf, result)
                     .await
@@ -1317,53 +1359,49 @@ pub async fn handle<H: Handler>(
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::TorExitNodeList => {
-                let nodes = parse_args::<Vec<&str>>(body).map_err(HandlerError::RecvError)?;
+                let nodes = decode_args::<Vec<&str>>(send, code, body, None).await?;
                 let result = handler.tor_exit_node_list(&nodes).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::SamplingPolicyList => {
-                let list =
-                    parse_args::<Vec<SamplingPolicy>>(body).map_err(HandlerError::RecvError)?;
+                let list = decode_args::<Vec<SamplingPolicy>>(send, code, body, None).await?;
                 let result = handler.sampling_policy_list(&list).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::DeleteSamplingPolicy => {
-                let policy_ids = parse_args::<Vec<u32>>(body).map_err(HandlerError::RecvError)?;
+                let policy_ids = decode_args::<Vec<u32>>(send, code, body, None).await?;
                 let result = handler.delete_sampling_policy(&policy_ids).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::TrustedDomainList => {
-                let domains = parse_args::<Vec<&str>>(body).map_err(HandlerError::RecvError)?;
+                let domains = decode_args::<Vec<&str>>(send, code, body, None).await?;
                 let result = handler.trusted_domain_list(&domains).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::InternalNetworkList => {
-                let network_list =
-                    parse_args::<HostNetworkGroup>(body).map_err(HandlerError::RecvError)?;
+                let network_list = decode_args::<HostNetworkGroup>(send, code, body, None).await?;
                 let result = handler.internal_network_list(network_list).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::Allowlist => {
-                let allowlist =
-                    parse_args::<HostNetworkGroup>(body).map_err(HandlerError::RecvError)?;
+                let allowlist = decode_args::<HostNetworkGroup>(send, code, body, None).await?;
                 let result = handler.allowlist(allowlist).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::Blocklist => {
-                let blocklist =
-                    parse_args::<HostNetworkGroup>(body).map_err(HandlerError::RecvError)?;
+                let blocklist = decode_args::<HostNetworkGroup>(send, code, body, None).await?;
                 let result = handler.blocklist(blocklist).await;
                 send_response(send, &mut buf, result)
                     .await
@@ -1375,16 +1413,14 @@ pub async fn handle<H: Handler>(
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::TrustedUserAgentList => {
-                let user_agent_list =
-                    parse_args::<Vec<&str>>(body).map_err(HandlerError::RecvError)?;
+                let user_agent_list = decode_args::<Vec<&str>>(send, code, body, None).await?;
                 let result = handler.trusted_user_agent_list(&user_agent_list).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::ReloadFilterRule => {
-                let rules =
-                    parse_args::<Vec<TrafficFilterRule>>(body).map_err(HandlerError::RecvError)?;
+                let rules = decode_args::<Vec<TrafficFilterRule>>(send, code, body, None).await?;
                 let result = handler.update_traffic_filter_rules(&rules).await;
                 send_response(send, &mut buf, result)
                     .await
@@ -1397,8 +1433,8 @@ pub async fn handle<H: Handler>(
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::DeleteCustomerData => {
-                let request = parse_args::<CustomerDataDeletionRequest>(body)
-                    .map_err(HandlerError::RecvError)?;
+                let request =
+                    decode_args::<CustomerDataDeletionRequest>(send, code, body, None).await?;
                 let result = handler.delete_customer_data(&request).await;
                 send_response(send, &mut buf, result)
                     .await
@@ -1441,48 +1477,43 @@ pub async fn handle<H: Handler>(
             // Each arm deserializes the typed request payload and
             // invokes the corresponding grouped handler method.
             RequestCode::NodeService => {
-                let req =
-                    parse_args::<NodeServiceRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeServiceRequest>(send, code, body, None).await?;
                 let result = handler.node_service(req).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::NodeNetworkInterface => {
-                let req = parse_args::<NodeNetworkInterfaceRequest>(body)
-                    .map_err(HandlerError::RecvError)?;
+                let req =
+                    decode_args::<NodeNetworkInterfaceRequest>(send, code, body, None).await?;
                 let result = handler.node_network_interface(req).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::NodeHostname => {
-                let req =
-                    parse_args::<NodeHostnameRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeHostnameRequest>(send, code, body, None).await?;
                 let result = handler.node_hostname(req).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::NodeTimeSync => {
-                let req =
-                    parse_args::<NodeTimeSyncRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeTimeSyncRequest>(send, code, body, None).await?;
                 let result = handler.node_time_sync(req).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::NodeLogging => {
-                let req =
-                    parse_args::<NodeLoggingRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeLoggingRequest>(send, code, body, None).await?;
                 let result = handler.node_logging(req).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::NodeRemoteAccess => {
-                let req =
-                    parse_args::<NodeRemoteAccessRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeRemoteAccessRequest>(send, code, body, None).await?;
                 let result = handler.node_remote_access(req).await;
                 send_response(send, &mut buf, result)
                     .await
@@ -1491,12 +1522,13 @@ pub async fn handle<H: Handler>(
             RequestCode::NodePower => {
                 // Classify parse failures as InvalidArgs so that
                 // HandlerError::kind() returns the correct category.
-                let req = parse_args::<NodePowerRequest>(body).map_err(|e| {
-                    HandlerError::RecvError(crate::protocol_error::DispatchError::from_io(
-                        crate::ProtocolErrorKind::InvalidArgs,
-                        &e,
-                    ))
-                })?;
+                let req = decode_args::<NodePowerRequest>(
+                    send,
+                    code,
+                    body,
+                    Some(crate::ProtocolErrorKind::InvalidArgs),
+                )
+                .await?;
                 let expects_response = node_power_expects_response(&req);
                 let result = handler.node_power(req).await;
                 if expects_response {
@@ -1506,16 +1538,14 @@ pub async fn handle<H: Handler>(
                 }
             }
             RequestCode::NodeObservation => {
-                let req =
-                    parse_args::<NodeObservationRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeObservationRequest>(send, code, body, None).await?;
                 let result = handler.node_observation(req).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::NodeVersion => {
-                let req =
-                    parse_args::<NodeVersionRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeVersionRequest>(send, code, body, None).await?;
                 let result = handler.node_version(req).await;
                 send_response(send, &mut buf, result)
                     .await
@@ -1527,13 +1557,12 @@ pub async fn handle<H: Handler>(
             // variants are answered with one frame like every other
             // family.
             RequestCode::NodePackage => {
-                let req =
-                    parse_args::<NodePackageRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodePackageRequest>(send, code, body, None).await?;
                 dispatch_node_package(handler, send, recv, &mut buf, req).await?;
             }
 
             RequestCode::NodeEnroll => {
-                let req = parse_args::<NodeEnrollRequest>(body).map_err(HandlerError::RecvError)?;
+                let req = decode_args::<NodeEnrollRequest>(send, code, body, None).await?;
                 let result = handler.node_enroll(req).await;
                 send_response(send, &mut buf, result)
                     .await
@@ -4476,6 +4505,240 @@ mod tests {
 
         let server_res = server_task.await.unwrap();
         assert!(server_res.is_ok());
+    }
+
+    // ── undecodable request bodies ──────────────────────────────
+    //
+    // A known code whose arguments cannot be decoded is answered with
+    // one error frame before the dispatcher returns its error.
+
+    /// The error frame text for an undecodable request `code`, spelled
+    /// out here rather than taken from the crate so that the tests
+    /// pin it byte for byte.
+    #[cfg(feature = "server")]
+    fn undecodable_text(code: u32) -> String {
+        format!(
+            "request code {code}: the arguments could not be decoded; the manager and the agent \
+             may be built against different review-protocol releases"
+        )
+    }
+
+    /// Encodes `req` as a 0.21.0 manager does and drops the last byte.
+    ///
+    /// For an `Install` with `config_template: None` that byte is the
+    /// `None` tag, so the result is what a 0.20.0 manager sends.
+    #[cfg(feature = "server")]
+    fn truncated_install(req: &crate::types::node::NodePackageRequest) -> Vec<u8> {
+        let mut body = bincode::serde::encode_to_vec(req, bincode::config::standard())
+            .expect("an install request encodes");
+        assert_eq!(body.pop(), Some(0), "the last byte is the `None` tag");
+        body
+    }
+
+    /// Sends request `code` with `body` verbatim, without re-encoding
+    /// it the way `oinq::message::send_request` would.
+    #[cfg(feature = "server")]
+    async fn send_raw_request(send: &mut quinn::SendStream, code: u32, body: &[u8]) {
+        let mut frame = code.to_le_bytes().to_vec();
+        frame.extend_from_slice(body);
+        oinq::frame::send_raw(send, &frame)
+            .await
+            .expect("should send the raw request");
+    }
+
+    /// Reads the answer to an undecodable request `code` as a
+    /// `Result<T, String>` and asserts that it is the error frame and
+    /// that the stream is finished right after it.
+    #[cfg(feature = "server")]
+    async fn assert_undecodable_answer<T>(recv: &mut quinn::RecvStream, code: u32)
+    where
+        T: for<'de> serde::Deserialize<'de> + std::fmt::Debug,
+    {
+        let mut buf = Vec::new();
+        let answer = oinq::frame::recv::<Result<T, String>>(recv, &mut buf)
+            .await
+            .expect("should receive the error frame");
+        assert_eq!(answer.unwrap_err(), undecodable_text(code));
+
+        let next = oinq::frame::recv::<Result<T, String>>(recv, &mut buf).await;
+        assert_eq!(
+            next.expect_err("no frame follows the error frame").kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "the stream is finished after the error frame"
+        );
+    }
+
+    /// Asserts that a dispatcher result is the decode error it has
+    /// always returned.
+    #[cfg(feature = "server")]
+    fn assert_decode_error(res: Result<(), super::HandlerError>) {
+        match res {
+            Err(super::HandlerError::RecvError(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected a decode error, got {other:?}"),
+        }
+    }
+
+    /// A 0.20.0 `Install` sent to `handle` is answered with the error
+    /// frame, read as the preflight verdict `install_exchange` expects.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_undecodable_install_answers_error_frame() {
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::InstallPreflight;
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = NoopHandler;
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let code = u32::from(RequestCode::NodePackage);
+        let body = truncated_install(&install_request("sensor", 4_194_304));
+        send_raw_request(&mut client_send, code, &body).await;
+        assert_undecodable_answer::<InstallPreflight>(&mut client_recv, code).await;
+
+        assert_decode_error(server_task.await.unwrap());
+    }
+
+    /// The same through `handle_node`.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_undecodable_install_answers_error_frame() {
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::InstallPreflight;
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = StandaloneNodeHandler;
+            super::handle_node(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let code = u32::from(RequestCode::NodePackage);
+        let body = truncated_install(&install_request("sensor", 4_194_304));
+        send_raw_request(&mut client_send, code, &body).await;
+        assert_undecodable_answer::<InstallPreflight>(&mut client_recv, code).await;
+
+        assert_decode_error(server_task.await.unwrap());
+    }
+
+    /// A body cut inside the bootstrap material's wrapped secret is
+    /// answered with the fixed text, so nothing from the body reaches
+    /// the manager.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_undecodable_install_echoes_no_secret() {
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{InstallPreflight, NodePackageRequest};
+
+        const MARKER: &[u8] = b"s.MARKER-must-not-be-echoed";
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = StandaloneNodeHandler;
+            super::handle_node(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let mut req = install_request("sensor", 4_194_304);
+        let NodePackageRequest::Install {
+            bootstrap_material, ..
+        } = &mut req
+        else {
+            unreachable!("install_request builds an Install");
+        };
+        let mut material = enroll_material();
+        material.wrapped_secret_id = String::from_utf8(MARKER.to_vec()).unwrap();
+        *bootstrap_material = Some(material);
+
+        let mut body = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();
+        let at = body
+            .windows(MARKER.len())
+            .position(|w| w == MARKER)
+            .expect("the encoding carries the marker");
+        body.truncate(at + MARKER.len() / 2);
+
+        let code = u32::from(RequestCode::NodePackage);
+        send_raw_request(&mut client_send, code, &body).await;
+        assert_undecodable_answer::<InstallPreflight>(&mut client_recv, code).await;
+
+        assert_decode_error(server_task.await.unwrap());
+    }
+
+    /// An undecodable `NodePower` through `handle_node` is answered
+    /// with the error frame and still classifies as `InvalidArgs`.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_undecodable_node_power_answers_error_frame() {
+        use crate::ProtocolErrorKind;
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::NodePowerResponse;
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = StandaloneNodeHandler;
+            super::handle_node(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let code = u32::from(RequestCode::NodePower);
+        let mut buf = Vec::new();
+        oinq::message::send_request(&mut client_send, &mut buf, code, "not-a-power-request")
+            .await
+            .unwrap();
+        assert_undecodable_answer::<NodePowerResponse>(&mut client_recv, code).await;
+
+        let server_err = server_task.await.unwrap().unwrap_err();
+        assert_eq!(server_err.kind(), ProtocolErrorKind::InvalidArgs);
+    }
+
+    /// An undecodable `ReloadTi` through `handle` is answered with the
+    /// error frame and still classifies as `InvalidArgs`.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_undecodable_reload_ti_answers_error_frame() {
+        use crate::ProtocolErrorKind;
+        use crate::test::{TOKEN, channel};
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = NoopHandler;
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let code = u32::from(RequestCode::ReloadTi);
+        let mut buf = Vec::new();
+        oinq::message::send_request(&mut client_send, &mut buf, code, 42u32)
+            .await
+            .unwrap();
+        assert_undecodable_answer::<()>(&mut client_recv, code).await;
+
+        let server_err = server_task.await.unwrap().unwrap_err();
+        assert_eq!(server_err.kind(), ProtocolErrorKind::InvalidArgs);
     }
 
     // ── node.enroll dispatch tests ──────────────────────────────
