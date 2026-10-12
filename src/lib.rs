@@ -254,6 +254,9 @@ pub enum HandshakeError {
     MessageTooLarge,
     #[error("invalid message")]
     InvalidMessage,
+    /// A manager-supplied version argument could not be parsed as semver.
+    #[error("invalid version argument: {0}")]
+    InvalidVersionArgument(String),
     #[error("protocol version {0} is not supported; version {1} is required")]
     IncompatibleProtocol(String, String),
 }
