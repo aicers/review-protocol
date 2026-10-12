@@ -569,7 +569,7 @@ pub async fn handshake(
             send.finish().ok();
             Err(HandshakeError::IncompatibleProtocol(
                 protocol_version.to_string(),
-                version_req.to_string(),
+                format!("{version_req}, <={highest_protocol_version}"),
             ))
         }
     } else {
@@ -579,7 +579,7 @@ pub async fn handshake(
         send.finish().ok();
         Err(HandshakeError::IncompatibleProtocol(
             protocol_version.to_string(),
-            version_req.to_string(),
+            format!("{version_req}, <={highest_protocol_version}"),
         ))
     }
 }
@@ -662,6 +662,64 @@ mod tests {
         const VALID_VERSION: &str = "1.0.0";
         const VERSION_REQ: &str = ">=1.0.0";
         const TIMEOUT: Duration = Duration::from_secs(1);
+
+        fn assert_incompatible_protocol(
+            error: HandshakeError,
+            agent_version: &str,
+            accepted_version: &str,
+        ) {
+            let HandshakeError::IncompatibleProtocol(actual_version, actual_accepted) = error
+            else {
+                panic!("expected IncompatibleProtocol, got {error:?}");
+            };
+            assert_eq!(actual_version, agent_version);
+            assert_eq!(actual_accepted, accepted_version);
+        }
+
+        async fn rejected_agent(agent_version: &str, expected_response: &str) {
+            const REQUIREMENT: &str = ">=0.48.0";
+            const CEILING: &str = "0.49.0";
+            const ACCEPTED_RANGE: &str = ">=0.48.0, <=0.49.0";
+
+            let _lock = TOKEN.lock().await;
+            let channel = channel().await;
+            let (server_result, agent_result) = tokio::join!(
+                crate::server::handshake(
+                    &channel.server.conn,
+                    SocketAddr::from(([0, 0, 0, 0], 0)),
+                    REQUIREMENT,
+                    CEILING,
+                ),
+                crate::client::handshake(
+                    &channel.client.conn,
+                    "test-agent",
+                    VALID_VERSION,
+                    agent_version,
+                    Status::Ready,
+                ),
+            );
+
+            assert_incompatible_protocol(
+                server_result.expect_err("incompatible agent must be rejected"),
+                agent_version,
+                ACCEPTED_RANGE,
+            );
+            assert_incompatible_protocol(
+                agent_result.expect_err("agent must receive a rejection response"),
+                agent_version,
+                expected_response,
+            );
+        }
+
+        #[tokio::test]
+        async fn agent_version_fails_requirement() {
+            rejected_agent("0.47.0", ">=0.48.0").await;
+        }
+
+        #[tokio::test]
+        async fn agent_version_exceeds_ceiling() {
+            rejected_agent("0.50.0", "0.49.0").await;
+        }
 
         fn assert_invalid_argument(error: HandshakeError, argument: &str) {
             let HandshakeError::InvalidVersionArgument(message) = error else {

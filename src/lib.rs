@@ -1354,7 +1354,11 @@ mod tests {
             res,
             Err(crate::HandshakeError::IncompatibleProtocol(ref version, ref req))
                 if version == PREVIOUS_PROTOCOL_VERSION
-                    && req == crate::MIN_PROTOCOL_VERSION_REQ
+                    && req == &format!(
+                        "{}, <={}",
+                        crate::MIN_PROTOCOL_VERSION_REQ,
+                        crate::PROTOCOL_VERSION,
+                    )
         ));
 
         // Both branches return the same variant with the same payload, so the
@@ -1411,7 +1415,10 @@ mod tests {
             res,
             Err(crate::HandshakeError::IncompatibleProtocol(ref version, ref req))
                 if version == crate::PROTOCOL_VERSION
-                    && req == crate::MIN_PROTOCOL_VERSION_REQ
+                    && req == &format!(
+                        "{}, <={PREVIOUS_PROTOCOL_VERSION}",
+                        crate::MIN_PROTOCOL_VERSION_REQ,
+                    )
         ));
 
         // The agent version clears the floor, so this can only be the ceiling
