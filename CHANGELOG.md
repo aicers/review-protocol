@@ -9,9 +9,10 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- `server::handshake` protocol-version rejection errors now report the full
-  accepted range, combining `version_req` with `<=highest_protocol_version`.
-  The rejection responses sent to agents are unchanged.
+- `server::handshake` protocol-version rejection errors and agent rejection
+  responses now report the full accepted range, combining `version_req` with
+  `<=highest_protocol_version`. Unparsable agent protocol versions are explicitly
+  rejected with the same error and response.
 
 ## [0.22.0] - 2026-10-12
 
