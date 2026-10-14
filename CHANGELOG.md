@@ -5,6 +5,15 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `server::handshake` protocol-version rejection errors and agent rejection
+  responses now report the full accepted range, combining `version_req` with
+  `<=highest_protocol_version`. Unparsable agent protocol versions are explicitly
+  rejected with the same error and response.
+
 ## [0.22.0] - 2026-10-12
 
 ### Added
@@ -1026,6 +1035,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - `client::handshake` implements the application-level handshake process for the
   client after a QUIC connection is established.
 
+[Unreleased]: https://github.com/aicers/review-protocol/compare/0.22.0...main
 [0.22.0]: https://github.com/aicers/review-protocol/compare/0.21.0...0.22.0
 [0.21.0]: https://github.com/aicers/review-protocol/compare/0.20.0...0.21.0
 [0.20.0]: https://github.com/aicers/review-protocol/compare/0.19.0...0.20.0
