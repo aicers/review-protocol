@@ -97,7 +97,8 @@ cargo test --features client,server
 
 ## License
 
-Copyright 2024-2025 Petabi, Inc.
+Copyright 2024-2026 Petabi, Inc.
+Copyright 2026 ClumL Inc.
 
 Licensed under [Apache License, Version 2.0][apache-license] (the "License");
 you may not use this crate except in compliance with the License.
