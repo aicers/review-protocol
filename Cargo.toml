@@ -38,9 +38,15 @@ bincode = { version = "2", features = ["serde"], optional = true }
 ipnet = { version = "2", features = ["serde"] }
 jiff = { version = "0.2.15", features = ["serde"] }
 num_enum = { version = "0.7" }
-oinq = { git = "https://github.com/petabi/oinq.git", tag = "0.13.1", optional = true }
-quinn = { version = "0.11", optional = true }
-rcgen = { version = "0.14", optional = true }
+oinq = { git = "https://github.com/petabi/oinq.git", tag = "0.14.0", optional = true }
+quinn = { version = "0.11", default-features = false, features = [
+  "log",
+  "platform-verifier",
+  "runtime-tokio",
+  "rustls-aws-lc-rs",
+  "bloom",
+], optional = true }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"], optional = true }
 rustls = { version = "0.23", default-features = false, optional = true }
 rustls-pemfile = { version = "2", optional = true }
 semver = { version = "1", optional = true }
@@ -52,12 +58,15 @@ thiserror = { version = "2", optional = true }
 tokio = { version = "1", features = ["sync"], optional = true }
 
 [dev-dependencies]
-quinn = { version = "0.11", features = ["ring"] }
-rcgen = "0.14"
-rustls = { version = "0.23", default-features = false, features = [
-  "ring",
-  "std",
+quinn = { version = "0.11", default-features = false, features = [
+  "log",
+  "platform-verifier",
+  "runtime-tokio",
+  "rustls-aws-lc-rs",
+  "bloom",
 ] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 rustls-pemfile = "2"
 tokio = { version = "1", features = ["macros", "rt"] }
 tokio-test = "0.4.4"
