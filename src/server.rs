@@ -175,6 +175,8 @@ pub use self::handler::{Handler, handle, handle_authorized, handle_authorized_wi
 #[cfg(feature = "server")]
 pub use self::stream::process_event_stream;
 #[cfg(feature = "server")]
+use crate::legacy_transport as oinq;
+#[cfg(feature = "server")]
 use crate::types::EventMessage;
 #[cfg(feature = "server")]
 use crate::{

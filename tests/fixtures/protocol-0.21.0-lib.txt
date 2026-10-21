@@ -1,0 +1,192 @@
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentInfo {
+    #[serde(rename = "agent_name", alias = "app_name")]
+    pub agent_name: String,
+    #[serde(rename = "agent_version", alias = "app_version", alias = "version")]
+    pub agent_version: String,
+
+    /// The wire protocol version the agent advertises.
+    ///
+    /// This is the **protocol** version, not the crate version. The value is
+    /// supplied by the caller — an agent passes it to
+    /// `client::ConnectionBuilder::new` — and this crate never fills it in.
+    /// [`PROTOCOL_VERSION`] is the value this crate's surface corresponds to.
+    ///
+    /// `server::handshake` enforces a window on it from both sides: a floor,
+    /// the caller's `version_req`, and a ceiling, the caller's
+    /// `highest_protocol_version`. A version outside either end answers
+    /// `HandshakeError::IncompatibleProtocol`. So a caller that passes a
+    /// crate version into either argument breaks its own handshake — a floor
+    /// in the crate's namespace is vacuous against a protocol version, and a
+    /// ceiling in it refuses every agent.
+    pub protocol_version: String,
+    pub addr: SocketAddr,
+    pub status: Status,
+
+    // ── conditional tail ───────────────────────────────────────
+    //
+    // Append-only, decoded in declaration order. See the type-level
+    // documentation before adding a field here.
+    /// Namespaced capability tags the agent advertises.
+    ///
+    /// The set is **open**: [`types::capability`] lists the tags this crate
+    /// knows about, but a consumer validates the ones it knows and preserves
+    /// the rest untouched. A new capability is just another tag and needs no
+    /// wire change, and one agent may hold several roles at once.
+    ///
+    /// Security-sensitive tags are **advertised, not authoritative**. This
+    /// crate transports them; a manager corroborates them elsewhere before
+    /// granting anything.
+    ///
+    /// This is unrelated to the crate's other `capabilities`, the
+    /// `Vec<String>` on `auth::ProtocolMetadata`: a different field on a
+    /// different type, attached to an `auth::AuthorizationContext` and never
+    /// present on the handshake struct. The two are not merged, and whether
+    /// they should ever converge is a question for elsewhere.
+    ///
+    /// An empty set means the agent advertised nothing — including the case of
+    /// a peer too old to send the field at all.
+    ///
+    /// [`types::capability`]: crate::types::capability
+    pub capabilities: BTreeSet<String>,
+
+    /// The release-signing trust-set generation the agent reports itself
+    /// active on, or `None` when the epoch is unknown.
+    ///
+    /// `None` means **unknown**, not epoch 0 and not confirmed.
+    ///
+    /// The value is agent-asserted, so it bounds the agent's status
+    /// **downward only**: a consumer clamps it against its own active epoch,
+    /// where a report at or below that epoch may mark the host caught up, and
+    /// a report **above** it is treated as un-confirmed, never as confirmed.
+    /// This crate does not implement the clamp; it transports the reading, and
+    /// the consumer applies the rule.
+    ///
+    /// This is the **connect-time** reading only. It is exchanged once per
+    /// connection and so cannot report an activation that happens later on a
+    /// still-open connection; the per-apply trust acknowledgement carries that
+    /// half of the picture.
+    pub active_trust_epoch: Option<u64>,
+
+    /// The range of package-manifest `format_version` values the agent can
+    /// decode, or `None` when the agent did not report one.
+    ///
+    /// `None` means the agent's range is unknown, and the safe assumption is
+    /// the launch format only.
+    pub manifest_formats: Option<ManifestFormatRange>,
+
+    /// Digests of the provisioning file as read by the enforcing daemon and
+    /// relayed by the agent, or `None` when the agent did not report them.
+    pub provisioning_fingerprint: Option<ProvisioningFingerprint>,
+
+    /// The registrar's audit-store health, relayed from its local endpoint, or
+    /// `None` when the agent did not report it.
+    pub audit_health: Option<AuditHealth>,
+}
+
+/// The base fields of [`AgentInfo`], i.e. everything before the conditional
+/// tail.
+///
+/// Decoding the tail requires knowing where the base ends, and bincode reports
+/// that only as the number of bytes a decode consumed — so the base needs a type
+/// of its own that stops at `status`. The fields must mirror the leading fields
+/// of `AgentInfo` exactly. Two tests catch drift between them:
+/// `agent_info_encodes_base_then_tail` fails if `AgentInfo` gains a field ahead
+/// of the tail, and `base_only_decoder_ignores_the_tail` fails if this struct
+/// stops consuming exactly the base.
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+struct AgentInfoBase {
+    #[serde(rename = "agent_name", alias = "app_name")]
+    agent_name: String,
+    #[serde(rename = "agent_version", alias = "app_version", alias = "version")]
+    agent_version: String,
+    protocol_version: String,
+    addr: SocketAddr,
+    status: Status,
+}
+
+/// The error type for a failed [`AgentInfo`] decode.
+#[cfg(feature = "server")]
+#[derive(Debug, Error)]
+pub(crate) enum AgentInfoDecodeError {
+    #[error("cannot decode the agent information: {0}")]
+    Base(bincode::error::DecodeError),
+    #[error("cannot decode `{field}` in the agent information tail: {source}")]
+    Tail {
+        field: &'static str,
+        #[source]
+        source: bincode::error::DecodeError,
+    },
+}
+
+/// Decodes an [`AgentInfo`] frame, reading as much of the conditional tail as
+/// the peer sent.
+///
+/// A tail field the peer omitted reads as unknown: an empty set for
+/// `capabilities` and `None` for the rest. That applies only when the bytes run
+/// out at a field boundary — a tail that is present but does not decode is an
+/// error.
+///
+/// # Errors
+///
+/// Returns [`AgentInfoDecodeError::Base`] if the base struct does not decode,
+/// and [`AgentInfoDecodeError::Tail`] if a tail field is present but does not
+/// decode.
+#[cfg(feature = "server")]
+pub(crate) fn decode_agent_info(buf: &[u8]) -> Result<AgentInfo, AgentInfoDecodeError> {
+    let config = bincode::config::standard();
+    let (base, mut offset) =
+        bincode::serde::borrow_decode_from_slice::<AgentInfoBase, _>(buf, config)
+            .map_err(AgentInfoDecodeError::Base)?;
+
+    let capabilities = decode_tail_field(buf, &mut offset, "capabilities")?.unwrap_or_default();
+    let active_trust_epoch = decode_tail_field(buf, &mut offset, "active_trust_epoch")?.flatten();
+    let manifest_formats = decode_tail_field(buf, &mut offset, "manifest_formats")?.flatten();
+    let provisioning_fingerprint =
+        decode_tail_field(buf, &mut offset, "provisioning_fingerprint")?.flatten();
+    let audit_health = decode_tail_field(buf, &mut offset, "audit_health")?.flatten();
+
+    Ok(AgentInfo {
+        agent_name: base.agent_name,
+        agent_version: base.agent_version,
+        protocol_version: base.protocol_version,
+        addr: base.addr,
+        status: base.status,
+        capabilities,
+        active_trust_epoch,
+        manifest_formats,
+        provisioning_fingerprint,
+        audit_health,
+    })
+}
+
+/// Decodes one conditional-tail field from `buf` at `offset`, advancing
+/// `offset` by exactly the number of bytes that field occupies.
+///
+/// Returns `Ok(None)` if the buffer ends at `offset`, meaning the peer stopped
+/// before this field.
+///
+/// # Errors
+///
+/// Returns [`AgentInfoDecodeError::Tail`] if bytes remain but do not decode
+/// into `T`.
+#[cfg(feature = "server")]
+fn decode_tail_field<'a, T>(
+    buf: &'a [u8],
+    offset: &mut usize,
+    field: &'static str,
+) -> Result<Option<T>, AgentInfoDecodeError>
+where
+    T: serde::Deserialize<'a>,
+{
+    let Some(rest) = buf.get(*offset..).filter(|rest| !rest.is_empty()) else {
+        return Ok(None);
+    };
+    let (value, consumed) =
+        bincode::serde::borrow_decode_from_slice::<T, _>(rest, bincode::config::standard())
+            .map_err(|source| AgentInfoDecodeError::Tail { field, source })?;
+    *offset += consumed;
+    Ok(Some(value))
+}
+
