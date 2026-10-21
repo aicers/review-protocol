@@ -22,6 +22,14 @@ facilitate efficient and secure communication within the REview ecosystem.
   management
 - **Error Handling**: Comprehensive error handling with custom recovery options
 
+## Additive session API
+
+The `session` module offers cloneable role-specific domain handles, unique
+incoming stream owners, typed errors and outcome certainty, peer certificate
+access, and bounded framing over oinq 0.14.0. Constructors require explicit
+`SessionOptions`; `legacy_compatible()` selects the existing `u32` wire bound,
+and applications can configure separate limits for each message family.
+
 ## Unidirectional Event Stream API
 
 The crate provides a high-level API for handling unidirectional event streams,

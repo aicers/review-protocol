@@ -1,0 +1,109 @@
+pub(crate) enum RequestCode {
+    /// Start DNS filtering
+    DnsStart = 1,
+
+    /// Stop DNS filtering
+    DnsStop = 2,
+
+    /// Reboot the host
+    Reboot = 4,
+
+    /// Reload the configuration
+    ReloadConfig = 6,
+
+    /// Fetch the TI database and reload it
+    ReloadTi = 5,
+
+    /// Collect resource usage stats
+    ResourceUsage = 7,
+
+    /// Update the list of tor exit nodes
+    TorExitNodeList = 8,
+
+    /// Update the list of sampling policies
+    SamplingPolicyList = 9,
+
+    /// Update traffic filter rules
+    ReloadFilterRule = 10,
+
+    /// Update Configuration
+    UpdateConfig = 12,
+
+    /// Delete the list of sampling policies
+    DeleteSamplingPolicy = 13,
+
+    /// Update the list of Internal network
+    InternalNetworkList = 14,
+
+    /// Update the list of allow
+    Allowlist = 15,
+
+    /// Update the list of block
+    Blocklist = 16,
+
+    /// Request Echo (for ping)
+    EchoRequest = 17,
+
+    /// Update the list of trusted User-agent
+    TrustedUserAgentList = 18,
+
+    /// Update the list of trusted domains
+    TrustedDomainList = 0,
+
+    /// Collect process list
+    ProcessList = 19,
+
+    /// Update the semi-supervised models
+    SemiSupervisedModels = 20,
+
+    /// Shutdown the host
+    Shutdown = 21,
+
+    /// Delete customer-owned filesystem data
+    DeleteCustomerData = 22,
+
+    // ── node feature-family request codes ──────────────────────
+    //
+    // Each node feature family maps to exactly one request code.
+    // The typed enum payload (e.g. `NodeServiceRequest`) carries
+    // the subcommand; no per-subcommand codes are needed.
+    //
+    // These codes are internal to the crate and must not appear in
+    // the public API.
+    /// Node service-control family.
+    NodeService = 100,
+
+    /// Node network-interface management family.
+    NodeNetworkInterface = 101,
+
+    /// Node hostname management family.
+    NodeHostname = 102,
+
+    /// Node time-synchronization management family.
+    NodeTimeSync = 103,
+
+    /// Node logging-configuration family.
+    NodeLogging = 104,
+
+    /// Node remote-access configuration family.
+    NodeRemoteAccess = 105,
+
+    /// Node power-control family.
+    NodePower = 106,
+
+    /// Node host-observation family.
+    NodeObservation = 107,
+
+    /// Node version-management family.
+    NodeVersion = 108,
+
+    /// Node package-management family.
+    NodePackage = 109,
+
+    /// Node service-enrollment family.
+    NodeEnroll = 110,
+
+    /// Unknown request
+    #[num_enum(default)]
+    Unknown = u32::MAX,
+}

@@ -11,9 +11,9 @@ use std::{
 
 #[cfg(any(feature = "client", feature = "server"))]
 use num_enum::{FromPrimitive, IntoPrimitive};
-#[cfg(feature = "client")]
-use oinq::frame;
 
+#[cfg(feature = "client")]
+use crate::legacy_transport::frame;
 #[cfg(feature = "client")]
 use crate::{
     AgentInfo,

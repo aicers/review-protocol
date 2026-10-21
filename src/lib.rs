@@ -179,12 +179,16 @@ pub mod auth;
 pub mod client;
 #[cfg(feature = "client")]
 pub mod frame;
+#[cfg(any(feature = "client", feature = "server"))]
+mod legacy_transport;
 pub mod protocol_error;
 #[cfg(feature = "client")]
 pub mod request;
 pub mod server;
 #[cfg(any(feature = "client", feature = "server"))]
 pub mod service_id;
+#[cfg(any(feature = "client", feature = "server"))]
+pub mod session;
 #[cfg(any(
     feature = "test-support",
     all(test, any(feature = "client", feature = "server"))
@@ -192,6 +196,8 @@ pub mod service_id;
 #[doc(hidden)]
 pub mod test;
 pub mod types;
+#[cfg(any(feature = "client", feature = "server"))]
+mod wire;
 
 use std::{collections::BTreeSet, net::SocketAddr};
 
@@ -528,10 +534,7 @@ where
     I: serde::Serialize,
     O: serde::de::DeserializeOwned,
 {
-    let mut buf = vec![];
-    oinq::message::send_request(send, &mut buf, code, input).await?;
-
-    oinq::frame::recv(recv, &mut buf).await
+    legacy_transport::unary(send, recv, code, input).await
 }
 
 #[cfg(test)]
