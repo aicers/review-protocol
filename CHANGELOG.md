@@ -7,6 +7,14 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in transport-backed sessions with role-specific domain handles,
+  unique incoming owners, peer certificate access, typed errors and outcome
+  certainty, explicit per-family frame budgets, and cancellation-safe framing
+  with explicit exchange aborts. Legacy Quinn APIs and protocol bytes remain
+  compatible.
+
 ### Fixed
 
 - `server::handshake` protocol-version rejection errors and agent rejection

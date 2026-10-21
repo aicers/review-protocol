@@ -32,6 +32,7 @@ use num_enum::FromPrimitive;
 use oinq::request::parse_args;
 
 use super::RequestCode;
+use crate::legacy_transport as oinq;
 use crate::protocol_error::{DispatchError, ProtocolErrorKind};
 use crate::types::{
     ColumnStatisticsUpdate, CustomerDataDeletionReport, DataSource, DataSourceKey, EventMessage,

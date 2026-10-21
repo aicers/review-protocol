@@ -187,6 +187,8 @@ jobs:
           components: clippy, rustfmt
       - name: Check formatting
         run: cargo fmt -- --check --config group_imports=StdExternalCrate
+      - name: Compile external public surfaces
+        run: sh tests/check-surfaces.sh
       - name: Clippy (no features)
         run: cargo clippy --tests -- -D warnings
       - name: Clippy (client)
