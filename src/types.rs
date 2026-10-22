@@ -742,15 +742,28 @@ pub mod node {
     /// Response from a time-synchronization operation.
     ///
     /// [`Get`](Self::Get) returns the current NTP server list,
-    /// [`Status`](Self::Status) indicates whether synchronization is
-    /// enabled, and [`Done`](Self::Done) confirms a mutating
-    /// operation succeeded.
+    /// [`Status`](Self::Status) reports whether the time synchronization
+    /// service is enabled, whether the host is synchronized, the source in
+    /// use and the last measured offset, and [`Done`](Self::Done) confirms a
+    /// mutating operation succeeded.
     #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
     pub enum NodeTimeSyncResponse {
         /// Current NTP server list, or `None` if not configured.
         Get { servers: Option<Vec<String>> },
         /// Current synchronization status.
-        Status { enabled: bool },
+        Status {
+            /// The host's time synchronization service is enabled.
+            enabled: bool,
+            /// The host's clock is synchronized to the source it is meant to
+            /// follow, as of a recent measurement.
+            synchronized: bool,
+            /// The source in use; none when there is none or it is the host's
+            /// own clock.
+            server: Option<String>,
+            /// This host's clock minus its source's at the last measurement, in
+            /// microseconds; none when unknown.
+            offset_micros: Option<i64>,
+        },
         /// The operation completed successfully.
         Done,
     }
@@ -2506,7 +2519,20 @@ pub mod node {
             };
             assert_eq!(resp, roundtrip(&resp));
 
-            let resp = NodeTimeSyncResponse::Status { enabled: true };
+            let resp = NodeTimeSyncResponse::Status {
+                enabled: true,
+                synchronized: true,
+                server: Some("cm.example.com".into()),
+                offset_micros: Some(-1_234),
+            };
+            assert_eq!(resp, roundtrip(&resp));
+
+            let resp = NodeTimeSyncResponse::Status {
+                enabled: false,
+                synchronized: false,
+                server: None,
+                offset_micros: None,
+            };
             assert_eq!(resp, roundtrip(&resp));
 
             let resp = NodeTimeSyncResponse::Done;

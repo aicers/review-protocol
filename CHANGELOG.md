@@ -7,6 +7,19 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `NodeTimeSyncResponse::Status` now also reports whether the host is
+  synchronized to its source (`synchronized`), the source in use (`server`)
+  and the host's offset from it at the last measurement (`offset_micros`).
+  This is a breaking change: code that builds a `Status` with a struct literal
+  must initialize the three new fields, and a pattern that names its fields
+  without `..` must name them too. The variant's encoding changes, so a manager
+  and an agent exchanging `Status` must both be built against this release.
+  `PROTOCOL_VERSION` and `MIN_PROTOCOL_VERSION_REQ` are unchanged and no
+  capability tag guards the change. `NodeTimeSyncRequest` and the other
+  response variants are unchanged.
+
 ### Fixed
 
 - `server::handshake` protocol-version rejection errors and agent rejection
