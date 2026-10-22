@@ -1,8 +1,9 @@
 use std::io;
 
-use oinq::frame;
 use quinn::{RecvStream, SendStream};
 use serde::{Serialize, de::DeserializeOwned};
+
+use crate::legacy_transport::frame;
 
 /// Receives a message as a stream.
 ///
