@@ -51,6 +51,177 @@ pub enum CustomerDataDeletionOutcome {
     Failed(String),
 }
 
+/// A request to an Unsupervised Engine to start a training run.
+///
+/// The run creates the model named [`model`](Self::model), or replaces it,
+/// and the engine uploads the result with the client's `upload_run_model`
+/// under [`run_id`](Self::run_id).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrainModelRequest {
+    /// The identifier the Central Manager issued for this run.
+    pub run_id: u32,
+    /// The name of the model the run creates or replaces.
+    pub model: String,
+    /// The training definition, a TOML document.
+    ///
+    /// This crate carries the definition verbatim and never parses or
+    /// validates it. It does own the definition's schema, which is stated
+    /// here in full, and is the single statement of it: the Unsupervised
+    /// Engine parses the definition against this text, review-web validates
+    /// it against it, and Clumit Security Web writes it against it.
+    ///
+    /// Every table refuses unknown keys, so a key not listed below is
+    /// refused, including any path field (a `local` input, `export_path`,
+    /// `log_path`, `[auth]` or `[review]`). The definition carries no `name`
+    /// key: the name of the model is [`model`](Self::model) only.
+    ///
+    /// ```toml
+    /// event_kind = "http"                            # required; Giganto event kind (string)
+    /// method = "multidimension"                      # required; "multidimension" | "prefix" | "timeseries"
+    /// sources = ["piglet.node2.example.com"]         # required; non-empty array of strings, no repeats
+    /// window_start = "2026-10-14T00:00:00Z"          # required; RFC 3339 with offset; inclusive
+    /// window_end = "2026-10-21T00:00:00Z"            # required; RFC 3339 with offset; exclusive; after window_start
+    /// batch_size = 1000000                           # optional usize; default 1000000 (total events read)
+    /// algorithm = "dbscan"                           # optional; "dbscan" | "hdbscan" | "optics"; default "dbscan"
+    /// eps = 2.0                                      # optional f64; default 2.0
+    /// min_token_length = 3                           # optional usize; default 3
+    /// max_token_length = 10                          # optional usize; no default; ignored with a warning when < 2 * min_token_length
+    /// max_data_len = 30                              # optional usize; no default
+    /// long_pattern_len = 16000                       # optional usize; default 16000
+    /// precision = 2                                  # optional i32; default 2 (DEFAULT_PRECISION)
+    /// numbers_of_top_n = [30, 30]                    # optional array of usize; default []
+    /// max_event_id_num = 25                          # optional u32; default 25; capped at 100
+    /// suspicious_tokens = "indicator-name"           # optional; an indicator NAME, never a path
+    ///
+    /// [data_store]                                   # required
+    /// address = "10.0.0.5:38371"                     # socket address "ip:port"
+    /// server_name = "001.giganto.node1.example.com"
+    ///
+    /// [csv]                                          # required when method = "multidimension"; refused otherwise
+    /// reader = { delimiter = 9, quote = 0 }          # optional; both u8 keys required when present; default { delimiter = 44, quote = 34 }
+    /// format = [                                     # optional array; one entry per column, in column order
+    ///   { data_type = "utf8", weight = 0.0, name = "time" },
+    ///   { data_type = "utf8", weight = 1.0, name = "host" },
+    /// ]                                              # data_type: "int64" | "float64" | "datetime" | "ipaddr" | "enum" | "utf8" | "binary"; weight: f64, required; name: optional string; format: optional string (a datetime parse format)
+    /// time_intervals = [60]                          # optional array of u32 (seconds)
+    /// time_column = 0                                # optional usize
+    /// count_columns = [0]                            # optional array of usize
+    /// prefix_columns = [14, 15]                      # optional array of usize
+    /// ```
+    ///
+    /// - `[csv]` is exactly `crate::remake::csv::Config` (columns
+    ///   `ColumnDescription`, `reader` = `structured::csv::Config`,
+    ///   `data_type` = `structured::ColumnType`), with `deny_unknown_fields`
+    ///   added.
+    /// - The defaults are the engine's and equal RFC 0006 §5.5's.
+    /// - `event_type` is derived from `method` as in E1 (multidimension →
+    ///   `csv`, prefix → `log`, timeseries → `timeseries`).
+    /// - The engine refuses a definition that does not parse, has empty
+    ///   `sources`, repeats a source in `sources`, has `window_end` not after
+    ///   `window_start`, has `method = "multidimension"` without `[csv]`, or
+    ///   has `[csv]` with another method. Other bounds (§5.2) are
+    ///   review-web's.
+    pub definition: String,
+}
+
+/// A request to an Unsupervised Engine to clone a model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneModelRequest {
+    /// The identifier the Central Manager issued for this run.
+    pub run_id: u32,
+    /// The name of the model to clone.
+    pub source: String,
+    /// The name of the clone.
+    pub target_name: String,
+    /// Whether the engine drops every stored event from the clone, as it
+    /// must for a clone to another customer.
+    pub strip_events: bool,
+}
+
+/// The state of a run, as an Unsupervised Engine reports it.
+///
+/// There is no succeeded state: the Central Manager ends a run as succeeded
+/// itself when it accepts the run's model upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReportedRunState {
+    /// The engine started the run.
+    Started,
+    /// The run failed.
+    Failed,
+    /// The run was cancelled.
+    Cancelled,
+}
+
+/// The status of a detector of an Unsupervised Engine.
+///
+/// The engine reports it after every round and whenever it loads a
+/// configuration document.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectorStatusReport {
+    /// The `id` of the detector's `[[detectors]]` entry in the engine's
+    /// configuration document.
+    pub detector_id: i32,
+    /// Why the detector does or does not run.
+    pub state: DetectorState,
+    /// When the last round ended, in nanoseconds since the Unix epoch;
+    /// `None` before the detector's first round.
+    pub finished_at: Option<i64>,
+    /// The outcome of the last round; `None` before the detector's first
+    /// round.
+    pub outcome: Option<RoundOutcome>,
+    /// The failure reason of the last round.
+    pub reason: Option<String>,
+    /// The number of events the last round analysed.
+    pub events: u64,
+    /// The state of each of the detector's sources in the last round.
+    pub sources: Vec<SourceStatus>,
+}
+
+/// Why a detector does or does not run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetectorState {
+    /// The detector is scheduled and runs its rounds.
+    Running,
+    /// The detector is disabled.
+    Disabled,
+    /// The detector has no model to run.
+    NoModel,
+    /// The detector is paused for a run of its model.
+    PausedForRun,
+}
+
+/// The outcome of a detector's round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoundOutcome {
+    /// The round succeeded.
+    Succeeded,
+    /// The round failed; the report's `reason` says why.
+    Failed,
+}
+
+/// The state of one of a detector's sources in a round.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceStatus {
+    /// The source's name.
+    pub source: String,
+    /// The source's state in the round.
+    pub state: SourceState,
+    /// Why the source failed, when it did.
+    pub reason: Option<String>,
+}
+
+/// The state of a detector's source in a round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceState {
+    /// A Data Store node served the source's events.
+    Served,
+    /// No Data Store node served the source; the round goes on and the
+    /// source keeps its read position.
+    ServedByNoNode,
+    /// Reading the source's events failed, which fails the round.
+    Failed,
+}
+
 /// The data source key, either a numeric ID or a name.
 #[derive(Debug, Deserialize, Serialize)]
 pub enum DataSourceKey<'a> {

@@ -129,6 +129,22 @@ pub(crate) enum RequestCode {
     /// Node service-enrollment family.
     NodeEnroll = 110,
 
+    // ── Unsupervised Engine request codes ──────────────────────
+    //
+    // Non-node codes, numbered after `DeleteCustomerData`. They are
+    // declared last so that no existing variant moves.
+    /// Start a training run on an Unsupervised Engine
+    TrainModel = 23,
+
+    /// Start a clone run on an Unsupervised Engine
+    CloneModel = 24,
+
+    /// Cancel a run on an Unsupervised Engine
+    CancelRun = 25,
+
+    /// Run one round of an Unsupervised Engine detector now
+    RunDetectorOnce = 26,
+
     /// Unknown request
     #[num_enum(default)]
     Unknown = u32::MAX,
