@@ -1934,6 +1934,34 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "server")]
+    async fn node_time_sync_status_success_roundtrip() {
+        use crate::types::node::{NodeTimeSyncRequest, NodeTimeSyncResponse};
+        node_success_roundtrip(
+            RequestCode::NodeTimeSync,
+            NodeTimeSyncRequest::Status,
+            NodeTimeSyncResponse::Status {
+                enabled: true,
+                synchronized: true,
+                server: Some("cm.example.com".into()),
+                offset_micros: Some(-1_234),
+            },
+        )
+        .await;
+        node_success_roundtrip(
+            RequestCode::NodeTimeSync,
+            NodeTimeSyncRequest::Status,
+            NodeTimeSyncResponse::Status {
+                enabled: false,
+                synchronized: false,
+                server: None,
+                offset_micros: None,
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "server")]
     async fn node_logging_success_roundtrip() {
         use crate::types::node::{
             NodeLoggingEndpoint, NodeLoggingProtocol, NodeLoggingRequest, NodeLoggingResponse,
