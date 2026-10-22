@@ -458,7 +458,12 @@ impl ConnectionBuilder {
 
         const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
-        let tls_cfg = rustls::ClientConfig::builder()
+        // The provider is explicit so the endpoint does not depend on which
+        // providers the application compiles in or installs as the default.
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let tls_cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
             .with_root_certificates(self.roots.clone())
             .with_client_auth_cert(self.certs.clone(), self.key.clone_key())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
