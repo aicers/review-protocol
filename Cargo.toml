@@ -47,7 +47,7 @@ quinn = { version = "0.11", default-features = false, features = [
   "bloom",
 ], optional = true }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"], optional = true }
-rustls = { version = "0.23", default-features = false, optional = true }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
 semver = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -66,7 +66,10 @@ quinn = { version = "0.11", default-features = false, features = [
   "bloom",
 ] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
-rustls = { version = "0.23", default-features = false, features = ["std"] }
+# Deliberately compiles a second rustls provider (ring) into test builds, so
+# `build_endpoint` is tested the way applications such as roxyd and piglet
+# build it. Do not remove it.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"
 tokio = { version = "1", features = ["macros", "rt"] }
 tokio-test = "0.4.4"

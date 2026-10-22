@@ -19,6 +19,14 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   `PROTOCOL_VERSION` and `MIN_PROTOCOL_VERSION_REQ` are unchanged and no
   capability tag guards the change. `NodeTimeSyncRequest` and the other
   response variants are unchanged.
+- The crypto backend of the QUIC transport, certificate generation and
+  `oinq` is aws-lc-rs instead of ring.
+- The client endpoint now always uses the aws-lc-rs rustls provider,
+  whatever providers the application compiles in or installs as the
+  process-level default. It previously used the process-level default and
+  panicked ("Could not automatically determine the process-level
+  CryptoProvider") when none was installed and more than one provider was
+  compiled in.
 
 ### Fixed
 
