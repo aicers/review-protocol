@@ -278,6 +278,10 @@ pub(crate) enum RequestCode {
     UpdateHostOsAgents = 38,
     GetSamplingPolicyList = 39,
     ReportCustomerDataDeletion = 40,
+    UploadRunModel = 41,
+    ReportRun = 42,
+    ReportActiveRuns = 43,
+    ReportDetectorStatus = 44,
 
     /// Unknown request
     #[num_enum(default)]
@@ -297,6 +301,21 @@ mod request_code_tests {
             RequestCode::from_primitive(40),
             RequestCode::ReportCustomerDataDeletion
         );
+    }
+
+    #[test]
+    fn unsupervised_engine_report_codes() {
+        let cases = [
+            (RequestCode::UploadRunModel, 41),
+            (RequestCode::ReportRun, 42),
+            (RequestCode::ReportActiveRuns, 43),
+            (RequestCode::ReportDetectorStatus, 44),
+        ];
+        for (code, num) in cases {
+            assert_eq!(u32::from(code), num);
+            assert_eq!(RequestCode::from_primitive(num), code);
+        }
+        assert_eq!(RequestCode::from_primitive(45), RequestCode::Unknown);
     }
 }
 

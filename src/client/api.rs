@@ -9,7 +9,10 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::Connection;
 use crate::{
     server,
-    types::{DataSource, DataSourceKey, HostNetworkGroup, SamplingPolicy, UserAgent},
+    types::{
+        DataSource, DataSourceKey, DetectorStatusReport, HostNetworkGroup, ReportedRunState,
+        SamplingPolicy, UserAgent,
+    },
     unary_request,
 };
 
@@ -31,6 +34,63 @@ impl Connection {
             report,
         )
         .await?;
+        res.map_err(io::Error::other)
+    }
+
+    /// Uploads the model a run produced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the response is invalid, or the
+    /// server rejects the upload.
+    pub async fn upload_run_model(&self, run_id: u32, model: &[u8]) -> io::Result<()> {
+        let res: Result<(), String> =
+            request(self, server::RequestCode::UploadRunModel, (run_id, model)).await?;
+        res.map_err(io::Error::other)
+    }
+
+    /// Reports the state of a run, with the reason for it if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the response is invalid, or the
+    /// server rejects the report.
+    pub async fn report_run(
+        &self,
+        run_id: u32,
+        state: ReportedRunState,
+        reason: Option<&str>,
+    ) -> io::Result<()> {
+        let res: Result<(), String> = request(
+            self,
+            server::RequestCode::ReportRun,
+            (run_id, state, reason),
+        )
+        .await?;
+        res.map_err(io::Error::other)
+    }
+
+    /// Reports the identifiers of the runs the engine still has.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the response is invalid, or the
+    /// server rejects the report.
+    pub async fn report_active_runs(&self, run_ids: &[u32]) -> io::Result<()> {
+        let res: Result<(), String> =
+            request(self, server::RequestCode::ReportActiveRuns, run_ids).await?;
+        res.map_err(io::Error::other)
+    }
+
+    /// Reports the status of a detector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the response is invalid, or the
+    /// server rejects the report.
+    pub async fn report_detector_status(&self, report: &DetectorStatusReport) -> io::Result<()> {
+        let res: Result<(), String> =
+            request(self, server::RequestCode::ReportDetectorStatus, report).await?;
         res.map_err(io::Error::other)
     }
 
@@ -428,10 +488,13 @@ mod tests {
 
     use crate::{
         server::handle,
-        test::{TEST_ENV, TestServerHandler},
+        test::{
+            ACTIVE_RUN_IDS, REJECTED_DETECTOR_ID, REJECTED_RUN_ID, RUN_ID, RUN_MODEL, RUN_REPORTS,
+            TEST_ENV, TestServerHandler, detector_status_reports,
+        },
         types::{
             CustomerDataDeletionOutcome, CustomerDataDeletionReport, CustomerDataDeletionReporter,
-            DataSourceKey,
+            DataSourceKey, DetectorState, DetectorStatusReport, ReportedRunState,
         },
     };
 
@@ -508,6 +571,114 @@ mod tests {
             };
             let error = client_conn
                 .report_customer_data_deletion(&report)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "report rejected");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upload_run_model_returns_handler_ok() {
+        run_test(|client_conn| async move {
+            assert!(
+                client_conn
+                    .upload_run_model(RUN_ID, RUN_MODEL)
+                    .await
+                    .is_ok()
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upload_run_model_converts_handler_error() {
+        run_test(|client_conn| async move {
+            let error = client_conn
+                .upload_run_model(REJECTED_RUN_ID, RUN_MODEL)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "report rejected");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn report_run_returns_handler_ok() {
+        for &(run_id, state, reason) in RUN_REPORTS {
+            run_test(|client_conn| async move {
+                assert!(
+                    client_conn.report_run(run_id, state, reason).await.is_ok(),
+                    "run report ({run_id}, {state:?}, {reason:?}) should arrive intact"
+                );
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn report_run_converts_handler_error() {
+        run_test(|client_conn| async move {
+            let error = client_conn
+                .report_run(REJECTED_RUN_ID, ReportedRunState::Failed, Some("failed"))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "report rejected");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn report_active_runs_returns_handler_ok() {
+        run_test(|client_conn| async move {
+            assert!(client_conn.report_active_runs(ACTIVE_RUN_IDS).await.is_ok());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn report_active_runs_converts_handler_error() {
+        run_test(|client_conn| async move {
+            let error = client_conn
+                .report_active_runs(&[RUN_ID, REJECTED_RUN_ID])
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "report rejected");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn report_detector_status_returns_handler_ok() {
+        for report in detector_status_reports() {
+            run_test(|client_conn| async move {
+                assert!(
+                    client_conn.report_detector_status(&report).await.is_ok(),
+                    "detector status report {report:?} should arrive intact"
+                );
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn report_detector_status_converts_handler_error() {
+        run_test(|client_conn| async move {
+            let report = DetectorStatusReport {
+                detector_id: REJECTED_DETECTOR_ID,
+                state: DetectorState::Running,
+                finished_at: None,
+                outcome: None,
+                reason: None,
+                events: 0,
+                sources: Vec::new(),
+            };
+            let error = client_conn
+                .report_detector_status(&report)
                 .await
                 .unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::Other);

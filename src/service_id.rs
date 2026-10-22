@@ -327,6 +327,15 @@ pub const COMMON_SEMI_SUPERVISED_MODELS: ServiceId =
     ServiceId::new("common", "semi_supervised_models");
 pub const COMMON_RENEW_CERTIFICATE: ServiceId = ServiceId::new("common", "renew_certificate");
 
+// ── engine ─────────────────────────────────────────────────────
+//
+// Requests the Central Manager sends an Unsupervised Engine.
+
+pub const ENGINE_TRAIN_MODEL: ServiceId = ServiceId::new("engine", "train_model");
+pub const ENGINE_CLONE_MODEL: ServiceId = ServiceId::new("engine", "clone_model");
+pub const ENGINE_CANCEL_RUN: ServiceId = ServiceId::new("engine", "cancel_run");
+pub const ENGINE_RUN_DETECTOR_ONCE: ServiceId = ServiceId::new("engine", "run_detector_once");
+
 // ── server.data_source ────────────────────────────────────────
 
 pub const SERVER_DATA_SOURCE_GET: ServiceId = ServiceId::new("server.data_source", "get");
@@ -406,6 +415,17 @@ pub const SERVER_LIST_SAMPLING_POLICY: ServiceId = ServiceId::new("server.list",
 
 pub const SERVER_CUSTOMER_DATA_DELETION_REPORT: ServiceId =
     ServiceId::new("server.customer_data_deletion", "report");
+
+// ── server.run ────────────────────────────────────────────────
+
+pub const SERVER_RUN_UPLOAD_MODEL: ServiceId = ServiceId::new("server.run", "upload_model");
+pub const SERVER_RUN_REPORT: ServiceId = ServiceId::new("server.run", "report");
+pub const SERVER_RUN_REPORT_ACTIVE: ServiceId = ServiceId::new("server.run", "report_active");
+
+// ── server.detector ───────────────────────────────────────────
+
+pub const SERVER_DETECTOR_REPORT_STATUS: ServiceId =
+    ServiceId::new("server.detector", "report_status");
 
 // ── Node request → method-level ServiceId ──────────────────────
 //
@@ -622,6 +642,12 @@ pub(crate) fn from_client_request_code(code: ClientRequestCode) -> Option<Servic
         ClientRequestCode::NodePackage => Some(NODE_PACKAGE),
         ClientRequestCode::NodeEnroll => Some(NODE_ENROLL),
 
+        // Unsupervised Engine codes.
+        ClientRequestCode::TrainModel => Some(ENGINE_TRAIN_MODEL),
+        ClientRequestCode::CloneModel => Some(ENGINE_CLONE_MODEL),
+        ClientRequestCode::CancelRun => Some(ENGINE_CANCEL_RUN),
+        ClientRequestCode::RunDetectorOnce => Some(ENGINE_RUN_DETECTOR_ONCE),
+
         ClientRequestCode::Unknown => None,
     }
 }
@@ -668,6 +694,10 @@ pub(crate) fn from_server_request_code(code: ServerRequestCode) -> Option<Servic
         ServerRequestCode::GetTrustedUserAgentList => Some(SERVER_LIST_TRUSTED_USER_AGENT),
         ServerRequestCode::GetSamplingPolicyList => Some(SERVER_LIST_SAMPLING_POLICY),
         ServerRequestCode::ReportCustomerDataDeletion => Some(SERVER_CUSTOMER_DATA_DELETION_REPORT),
+        ServerRequestCode::UploadRunModel => Some(SERVER_RUN_UPLOAD_MODEL),
+        ServerRequestCode::ReportRun => Some(SERVER_RUN_REPORT),
+        ServerRequestCode::ReportActiveRuns => Some(SERVER_RUN_REPORT_ACTIVE),
+        ServerRequestCode::ReportDetectorStatus => Some(SERVER_DETECTOR_REPORT_STATUS),
         ServerRequestCode::Unknown => None,
     }
 }
@@ -773,8 +803,19 @@ pub fn all() -> &'static [ServiceId] {
         COMMON_TRUSTED_USER_AGENT_LIST,
         COMMON_SEMI_SUPERVISED_MODELS,
         COMMON_RENEW_CERTIFICATE,
+        // engine
+        ENGINE_TRAIN_MODEL,
+        ENGINE_CLONE_MODEL,
+        ENGINE_CANCEL_RUN,
+        ENGINE_RUN_DETECTOR_ONCE,
         // server.customer_data_deletion
         SERVER_CUSTOMER_DATA_DELETION_REPORT,
+        // server.run
+        SERVER_RUN_UPLOAD_MODEL,
+        SERVER_RUN_REPORT,
+        SERVER_RUN_REPORT_ACTIVE,
+        // server.detector
+        SERVER_DETECTOR_REPORT_STATUS,
         // server.data_source
         SERVER_DATA_SOURCE_GET,
         SERVER_DATA_SOURCE_LIST,
@@ -1011,6 +1052,10 @@ mod tests {
             ClientRequestCode::NodeVersion,
             ClientRequestCode::NodePackage,
             ClientRequestCode::NodeEnroll,
+            ClientRequestCode::TrainModel,
+            ClientRequestCode::CloneModel,
+            ClientRequestCode::CancelRun,
+            ClientRequestCode::RunDetectorOnce,
         ];
         for &code in codes {
             assert!(
@@ -1056,6 +1101,10 @@ mod tests {
             ServerRequestCode::UpdateHostOsAgents,
             ServerRequestCode::GetSamplingPolicyList,
             ServerRequestCode::ReportCustomerDataDeletion,
+            ServerRequestCode::UploadRunModel,
+            ServerRequestCode::ReportRun,
+            ServerRequestCode::ReportActiveRuns,
+            ServerRequestCode::ReportDetectorStatus,
         ];
         for &code in codes {
             assert!(
@@ -1125,6 +1174,60 @@ mod tests {
         assert!(ids.contains(&SERVER_MODEL_GET));
         assert!(ids.contains(&SERVER_DATA_SOURCE_LIST));
         assert!(ids.contains(&SERVER_CUSTOMER_DATA_DELETION_REPORT));
+        // Unsupervised Engine
+        assert!(ids.contains(&ENGINE_TRAIN_MODEL));
+        assert!(ids.contains(&SERVER_RUN_UPLOAD_MODEL));
+        assert!(ids.contains(&SERVER_DETECTOR_REPORT_STATUS));
+    }
+
+    #[test]
+    fn unsupervised_engine_request_codes_map_to_their_ids() {
+        let client_cases = [
+            (ClientRequestCode::TrainModel, ENGINE_TRAIN_MODEL),
+            (ClientRequestCode::CloneModel, ENGINE_CLONE_MODEL),
+            (ClientRequestCode::CancelRun, ENGINE_CANCEL_RUN),
+            (ClientRequestCode::RunDetectorOnce, ENGINE_RUN_DETECTOR_ONCE),
+        ];
+        for (code, id) in client_cases {
+            assert_eq!(from_client_request_code(code), Some(id));
+            assert!(all().contains(&id));
+        }
+        let server_cases = [
+            (ServerRequestCode::UploadRunModel, SERVER_RUN_UPLOAD_MODEL),
+            (ServerRequestCode::ReportRun, SERVER_RUN_REPORT),
+            (
+                ServerRequestCode::ReportActiveRuns,
+                SERVER_RUN_REPORT_ACTIVE,
+            ),
+            (
+                ServerRequestCode::ReportDetectorStatus,
+                SERVER_DETECTOR_REPORT_STATUS,
+            ),
+        ];
+        for (code, id) in server_cases {
+            assert_eq!(from_server_request_code(code), Some(id));
+            assert!(all().contains(&id));
+        }
+        assert_eq!(ENGINE_TRAIN_MODEL.to_string(), "engine.train_model");
+        assert_eq!(ENGINE_CLONE_MODEL.to_string(), "engine.clone_model");
+        assert_eq!(ENGINE_CANCEL_RUN.to_string(), "engine.cancel_run");
+        assert_eq!(
+            ENGINE_RUN_DETECTOR_ONCE.to_string(),
+            "engine.run_detector_once"
+        );
+        assert_eq!(
+            SERVER_RUN_UPLOAD_MODEL.to_string(),
+            "server.run.upload_model"
+        );
+        assert_eq!(SERVER_RUN_REPORT.to_string(), "server.run.report");
+        assert_eq!(
+            SERVER_RUN_REPORT_ACTIVE.to_string(),
+            "server.run.report_active"
+        );
+        assert_eq!(
+            SERVER_DETECTOR_REPORT_STATUS.to_string(),
+            "server.detector.report_status"
+        );
     }
 
     #[test]

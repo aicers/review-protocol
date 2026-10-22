@@ -34,9 +34,9 @@ use oinq::request::parse_args;
 use super::RequestCode;
 use crate::protocol_error::{DispatchError, ProtocolErrorKind};
 use crate::types::{
-    ColumnStatisticsUpdate, CustomerDataDeletionReport, DataSource, DataSourceKey, EventMessage,
-    HostNetworkGroup, LabelDb, OutlierInfo, SamplingPolicy, TimeSeriesUpdate, UpdateClusterRequest,
-    UserAgent,
+    ColumnStatisticsUpdate, CustomerDataDeletionReport, DataSource, DataSourceKey,
+    DetectorStatusReport, EventMessage, HostNetworkGroup, LabelDb, OutlierInfo, ReportedRunState,
+    SamplingPolicy, TimeSeriesUpdate, UpdateClusterRequest, UserAgent,
 };
 
 /// A request handler that can handle a request to the server.
@@ -195,6 +195,62 @@ pub trait Handler {
         &self,
         _peer: &str,
         _hosts: &[(IpAddr, Vec<UserAgent>, Vec<String>)],
+    ) -> Result<(), String> {
+        Err("not supported".to_string())
+    }
+
+    /// Accepts the model a run of the Unsupervised Engine `peer` produced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or the
+    /// Central Manager refuses it.
+    async fn upload_run_model(
+        &self,
+        _peer: &str,
+        _run_id: u32,
+        _model: &[u8],
+    ) -> Result<(), String> {
+        Err("not supported".to_string())
+    }
+
+    /// Records the state the Unsupervised Engine `peer` reports for a run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or the
+    /// Central Manager refuses it.
+    async fn report_run(
+        &self,
+        _peer: &str,
+        _run_id: u32,
+        _state: ReportedRunState,
+        _reason: Option<&str>,
+    ) -> Result<(), String> {
+        Err("not supported".to_string())
+    }
+
+    /// Records the runs the Unsupervised Engine `peer` still has.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or the
+    /// Central Manager refuses it.
+    async fn report_active_runs(&self, _peer: &str, _run_ids: &[u32]) -> Result<(), String> {
+        Err("not supported".to_string())
+    }
+
+    /// Records the status the Unsupervised Engine `peer` reports for a
+    /// detector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or the
+    /// Central Manager refuses it.
+    async fn report_detector_status(
+        &self,
+        _peer: &str,
+        _report: &DetectorStatusReport,
     ) -> Result<(), String> {
         Err("not supported".to_string())
     }
@@ -445,6 +501,27 @@ where
                 let result = handler.update_host_user_agents(peer_name, &hosts).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
+            RequestCode::UploadRunModel => {
+                let (run_id, model) = parse_args::<(u32, Vec<u8>)>(body)?;
+                let result = handler.upload_run_model(peer_name, run_id, &model).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportRun => {
+                let (run_id, state, reason) =
+                    parse_args::<(u32, ReportedRunState, Option<&str>)>(body)?;
+                let result = handler.report_run(peer_name, run_id, state, reason).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportActiveRuns => {
+                let run_ids = parse_args::<Vec<u32>>(body)?;
+                let result = handler.report_active_runs(peer_name, &run_ids).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportDetectorStatus => {
+                let report = parse_args::<DetectorStatusReport>(body)?;
+                let result = handler.report_detector_status(peer_name, &report).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
             RequestCode::Unknown => {
                 oinq::frame::send(
                     send,
@@ -683,6 +760,27 @@ where
                 let result = handler.update_host_user_agents(peer_name, &hosts).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
+            RequestCode::UploadRunModel => {
+                let (run_id, model) = parse_args::<(u32, Vec<u8>)>(body)?;
+                let result = handler.upload_run_model(peer_name, run_id, &model).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportRun => {
+                let (run_id, state, reason) =
+                    parse_args::<(u32, ReportedRunState, Option<&str>)>(body)?;
+                let result = handler.report_run(peer_name, run_id, state, reason).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportActiveRuns => {
+                let run_ids = parse_args::<Vec<u32>>(body)?;
+                let result = handler.report_active_runs(peer_name, &run_ids).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportDetectorStatus => {
+                let report = parse_args::<DetectorStatusReport>(body)?;
+                let result = handler.report_detector_status(peer_name, &report).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
             RequestCode::Unknown => {
                 oinq::frame::send(
                     send,
@@ -876,6 +974,286 @@ mod tests {
         drop(client_recv);
         let _ = server_task.await.unwrap();
         assert_eq!(*reports.lock().unwrap(), vec![report]);
+    }
+
+    /// A request from an Unsupervised Engine, as the server handler
+    /// received it, with the caller's peer name.
+    #[derive(Debug, PartialEq)]
+    enum EngineReport {
+        UploadRunModel(String, u32, Vec<u8>),
+        ReportRun(String, u32, ReportedRunState, Option<String>),
+        ReportActiveRuns(String, Vec<u32>),
+        ReportDetectorStatus(String, DetectorStatusReport),
+    }
+
+    struct EngineReportHandler {
+        received: Arc<Mutex<Vec<EngineReport>>>,
+        response: Result<(), String>,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for EngineReportHandler {
+        async fn upload_run_model(
+            &self,
+            peer: &str,
+            run_id: u32,
+            model: &[u8],
+        ) -> Result<(), String> {
+            self.received
+                .lock()
+                .unwrap()
+                .push(EngineReport::UploadRunModel(
+                    peer.to_string(),
+                    run_id,
+                    model.to_vec(),
+                ));
+            self.response.clone()
+        }
+
+        async fn report_run(
+            &self,
+            peer: &str,
+            run_id: u32,
+            state: ReportedRunState,
+            reason: Option<&str>,
+        ) -> Result<(), String> {
+            self.received.lock().unwrap().push(EngineReport::ReportRun(
+                peer.to_string(),
+                run_id,
+                state,
+                reason.map(str::to_string),
+            ));
+            self.response.clone()
+        }
+
+        async fn report_active_runs(&self, peer: &str, run_ids: &[u32]) -> Result<(), String> {
+            self.received
+                .lock()
+                .unwrap()
+                .push(EngineReport::ReportActiveRuns(
+                    peer.to_string(),
+                    run_ids.to_vec(),
+                ));
+            self.response.clone()
+        }
+
+        async fn report_detector_status(
+            &self,
+            peer: &str,
+            report: &DetectorStatusReport,
+        ) -> Result<(), String> {
+            self.received
+                .lock()
+                .unwrap()
+                .push(EngineReport::ReportDetectorStatus(
+                    peer.to_string(),
+                    report.clone(),
+                ));
+            self.response.clone()
+        }
+    }
+
+    /// Sends each Unsupervised Engine request once over `client_send`,
+    /// asserting every answer equals `expected`, and returns what the
+    /// handler should have received from `peer`.
+    async fn send_engine_reports(
+        client_send: &mut quinn::SendStream,
+        client_recv: &mut quinn::RecvStream,
+        peer: &str,
+        expected: &Result<(), String>,
+    ) -> Vec<EngineReport> {
+        let model = vec![0x00, 0x7f, 0xff];
+        let response: Result<(), String> = crate::unary_request(
+            client_send,
+            client_recv,
+            u32::from(RequestCode::UploadRunModel),
+            (7_u32, model.as_slice()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(&response, expected);
+
+        let response: Result<(), String> = crate::unary_request(
+            client_send,
+            client_recv,
+            u32::from(RequestCode::ReportRun),
+            (7_u32, ReportedRunState::Failed, Some("training failed")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(&response, expected);
+
+        let run_ids = vec![7, 8, u32::MAX];
+        let response: Result<(), String> = crate::unary_request(
+            client_send,
+            client_recv,
+            u32::from(RequestCode::ReportActiveRuns),
+            run_ids.as_slice(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(&response, expected);
+
+        let reports = crate::test::detector_status_reports();
+        for report in &reports {
+            let response: Result<(), String> = crate::unary_request(
+                client_send,
+                client_recv,
+                u32::from(RequestCode::ReportDetectorStatus),
+                report,
+            )
+            .await
+            .unwrap();
+            assert_eq!(&response, expected);
+        }
+
+        let mut sent = vec![
+            EngineReport::UploadRunModel(peer.to_string(), 7, model),
+            EngineReport::ReportRun(
+                peer.to_string(),
+                7,
+                ReportedRunState::Failed,
+                Some("training failed".to_string()),
+            ),
+            EngineReport::ReportActiveRuns(peer.to_string(), run_ids),
+        ];
+        sent.extend(
+            reports
+                .into_iter()
+                .map(|report| EngineReport::ReportDetectorStatus(peer.to_string(), report)),
+        );
+        sent
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn engine_reports_default_is_not_supported() {
+        struct DefaultHandler;
+        impl Handler for DefaultHandler {}
+
+        let report = crate::test::detector_status_reports().remove(0);
+        let not_supported = Err("not supported".to_string());
+        assert_eq!(
+            DefaultHandler.upload_run_model("peer", 7, &[1]).await,
+            not_supported
+        );
+        assert_eq!(
+            DefaultHandler
+                .report_run("peer", 7, ReportedRunState::Started, None)
+                .await,
+            not_supported
+        );
+        assert_eq!(
+            DefaultHandler.report_active_runs("peer", &[7]).await,
+            not_supported
+        );
+        assert_eq!(
+            DefaultHandler.report_detector_status("peer", &report).await,
+            not_supported
+        );
+
+        // The default answer also reaches the engine over the wire.
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+        let server_task = tokio::spawn(async move {
+            super::handle(
+                &mut DefaultHandler,
+                &mut server_send,
+                &mut server_recv,
+                "test-peer",
+            )
+            .await
+        });
+        send_engine_reports(
+            &mut client_send,
+            &mut client_recv,
+            "test-peer",
+            &not_supported,
+        )
+        .await;
+        drop(client_send);
+        drop(client_recv);
+        assert!(server_task.await.unwrap().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn authorized_dispatches_engine_reports_with_peer() {
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let mut handler = EngineReportHandler {
+            received: Arc::clone(&received),
+            response: Ok(()),
+        };
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+        let peer = crate::auth::PeerContext::new("engine.example.test");
+
+        let server_task = tokio::spawn(async move {
+            super::handle_authorized(
+                &mut handler,
+                &mut server_send,
+                &mut server_recv,
+                &peer,
+                &crate::auth::NoopAuthorizer,
+            )
+            .await
+        });
+        let expected = send_engine_reports(
+            &mut client_send,
+            &mut client_recv,
+            "engine.example.test",
+            &Ok(()),
+        )
+        .await;
+
+        drop(client_send);
+        drop(client_recv);
+        assert!(server_task.await.unwrap().unwrap().is_none());
+        assert_eq!(*received.lock().unwrap(), expected);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn authorized_with_context_dispatches_engine_reports_and_returns_handler_error() {
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let mut handler = EngineReportHandler {
+            received: Arc::clone(&received),
+            response: Err("run 7 is not active".to_string()),
+        };
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+        let peer = crate::auth::PeerContext::new("engine.example.test");
+        let auth_ctx = crate::auth::AuthorizationContext::from_peer_context(&peer);
+        let authorizer = crate::auth::AuthorizerV2Adapter::new(crate::auth::NoopAuthorizer);
+
+        let server_task = tokio::spawn(async move {
+            super::handle_authorized_with_context(
+                &mut handler,
+                &mut server_send,
+                &mut server_recv,
+                &auth_ctx,
+                &authorizer,
+            )
+            .await
+        });
+        let expected = send_engine_reports(
+            &mut client_send,
+            &mut client_recv,
+            "engine.example.test",
+            &Err("run 7 is not active".to_string()),
+        )
+        .await;
+
+        drop(client_send);
+        drop(client_recv);
+        assert!(server_task.await.unwrap().unwrap().is_none());
+        assert_eq!(*received.lock().unwrap(), expected);
     }
 
     #[tokio::test]

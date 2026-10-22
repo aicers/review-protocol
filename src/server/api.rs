@@ -7,7 +7,8 @@ use super::node::{InstallOutcome, NodePowerOutcome, TerminalPreflight};
 use crate::{
     client,
     types::{
-        CustomerDataDeletionRequest, HostNetworkGroup, SamplingPolicy, TrafficFilterRule,
+        CloneModelRequest, CustomerDataDeletionRequest, HostNetworkGroup, SamplingPolicy,
+        TrafficFilterRule, TrainModelRequest,
         node::{
             InstallPreflight, NodeEnrollRequest, NodeEnrollResponse, NodeHostnameRequest,
             NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
@@ -123,6 +124,74 @@ impl Connection {
         request: &CustomerDataDeletionRequest,
     ) -> anyhow::Result<()> {
         self.send_request(client::RequestCode::DeleteCustomerData, request)
+            .await
+    }
+
+    /// Asks an Unsupervised Engine to start the training run the request
+    /// describes.
+    ///
+    /// `Ok(())` means the engine accepted the request; the run's later
+    /// states arrive as run reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine refuses the request, or if encoding
+    /// the request, opening the stream, sending the request or receiving
+    /// the response fails. Only an engine's refusal downcasts to `String`:
+    /// for it, `err.downcast_ref::<String>()` returns the engine's reason
+    /// unchanged, and for every other failure it returns `None`.
+    pub async fn send_train_model(&self, request: &TrainModelRequest) -> anyhow::Result<()> {
+        self.send_request(client::RequestCode::TrainModel, request)
+            .await
+    }
+
+    /// Asks an Unsupervised Engine to start the clone run the request
+    /// describes.
+    ///
+    /// `Ok(())` means the engine accepted the request; the run's later
+    /// states arrive as run reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine refuses the request, or if encoding
+    /// the request, opening the stream, sending the request or receiving
+    /// the response fails. Only an engine's refusal downcasts to `String`:
+    /// for it, `err.downcast_ref::<String>()` returns the engine's reason
+    /// unchanged, and for every other failure it returns `None`.
+    pub async fn send_clone_model(&self, request: &CloneModelRequest) -> anyhow::Result<()> {
+        self.send_request(client::RequestCode::CloneModel, request)
+            .await
+    }
+
+    /// Asks an Unsupervised Engine to cancel the run with the given
+    /// identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine refuses the request, or if encoding
+    /// the request, opening the stream, sending the request or receiving
+    /// the response fails. Only an engine's refusal downcasts to `String`:
+    /// for it, `err.downcast_ref::<String>()` returns the engine's reason
+    /// unchanged, and for every other failure it returns `None`.
+    pub async fn send_cancel_run(&self, run_id: u32) -> anyhow::Result<()> {
+        self.send_request(client::RequestCode::CancelRun, &run_id)
+            .await
+    }
+
+    /// Asks an Unsupervised Engine to run one round of a detector now.
+    ///
+    /// `detector_id` is the `id` of a `[[detectors]]` entry of the engine's
+    /// configuration document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine refuses the request, or if encoding
+    /// the request, opening the stream, sending the request or receiving
+    /// the response fails. Only an engine's refusal downcasts to `String`:
+    /// for it, `err.downcast_ref::<String>()` returns the engine's reason
+    /// unchanged, and for every other failure it returns `None`.
+    pub async fn send_run_detector_once(&self, detector_id: i32) -> anyhow::Result<()> {
+        self.send_request(client::RequestCode::RunDetectorOnce, &detector_id)
             .await
     }
 
@@ -1963,6 +2032,206 @@ mod tests {
         assert!(client_res.is_ok());
 
         test_env.teardown(&server_conn);
+    }
+
+    /// A request to an Unsupervised Engine, as the agent handler received
+    /// it.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[derive(Debug, PartialEq)]
+    enum EngineRequest {
+        TrainModel(super::TrainModelRequest),
+        CloneModel(super::CloneModelRequest),
+        CancelRun(u32),
+        RunDetectorOnce(i32),
+    }
+
+    /// An agent handler that records each Unsupervised Engine request and
+    /// answers it with `answer`.
+    #[cfg(all(feature = "client", feature = "server"))]
+    struct EngineHandler {
+        answer: Result<(), String>,
+        received: Vec<EngineRequest>,
+    }
+
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[async_trait::async_trait]
+    impl crate::request::Handler for EngineHandler {
+        async fn train_model(&mut self, request: &super::TrainModelRequest) -> Result<(), String> {
+            self.received
+                .push(EngineRequest::TrainModel(request.clone()));
+            self.answer.clone()
+        }
+
+        async fn clone_model(&mut self, request: &super::CloneModelRequest) -> Result<(), String> {
+            self.received
+                .push(EngineRequest::CloneModel(request.clone()));
+            self.answer.clone()
+        }
+
+        async fn cancel_run(&mut self, run_id: u32) -> Result<(), String> {
+            self.received.push(EngineRequest::CancelRun(run_id));
+            self.answer.clone()
+        }
+
+        async fn run_detector_once(&mut self, detector_id: i32) -> Result<(), String> {
+            self.received
+                .push(EngineRequest::RunDetectorOnce(detector_id));
+            self.answer.clone()
+        }
+    }
+
+    #[cfg(all(feature = "client", feature = "server"))]
+    fn train_model_request() -> super::TrainModelRequest {
+        super::TrainModelRequest {
+            run_id: 7,
+            model: "http-baseline".to_string(),
+            definition: concat!(
+                "event_kind = \"http\"\n",
+                "method = \"prefix\"\n",
+                "sources = [\"piglet.node2.example.com\"]\n",
+                "window_start = \"2026-10-14T00:00:00Z\"\n",
+                "window_end = \"2026-10-21T00:00:00Z\"\n",
+                "\n",
+                "[data_store]\n",
+                "address = \"10.0.0.5:38371\"\n",
+                "server_name = \"001.giganto.node1.example.com\"\n",
+            )
+            .to_string(),
+        }
+    }
+
+    #[cfg(all(feature = "client", feature = "server"))]
+    fn clone_model_request() -> super::CloneModelRequest {
+        super::CloneModelRequest {
+            run_id: u32::MAX,
+            source: "http-baseline".to_string(),
+            target_name: "http-baseline-copy".to_string(),
+            strip_events: true,
+        }
+    }
+
+    /// Sends each Unsupervised Engine request through `server::Connection`
+    /// to an agent served by `handler`, and returns the results the
+    /// manager saw with the handler afterwards.
+    #[cfg(all(feature = "client", feature = "server"))]
+    async fn engine_requests_roundtrip<H>(mut handler: H) -> (Vec<anyhow::Result<()>>, H)
+    where
+        H: crate::request::Handler + 'static,
+    {
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn) = test_env.setup().await;
+
+        let handler_conn = client_conn.clone();
+        let client_handle = tokio::spawn(async move {
+            // One stream per request.
+            for _ in 0..5 {
+                let (mut send, mut recv) = handler_conn.accept_bi().await.unwrap();
+                crate::request::handle(&mut handler, &mut send, &mut recv)
+                    .await
+                    .unwrap();
+            }
+            handler
+        });
+
+        let results = vec![
+            server_conn.send_train_model(&train_model_request()).await,
+            server_conn.send_clone_model(&clone_model_request()).await,
+            server_conn.send_cancel_run(7).await,
+            server_conn.send_run_detector_once(-3).await,
+            server_conn.send_run_detector_once(i32::MAX).await,
+        ];
+        let handler = client_handle.await.unwrap();
+
+        test_env.teardown(&server_conn);
+        (results, handler)
+    }
+
+    #[cfg(all(feature = "client", feature = "server"))]
+    fn expected_engine_requests() -> Vec<EngineRequest> {
+        vec![
+            EngineRequest::TrainModel(train_model_request()),
+            EngineRequest::CloneModel(clone_model_request()),
+            EngineRequest::CancelRun(7),
+            EngineRequest::RunDetectorOnce(-3),
+            EngineRequest::RunDetectorOnce(i32::MAX),
+        ]
+    }
+
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn send_engine_requests_returns_handler_ok() {
+        let handler = EngineHandler {
+            answer: Ok(()),
+            received: Vec::new(),
+        };
+        let (results, handler) = engine_requests_roundtrip(handler).await;
+
+        for result in results {
+            assert!(result.is_ok(), "unexpected error: {result:?}");
+        }
+        assert_eq!(handler.received, expected_engine_requests());
+    }
+
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn send_engine_requests_returns_handler_error_as_string() {
+        const REASON: &str = "another run is in progress";
+
+        let handler = EngineHandler {
+            answer: Err(REASON.to_string()),
+            received: Vec::new(),
+        };
+        let (results, handler) = engine_requests_roundtrip(handler).await;
+
+        for result in results {
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<String>().map(String::as_str),
+                Some(REASON)
+            );
+        }
+        assert_eq!(handler.received, expected_engine_requests());
+    }
+
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn send_engine_requests_default_not_supported() {
+        struct DefaultHandler;
+
+        #[async_trait::async_trait]
+        impl crate::request::Handler for DefaultHandler {}
+
+        let (results, _) = engine_requests_roundtrip(DefaultHandler).await;
+
+        for result in results {
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<String>().map(String::as_str),
+                Some("not supported")
+            );
+        }
+    }
+
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn send_engine_requests_undelivered_error_is_not_a_string() {
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, _client_conn) = test_env.setup().await;
+        test_env.teardown(&server_conn);
+
+        let results = [
+            server_conn.send_train_model(&train_model_request()).await,
+            server_conn.send_clone_model(&clone_model_request()).await,
+            server_conn.send_cancel_run(7).await,
+            server_conn.send_run_detector_once(-3).await,
+        ];
+        for result in results {
+            let error = result.unwrap_err();
+            assert!(
+                error.downcast_ref::<String>().is_none(),
+                "an undelivered request should not look like an engine's refusal: {error:?}"
+            );
+        }
     }
 
     #[cfg(all(feature = "client", feature = "server"))]

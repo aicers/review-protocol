@@ -49,8 +49,8 @@ use thiserror::Error;
 use crate::{
     client::RequestCode,
     types::{
-        CustomerDataDeletionRequest, HostNetworkGroup, Process, ResourceUsage, SamplingPolicy,
-        TrafficFilterRule,
+        CloneModelRequest, CustomerDataDeletionRequest, HostNetworkGroup, Process, ResourceUsage,
+        SamplingPolicy, TrafficFilterRule, TrainModelRequest,
         node::{
             InstallPreflight, NodeEnrollRequest, NodeEnrollResponse, NodeHostnameRequest,
             NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
@@ -671,6 +671,51 @@ pub trait Handler: Send {
     }
 
     async fn shutdown(&mut self) -> Result<(), String> {
+        return Err("not supported".to_string());
+    }
+
+    // ── Unsupervised Engine methods ────────────────────────────
+    //
+    // `Ok(())` means the engine accepted the request; the run's later
+    // states arrive through `client::Connection::report_run`.
+
+    /// Starts the training run the request describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the engine refuses it.
+    async fn train_model(&mut self, _request: &TrainModelRequest) -> Result<(), String> {
+        return Err("not supported".to_string());
+    }
+
+    /// Starts the clone run the request describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the engine refuses it.
+    async fn clone_model(&mut self, _request: &CloneModelRequest) -> Result<(), String> {
+        return Err("not supported".to_string());
+    }
+
+    /// Cancels the run with the given identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the engine refuses it.
+    async fn cancel_run(&mut self, _run_id: u32) -> Result<(), String> {
+        return Err("not supported".to_string());
+    }
+
+    /// Runs one round of the detector with the given identifier now.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the engine refuses it.
+    async fn run_detector_once(&mut self, _detector_id: i32) -> Result<(), String> {
         return Err("not supported".to_string());
     }
 
@@ -1569,6 +1614,36 @@ pub async fn handle<H: Handler>(
                     .map_err(HandlerError::SendError)?;
             }
 
+            // ── Unsupervised Engine dispatch ───────────────────
+            RequestCode::TrainModel => {
+                let request = decode_args::<TrainModelRequest>(send, code, body, None).await?;
+                let result = handler.train_model(&request).await;
+                send_response(send, &mut buf, result)
+                    .await
+                    .map_err(HandlerError::SendError)?;
+            }
+            RequestCode::CloneModel => {
+                let request = decode_args::<CloneModelRequest>(send, code, body, None).await?;
+                let result = handler.clone_model(&request).await;
+                send_response(send, &mut buf, result)
+                    .await
+                    .map_err(HandlerError::SendError)?;
+            }
+            RequestCode::CancelRun => {
+                let run_id = decode_args::<u32>(send, code, body, None).await?;
+                let result = handler.cancel_run(run_id).await;
+                send_response(send, &mut buf, result)
+                    .await
+                    .map_err(HandlerError::SendError)?;
+            }
+            RequestCode::RunDetectorOnce => {
+                let detector_id = decode_args::<i32>(send, code, body, None).await?;
+                let result = handler.run_detector_once(detector_id).await;
+                send_response(send, &mut buf, result)
+                    .await
+                    .map_err(HandlerError::SendError)?;
+            }
+
             // The fail-closed backstop for a code this build has not
             // assigned. An older binary, whose `RequestCode` has
             // neither a `NodePackage` nor a `NodeEnroll` variant,
@@ -1601,6 +1676,22 @@ mod tests {
         );
     }
 
+    /// The Unsupervised Engine codes take the non-node codes after
+    /// `DeleteCustomerData`.
+    #[test]
+    fn unsupervised_engine_request_codes() {
+        let cases: &[(RequestCode, u32)] = &[
+            (RequestCode::TrainModel, 23),
+            (RequestCode::CloneModel, 24),
+            (RequestCode::CancelRun, 25),
+            (RequestCode::RunDetectorOnce, 26),
+        ];
+        for &(code, num) in cases {
+            assert_eq!(u32::from(code), num);
+            assert_eq!(RequestCode::from_primitive(num), code);
+        }
+    }
+
     /// Verify that every node feature-family request code maps to a
     /// stable numeric value and round-trips through `FromPrimitive`.
     #[test]
@@ -1628,8 +1719,14 @@ mod tests {
     /// (non-node) codes and that unknown values still map to `Unknown`.
     #[test]
     fn node_request_codes_no_collision() {
-        // All existing non-node codes live in 0..=22; node codes
+        // All existing non-node codes live in 0..=26; node codes
         // start at 100. Verify that the gap maps to Unknown.
+        assert_eq!(
+            RequestCode::from_primitive(26),
+            RequestCode::RunDetectorOnce,
+            "26 is the last non-node code"
+        );
+        assert_eq!(RequestCode::from_primitive(27), RequestCode::Unknown);
         assert_eq!(RequestCode::from_primitive(50), RequestCode::Unknown);
         assert_eq!(RequestCode::from_primitive(99), RequestCode::Unknown);
         assert_eq!(
@@ -1663,6 +1760,56 @@ mod tests {
         let result = super::Handler::delete_customer_data(&mut NoopHandler, &request).await;
 
         assert_eq!(result.unwrap_err(), "not supported");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn unsupervised_engine_methods_default_not_supported() {
+        let train = crate::types::TrainModelRequest {
+            run_id: 7,
+            model: "http-baseline".to_string(),
+            definition: String::new(),
+        };
+        let clone = crate::types::CloneModelRequest {
+            run_id: 8,
+            source: "http-baseline".to_string(),
+            target_name: "http-baseline-copy".to_string(),
+            strip_events: false,
+        };
+        let mut handler = NoopHandler;
+
+        let results = [
+            super::Handler::train_model(&mut handler, &train).await,
+            super::Handler::clone_model(&mut handler, &clone).await,
+            super::Handler::cancel_run(&mut handler, 7).await,
+            super::Handler::run_detector_once(&mut handler, 1).await,
+        ];
+        for result in results {
+            assert_eq!(result.unwrap_err(), "not supported");
+        }
+    }
+
+    /// Each Unsupervised Engine request answered through `handle` with
+    /// the default implementation reaches the caller as "not
+    /// supported".
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn unsupervised_engine_dispatch_default_not_supported() {
+        let train = crate::types::TrainModelRequest {
+            run_id: 7,
+            model: "http-baseline".to_string(),
+            definition: "event_kind = \"http\"".to_string(),
+        };
+        let clone = crate::types::CloneModelRequest {
+            run_id: 8,
+            source: "http-baseline".to_string(),
+            target_name: "http-baseline-copy".to_string(),
+            strip_events: true,
+        };
+        node_dispatch_roundtrip::<_, ()>(RequestCode::TrainModel, train).await;
+        node_dispatch_roundtrip::<_, ()>(RequestCode::CloneModel, clone).await;
+        node_dispatch_roundtrip::<_, ()>(RequestCode::CancelRun, 7_u32).await;
+        node_dispatch_roundtrip::<_, ()>(RequestCode::RunDetectorOnce, -1_i32).await;
     }
 
     /// Dispatch round-trip test helper: sends a typed node request
@@ -3131,6 +3278,84 @@ mod tests {
             res.unwrap_err().contains("unknown request code"),
             "non-node code should be rejected"
         );
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// The Unsupervised Engine codes are non-node codes, so
+    /// `handle_node` answers each of them as it answers `DnsStart`.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_rejects_unsupervised_engine_codes() {
+        use crate::test::{TOKEN, channel};
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = StandaloneNodeHandler;
+            super::handle_node(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let train = crate::types::TrainModelRequest {
+            run_id: 7,
+            model: "http-baseline".to_string(),
+            definition: String::new(),
+        };
+        let clone = crate::types::CloneModelRequest {
+            run_id: 8,
+            source: "http-baseline".to_string(),
+            target_name: "http-baseline-copy".to_string(),
+            strip_events: false,
+        };
+        let answers: [Result<(), String>; 4] = [
+            crate::unary_request(
+                &mut client_send,
+                &mut client_recv,
+                u32::from(RequestCode::TrainModel),
+                &train,
+            )
+            .await
+            .expect("wire transport should succeed"),
+            crate::unary_request(
+                &mut client_send,
+                &mut client_recv,
+                u32::from(RequestCode::CloneModel),
+                &clone,
+            )
+            .await
+            .expect("wire transport should succeed"),
+            crate::unary_request(
+                &mut client_send,
+                &mut client_recv,
+                u32::from(RequestCode::CancelRun),
+                7_u32,
+            )
+            .await
+            .expect("wire transport should succeed"),
+            crate::unary_request(
+                &mut client_send,
+                &mut client_recv,
+                u32::from(RequestCode::RunDetectorOnce),
+                1_i32,
+            )
+            .await
+            .expect("wire transport should succeed"),
+        ];
+        for (answer, code) in answers.into_iter().zip(23..=26) {
+            assert_eq!(
+                answer.unwrap_err(),
+                format!("unknown request code: {code}"),
+                "handle_node should reject non-node code {code}"
+            );
+        }
 
         drop(client_send);
         drop(client_recv);

@@ -7,6 +7,33 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Requests between the Central Manager and an Unsupervised Engine. The Central
+  Manager can ask an engine to train a model
+  (`server::Connection::send_train_model` with a `TrainModelRequest`, whose
+  `definition` is a TOML document carried as an unparsed string and whose
+  schema its rustdoc states), clone a model (`send_clone_model` with a
+  `CloneModelRequest`), cancel a run (`send_cancel_run`) and run a detector
+  once (`send_run_detector_once`); an engine answers them through the new
+  `request::Handler` methods `train_model`, `clone_model`, `cancel_run` and
+  `run_detector_once`. An engine can upload a run's model
+  (`client::Connection::upload_run_model`), report a run's state
+  (`report_run`, with a `ReportedRunState`), report its active runs
+  (`report_active_runs`) and report a detector's status
+  (`report_detector_status`, with a `DetectorStatusReport` carrying
+  `DetectorState`, `RoundOutcome`, `SourceStatus` and `SourceState`); the
+  Central Manager answers them through the new `server::Handler` methods
+  `upload_run_model`, `report_run`, `report_active_runs` and
+  `report_detector_status`, each given the caller's peer name. Every new
+  `Handler` method defaults to answering "not supported". The `ServiceId`s
+  `ENGINE_TRAIN_MODEL`, `ENGINE_CLONE_MODEL`, `ENGINE_CANCEL_RUN`,
+  `ENGINE_RUN_DETECTOR_ONCE`, `SERVER_RUN_UPLOAD_MODEL`, `SERVER_RUN_REPORT`,
+  `SERVER_RUN_REPORT_ACTIVE` and `SERVER_DETECTOR_REPORT_STATUS` identify
+  them. `PROTOCOL_VERSION` and `MIN_PROTOCOL_VERSION_REQ` are unchanged; an
+  agent or manager built on an older release answers these requests with
+  "unknown request code".
+
 ### Changed
 
 - `NodeTimeSyncResponse::Status` now also reports whether the host is
