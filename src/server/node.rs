@@ -1466,6 +1466,7 @@ mod tests {
                     commit: "0123456789abcdef".into(),
                     lifecycle: Lifecycle::Running,
                     bound_addrs: vec![],
+                    privilege_profile: None,
                 })),
                 NodePackageRequest::ListHostPorts => Ok(NodePackageResponse::HostPorts(Vec::new())),
                 NodePackageRequest::Install { .. } => {
@@ -1514,6 +1515,7 @@ mod tests {
             on_failure: FailurePolicy::Rollback,
             bind_addrs: None,
             config_template: None,
+            privilege_profile: None,
         }
     }
 

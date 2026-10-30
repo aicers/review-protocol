@@ -1217,6 +1217,7 @@ pub mod node {
     ///         "0.0.0.0:8442".parse::<SocketAddr>().unwrap(),
     ///     )])),
     ///     config_template: None,
+    ///     privilege_profile: None,
     /// };
     /// assert!(matches!(req, NodePackageRequest::Install { .. }));
     /// ```
@@ -1338,6 +1339,42 @@ pub mod node {
             /// Appended last, after `bind_addrs`, because declaration
             /// position is the wire encoding.
             config_template: Option<String>,
+            /// The serialized name of one of the privilege profiles the
+            /// package's unit declares, selecting how the agent renders
+            /// the unit.
+            ///
+            /// Allowed on a first install **and** on an update, unlike
+            /// [`bind_addrs`](Self::Install::bind_addrs) and
+            /// [`config_template`](Self::Install::config_template).
+            ///
+            /// `None` is the only accepted value for a package whose unit
+            /// declares no profiles. On an update of a package that
+            /// declares profiles, `None` keeps the profile the instance
+            /// last applied, which is what
+            /// [`PackageState::privilege_profile`] reports.
+            ///
+            /// An `Install` of the build already installed whose profile
+            /// is `Some` and differs from the profile the instance last
+            /// applied is a full apply of that build with the new
+            /// profile, never [`InstallPreflight::AlreadyApplied`].
+            ///
+            /// A [reserved `"trust"`](Self::Install::target) install
+            /// carries `None`.
+            ///
+            /// Carried verbatim: this crate never parses, defaults or
+            /// validates it. `Some("")` is a name like any other, refused
+            /// by the agent as undeclared rather than collapsed to `None`.
+            ///
+            /// Its refusals are
+            /// [`NodePackageError::UndeclaredPrivilegeProfile`],
+            /// [`NodePackageError::UnexpectedPrivilegeProfile`] and
+            /// [`NodePackageError::MissingPrivilegeProfile`], decided
+            /// after the package is opened; it is not judged in
+            /// preflight.
+            ///
+            /// Appended last, after `config_template`, because
+            /// declaration position is the wire encoding.
+            privilege_profile: Option<String>,
         },
         /// Remove one installed instance.
         Remove {
@@ -1658,6 +1695,20 @@ pub mod node {
         ///
         /// Empty for a component that listens on nothing.
         pub bound_addrs: Vec<BoundAddr>,
+        /// The serialized name of the privilege profile the instance's
+        /// unit was rendered with at its last committed apply — after a
+        /// rollback, the restored one.
+        ///
+        /// `None` for an instance whose package declares no profiles,
+        /// for a target that is not a module, and for an instance that
+        /// is not installed. Agent-reported and carried verbatim. It is
+        /// the profile an update whose
+        /// [`privilege_profile`](NodePackageRequest::Install::privilege_profile)
+        /// is `None` keeps.
+        ///
+        /// Appended last, after `bound_addrs`, because declaration
+        /// position is the wire encoding.
+        pub privilege_profile: Option<String>,
     }
 
     /// An address an instance is bound to, named by the
@@ -1933,6 +1984,47 @@ pub mod node {
         /// "this instance is not one I manage".  Terminal and **not**
         /// retryable: the state is a standing property of the host.
         UnmanagedInstancePresent,
+        /// The privilege profile in effect for the apply is not one the
+        /// package's unit declares.
+        ///
+        /// Raised after the package is opened and verified and before
+        /// the first mutation, so nothing on the host changed. Terminal
+        /// and **not** retryable with the same request.
+        UndeclaredPrivilegeProfile {
+            /// The profile that was refused: the request's
+            /// [`privilege_profile`](NodePackageRequest::Install::privilege_profile),
+            /// or, on an update carrying `None`, the profile the
+            /// instance last applied, which the new build no longer
+            /// declares. A string that is no profile name at all,
+            /// including `""`, is refused this way.
+            profile: String,
+            /// The profile names the package's unit declares, in
+            /// declared order, so the manager can name what is allowed.
+            declared: Vec<String>,
+        },
+        /// The request carries a privilege profile for an apply that
+        /// takes none: a package whose unit declares no profiles, a
+        /// package with no unit, or a target the agent applies no
+        /// profile to — anything that is not a module, including the
+        /// [reserved `"trust"` target](crate::types::node) and the
+        /// agent's own update.
+        ///
+        /// Raised after the package is opened and verified and before
+        /// the first mutation, so nothing on the host changed. Terminal
+        /// and **not** retryable with the same request.
+        UnexpectedPrivilegeProfile {
+            /// The profile the request carried.
+            profile: String,
+        },
+        /// The package's unit declares privilege profiles and the apply
+        /// has none in effect: the request carries `None` on a first
+        /// install, or on an update of an instance with no recorded
+        /// profile.
+        ///
+        /// Raised after the package is opened and verified and before
+        /// the first mutation, so nothing on the host changed. Terminal
+        /// and **not** retryable with the same request.
+        MissingPrivilegeProfile,
     }
 
     impl NodePackageError {
@@ -1967,7 +2059,10 @@ pub mod node {
                 | Self::BootstrapMaterialExpired
                 | Self::InsufficientDiskSpace { .. }
                 | Self::ObservationUnavailable
-                | Self::UnmanagedInstancePresent => None,
+                | Self::UnmanagedInstancePresent
+                | Self::UndeclaredPrivilegeProfile { .. }
+                | Self::UnexpectedPrivilegeProfile { .. }
+                | Self::MissingPrivilegeProfile => None,
             }
         }
     }
@@ -2885,6 +2980,7 @@ pub mod node {
                 commit: "0123456789abcdef".into(),
                 lifecycle,
                 bound_addrs,
+                privilege_profile: None,
             }
         }
 
@@ -2904,6 +3000,7 @@ pub mod node {
                             on_failure,
                             bind_addrs: None,
                             config_template: Some("reconverge-baseline".into()),
+                            privilege_profile: None,
                         };
                         assert_eq!(req, roundtrip(&req));
                     }
@@ -2935,13 +3032,15 @@ pub mod node {
         fn install_with_bind_addrs(
             bind_addrs: Option<BTreeMap<String, SocketAddr>>,
         ) -> NodePackageRequest {
-            install_with_config_template(bind_addrs, None)
+            install_with_config_template(bind_addrs, None, None)
         }
 
-        /// Helper: an `Install` carrying both configuration inputs.
+        /// Helper: an `Install` carrying both configuration inputs and
+        /// the privilege profile.
         fn install_with_config_template(
             bind_addrs: Option<BTreeMap<String, SocketAddr>>,
             config_template: Option<String>,
+            privilege_profile: Option<String>,
         ) -> NodePackageRequest {
             NodePackageRequest::Install {
                 target: "giganto".into(),
@@ -2954,6 +3053,7 @@ pub mod node {
                 on_failure: FailurePolicy::Rollback,
                 bind_addrs,
                 config_template,
+                privilege_profile,
             }
         }
 
@@ -3055,7 +3155,8 @@ pub mod node {
                         "0.0.0.0:8442".parse::<SocketAddr>().expect("valid"),
                     )])),
                 ] {
-                    let req = install_with_config_template(bind_addrs, config_template.clone());
+                    let req =
+                        install_with_config_template(bind_addrs, config_template.clone(), None);
                     let decoded = roundtrip(&req);
                     assert_eq!(req, decoded);
                     let NodePackageRequest::Install {
@@ -3070,12 +3171,48 @@ pub mod node {
             }
         }
 
+        /// The privilege profile is carried verbatim, including an
+        /// empty, miscased or unknown name, and may coexist with a
+        /// template id on the wire.
+        #[test]
+        fn node_package_install_privilege_profile_roundtrip() {
+            for privilege_profile in [
+                None,
+                Some("dpdk".to_string()),
+                Some(String::new()),
+                Some("Root".to_string()),
+                Some("no-such-profile".to_string()),
+            ] {
+                for config_template in [None, Some("reconverge-baseline".to_string())] {
+                    let req = install_with_config_template(
+                        None,
+                        config_template.clone(),
+                        privilege_profile.clone(),
+                    );
+                    let decoded = roundtrip(&req);
+                    assert_eq!(req, decoded);
+                    let NodePackageRequest::Install {
+                        config_template: decoded_id,
+                        privilege_profile: decoded_profile,
+                        ..
+                    } = decoded
+                    else {
+                        panic!("expected an install");
+                    };
+                    assert_eq!(decoded_id, config_template);
+                    assert_eq!(decoded_profile, privilege_profile);
+                }
+            }
+        }
+
         /// Field POSITION is the wire contract just as variant order
-        /// is, so `config_template` has to be the tail field of `Install`,
-        /// after `bind_addrs`.
+        /// is, so `privilege_profile` has to be the tail field of
+        /// `Install`, after `config_template`, which follows
+        /// `bind_addrs`.
         ///
         /// Reordering fields or inserting a later one ahead of
-        /// `config_template` changes the wire encoding and breaks this test.
+        /// `privilege_profile` changes the wire encoding and breaks this
+        /// test.
         #[test]
         fn node_package_install_field_order_is_pinned() {
             let bind_addrs = BTreeMap::from([(
@@ -3100,12 +3237,17 @@ pub mod node {
                 encode(&FailurePolicy::Rollback),
                 encode(&Some(bind_addrs.clone())),
                 encode(&Some(id.clone())),
+                encode(&Some("af-packet".to_string())),
             ]
             .concat();
             assert_eq!(
-                encode(&install_with_config_template(Some(bind_addrs), Some(id))),
+                encode(&install_with_config_template(
+                    Some(bind_addrs),
+                    Some(id),
+                    Some("af-packet".into())
+                )),
                 expected,
-                "`config_template` is the tail field, after `bind_addrs`"
+                "`privilege_profile` is the tail field, after `config_template`"
             );
         }
 
@@ -3124,6 +3266,7 @@ pub mod node {
                 on_failure: FailurePolicy::Rollback,
                 bind_addrs: None,
                 config_template: None,
+                privilege_profile: None,
             };
 
             let one = install(1);
@@ -3270,6 +3413,67 @@ pub mod node {
             assert_eq!(resp, roundtrip(&resp));
         }
 
+        /// Field POSITION is the wire contract, so `privilege_profile`
+        /// has to be the tail field of `PackageState`, after
+        /// `bound_addrs`, and both its values survive the wire alone and
+        /// inside every response that carries a `PackageState`.
+        ///
+        /// Reordering fields or inserting a later one ahead of
+        /// `privilege_profile` changes the wire encoding and breaks this
+        /// test.
+        #[test]
+        fn package_state_field_order_is_pinned() {
+            let bound_addrs = vec![BoundAddr {
+                name: "ingest_address".into(),
+                addr: "0.0.0.0:38370".into(),
+            }];
+            let state = PackageState {
+                privilege_profile: Some("replay".into()),
+                ..package_state(Lifecycle::Running, bound_addrs.clone())
+            };
+
+            let expected = [
+                encode(&"1.2.3".to_string()),
+                encode(&"0123456789abcdef".to_string()),
+                encode(&Lifecycle::Running),
+                encode(&bound_addrs),
+                encode(&Some("replay".to_string())),
+            ]
+            .concat();
+            assert_eq!(
+                encode(&state),
+                expected,
+                "`privilege_profile` is the tail field, after `bound_addrs`"
+            );
+
+            for privilege_profile in [None, Some("replay".to_string())] {
+                let state = PackageState {
+                    privilege_profile: privilege_profile.clone(),
+                    ..package_state(Lifecycle::Running, bound_addrs.clone())
+                };
+                let decoded = roundtrip(&state);
+                assert_eq!(state, decoded);
+                assert_eq!(decoded.privilege_profile, privilege_profile);
+
+                let resp = NodePackageResponse::State(state.clone());
+                assert_eq!(resp, roundtrip(&resp));
+
+                let resp = NodePackageResponse::Installed(vec![
+                    InstalledPackage {
+                        target: "sensor".into(),
+                        instance: Some(1),
+                        state: state.clone(),
+                    },
+                    InstalledPackage {
+                        target: "sensor".into(),
+                        instance: Some(2),
+                        state,
+                    },
+                ]);
+                assert_eq!(resp, roundtrip(&resp));
+            }
+        }
+
         #[test]
         fn serde_roundtrip_node_package_payload_types() {
             let addr = BoundAddr {
@@ -3406,6 +3610,7 @@ pub mod node {
                 on_failure: FailurePolicy::Rollback,
                 bind_addrs: None,
                 config_template: None,
+                privilege_profile: None,
             };
             let rendered = format!("{req:?}");
             assert_redacted(&rendered);
@@ -3457,10 +3662,23 @@ pub mod node {
             for err in [
                 NodePackageError::ObservationUnavailable,
                 NodePackageError::UnmanagedInstancePresent,
+                NodePackageError::UndeclaredPrivilegeProfile {
+                    profile: "Root".into(),
+                    declared: Vec::new(),
+                },
+                NodePackageError::UndeclaredPrivilegeProfile {
+                    profile: String::new(),
+                    declared: vec!["root".into(), "replay".into()],
+                },
+                NodePackageError::UnexpectedPrivilegeProfile {
+                    profile: "dpdk".into(),
+                },
+                NodePackageError::MissingPrivilegeProfile,
             ] {
+                assert_eq!(err.active_trust_epoch(), None);
                 assert_eq!(err, roundtrip(&err));
-                // A non-apply refusal travels in the same success-shaped
-                // frame as an apply failure, and reports no trust epoch.
+                // Each travels in the same success-shaped frame as any
+                // other apply failure, and reports no trust epoch.
                 let resp = NodePackageResponse::Failed(err.clone());
                 assert_eq!(resp, roundtrip(&resp));
                 assert_eq!(resp.active_trust_epoch(), None);
@@ -3869,6 +4087,23 @@ pub mod node {
                 variant_index(&encode(&NodePackageError::UnmanagedInstancePresent)),
                 7
             );
+            assert_eq!(
+                variant_index(&encode(&NodePackageError::UndeclaredPrivilegeProfile {
+                    profile: "dpdk".into(),
+                    declared: vec!["root".into(), "replay".into()],
+                })),
+                8
+            );
+            assert_eq!(
+                variant_index(&encode(&NodePackageError::UnexpectedPrivilegeProfile {
+                    profile: "dpdk".into(),
+                })),
+                9
+            );
+            assert_eq!(
+                variant_index(&encode(&NodePackageError::MissingPrivilegeProfile)),
+                10
+            );
         }
 
         /// `Lifecycle` rides the wire as its `u8` discriminant, and a
@@ -3895,9 +4130,10 @@ pub mod node {
 
             // The fallback survives inside an enclosing payload too.
             // `lifecycle` is the single byte preceding the empty
-            // `bound_addrs`, whose length prefix is a fixed 8 bytes.
+            // `bound_addrs`, whose length prefix is a fixed 8 bytes,
+            // followed by the 1-byte `None` tag of `privilege_profile`.
             let mut bytes = encode(&package_state(Lifecycle::Running, Vec::new()));
-            let position = bytes.len() - 9;
+            let position = bytes.len() - 10;
             assert_eq!(
                 bytes.get(position),
                 Some(&2),

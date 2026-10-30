@@ -429,8 +429,15 @@ pub trait NodeHandler: Send {
     /// This is step 2 of the install exchange and is decided
     /// **before any bytes move** — from the framed request
     /// (`idempotency_key`, `(target, version, commit)`,
-    /// `bind_addrs`, `bootstrap_material`, `config_template`) and from
-    /// what the agent already knows about itself, never from the payload.
+    /// `bind_addrs`, `bootstrap_material`, `config_template`,
+    /// `privilege_profile`) and from what the agent already knows about
+    /// itself, never from the payload.
+    /// [`privilege_profile`](NodePackageRequest::Install::privilege_profile)
+    /// is read only to decide
+    /// [`AlreadyApplied`](InstallPreflight::AlreadyApplied) and is never
+    /// refused here: whether the package declares profiles is known only
+    /// once it is opened, so its refusals come from
+    /// [`node_package_install`](Self::node_package_install).
     /// An `Err`
     /// returned here is the terminal frame of the exchange: no
     /// package bytes are requested and
@@ -444,8 +451,12 @@ pub trait NodeHandler: Send {
     /// be re-applied: an operator would fix the cause, re-run the
     /// same build, and get a recorded success over a still-failed
     /// service.  The contract is therefore `AlreadyApplied` only when
-    /// the build is installed **and** its unit is not failed;
-    /// otherwise [`Proceed`](InstallPreflight::Proceed).
+    /// the build is installed, its unit is not failed, **and** the
+    /// request's `privilege_profile` is `None` or equals the profile
+    /// the instance last applied; otherwise
+    /// [`Proceed`](InstallPreflight::Proceed).  A different profile on
+    /// the installed build is a full apply of that build with the new
+    /// profile.
     ///
     /// [`InsufficientDiskSpace`](InstallPreflight::InsufficientDiskSpace)
     /// is decided from `size` alone, so nothing on the host is
@@ -3387,6 +3398,7 @@ mod tests {
             on_failure: FailurePolicy::Rollback,
             bind_addrs: None,
             config_template: None,
+            privilege_profile: None,
         }
     }
 
@@ -3402,6 +3414,7 @@ mod tests {
             commit: "0123456789abcdef".into(),
             lifecycle: Lifecycle::Running,
             bound_addrs: vec![],
+            privilege_profile: None,
         };
         vec![
             InstalledPackage {
@@ -3473,6 +3486,7 @@ mod tests {
                     commit: "0123456789abcdef".into(),
                     lifecycle: Lifecycle::Stopped,
                     bound_addrs: vec![],
+                    privilege_profile: None,
                 })),
                 NodePackageRequest::ListHostPorts => {
                     Ok(NodePackageResponse::HostPorts(host_ports()))
@@ -3666,6 +3680,7 @@ mod tests {
                 commit: "0123456789abcdef".into(),
                 lifecycle: Lifecycle::Stopped,
                 bound_addrs: vec![],
+                privilege_profile: None,
             }),
         )
         .await;
@@ -3716,6 +3731,7 @@ mod tests {
                 commit: "0123456789abcdef".into(),
                 lifecycle: Lifecycle::Stopped,
                 bound_addrs: vec![],
+                privilege_profile: None,
             }),
         )
         .await;
@@ -4776,10 +4792,12 @@ mod tests {
         )
     }
 
-    /// Encodes `req` as a 0.21.0 manager does and drops the last byte.
+    /// Encodes `req` as a manager built against this release does and
+    /// drops the last byte.
     ///
-    /// For an `Install` with `config_template: None` that byte is the
-    /// `None` tag, so the result is what a 0.20.0 manager sends.
+    /// For an `Install` with `privilege_profile: None` that byte is the
+    /// `None` tag of its tail field, so the result is what a manager
+    /// built against the previous release sends.
     #[cfg(feature = "server")]
     fn truncated_install(req: &crate::types::node::NodePackageRequest) -> Vec<u8> {
         let mut body = bincode::serde::encode_to_vec(req, bincode::config::standard())
@@ -4833,7 +4851,8 @@ mod tests {
         }
     }
 
-    /// A 0.20.0 `Install` sent to `handle` is answered with the error
+    /// An `Install` from a manager built against the previous release,
+    /// sent to `handle`, is answered with the error
     /// frame, read as the preflight verdict `install_exchange` expects.
     #[tokio::test]
     #[cfg(feature = "server")]
