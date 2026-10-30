@@ -2924,6 +2924,7 @@ mod tests {
             commit: "0123456789abcdef".into(),
             lifecycle,
             bound_addrs: vec![],
+            privilege_profile: None,
         }
     }
 
@@ -3003,6 +3004,7 @@ mod tests {
             on_failure: FailurePolicy::Rollback,
             bind_addrs: None,
             config_template: None,
+            privilege_profile: None,
         }
     }
 

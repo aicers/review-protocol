@@ -5,6 +5,49 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `NodePackageRequest::Install::privilege_profile` selects, by name, one of
+  the privilege profiles a package's unit declares, so the agent renders the
+  unit with it. It is allowed on a first install and on an update; `None`
+  means no profile for a package that declares none and, on an update, keeps
+  the profile the instance last applied. An `Install` of the installed build
+  with a different profile is a full apply rather than `AlreadyApplied`.
+- `PackageState::privilege_profile` reports the name of the profile the
+  instance's unit was rendered with at its last committed apply, or `None`
+  for an instance whose package declares no profiles, a target that is not a
+  module, or an instance that is not installed. The crate carries both
+  fields' names verbatim and never parses, defaults or validates them.
+- `NodePackageError::UndeclaredPrivilegeProfile` is returned when the profile
+  in effect is not one the package's unit declares, and lists the declared
+  ones; `NodePackageError::UnexpectedPrivilegeProfile` when a request carries
+  a profile for a package whose unit declares none, a package with no unit,
+  or a target that is not a module; and
+  `NodePackageError::MissingPrivilegeProfile` when the unit declares profiles
+  and the apply has none in effect. Each is returned after the package is
+  opened and verified and before anything on the host changes, and is not
+  retryable with the same request.
+
+### Changed
+
+- `NodePackageRequest::Install` and `PackageState` have a new field,
+  `privilege_profile`. This is a breaking change: code that builds either
+  with a struct literal must initialize it (`None` keeps today's behaviour),
+  and a pattern that names their fields without `..` must name it too.
+  `NodePackageError` has three more variants, so an exhaustive match must
+  handle them. The encodings of `Install` and `PackageState` change, so a
+  manager and an agent exchanging `node.package` requests must both be built
+  against this release: an agent built against 0.23.0 silently ignores
+  `privilege_profile`, so a manager must not send one to it; an agent built
+  against this release answers an `Install` from a manager built against
+  0.23.0 as undecodable; and a manager built against 0.23.0 misreads, or
+  fails to decode, a `ListInstalled` answer of more than one entry from an
+  agent built against this release. `PROTOCOL_VERSION` and
+  `MIN_PROTOCOL_VERSION_REQ` are unchanged and no capability tag guards the
+  change.
+
 ## [0.23.0] - 2026-10-22
 
 ### Added
@@ -1083,6 +1126,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - `client::handshake` implements the application-level handshake process for the
   client after a QUIC connection is established.
 
+[Unreleased]: https://github.com/aicers/review-protocol/compare/0.23.0...main
 [0.23.0]: https://github.com/aicers/review-protocol/compare/0.22.0...0.23.0
 [0.22.0]: https://github.com/aicers/review-protocol/compare/0.21.0...0.22.0
 [0.21.0]: https://github.com/aicers/review-protocol/compare/0.20.0...0.21.0
