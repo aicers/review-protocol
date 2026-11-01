@@ -557,7 +557,7 @@ configurations CI checks.
 Code behind a feature must compile and lint in every configuration that
 enables it, not only under `--all-features`.
 
-## CI requirements
+## Validation
 
 - Run local checks on the host's own operating system: macOS on a Mac,
   Linux on a Linux host. Do not use a container, a virtual machine or
