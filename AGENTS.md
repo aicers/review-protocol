@@ -559,25 +559,48 @@ enables it, not only under `--all-features`.
 
 ## CI requirements
 
-Before pushing, run what `check` runs, in full:
+- Run local checks on the host's own operating system: macOS on a Mac,
+  Linux on a Linux host. Do not use a container, a virtual machine or
+  another operating system in its place. A CI job or matrix entry for
+  another operating system or platform is left to CI.
+- A change is documentation-only when every changed path matches the
+  `docs` filter of the `changes` job in `.github/workflows/ci.yml` and
+  none matches its `code` filter. For such a change run only the
+  `Markdown` row, and build or test no code.
+- For any other change, run every row of the table below that applies to
+  the host before pushing. Run each test command as written, in full: do
+  not narrow it to the changed files or to selected test names.
 
-```sh
-cargo fmt -- --check --config group_imports=StdExternalCrate
-cargo clippy --tests -- -D warnings
-cargo clippy --tests --features client -- -D warnings
-cargo clippy --tests --features server -- -D warnings
-cargo clippy --tests --all-features -- -D warnings
-```
+<!-- markdownlint-disable MD013 -->
+| CI job | Local command |
+| --- | --- |
+| `check` | `cargo fmt -- --check --config group_imports=StdExternalCrate`, `cargo clippy --tests -- -D warnings`, `cargo clippy --tests --features client -- -D warnings`, `cargo clippy --tests --features server -- -D warnings`, `cargo clippy --tests --all-features -- -D warnings` |
+| `test`, no features | `cargo build`, `cargo test` |
+| `test`, `--features client` | `cargo build --features client`, `cargo test --features client` |
+| `test`, `--features server` | `cargo build --features server`, `cargo test --features server` |
+| `test`, `--all-features` | `cargo build --all-features`, `cargo test --all-features` |
+| `Markdown` | `markdownlint-cli2 "**/*.md" "#target"` |
+<!-- markdownlint-enable MD013 -->
 
-Four clippy runs, not one: `--all-features` alone would miss code that
-only compiles in a narrower configuration.
-
-`test` runs `cargo build` and `cargo test` over the same four feature
-sets on both `ubuntu-latest` and `macOS-latest`.
-
-`CI Gate` is the required status check, not the individual jobs. A
-documentation-only change skips the Rust jobs but still runs `Markdown`,
-which lints the tree and then runs the shared instruction-block drift
-check as its last step. The drift check lives there because `AGENTS.md`
-is itself Markdown, so a docs-only change is exactly the one that can
-edit a generated region — and a gated job would skip the check on it.
+- `test` runs each of the four feature sets on both `ubuntu-latest` and
+  `macOS-latest`; locally, run all four on the host. CI adds `--verbose`
+  to `cargo build` and `cargo test`, which changes only the output. The
+  tests bind QUIC endpoints on `[::1]`, so the host needs IPv6 loopback.
+- Four clippy runs, not one: `--all-features` alone would miss code that
+  only compiles in a narrower configuration.
+- Left to CI: `coverage`, which runs `cargo llvm-cov` and uploads the
+  report to Codecov with a repository secret; the tests it measures are
+  the `--all-features` row above. The `Documentation` workflow builds and
+  publishes `cargo doc`, and runs only on a push to `main` or by hand.
+  The shared instruction-block drift check runs as the last step of
+  `Markdown`; the generated regions of this file are never edited here.
+  It lives there because `AGENTS.md` is itself Markdown, so a docs-only
+  change is exactly the one that can edit a generated region — and a
+  gated job would skip the check on it.
+- `CI Gate` and `Markdown` are the required status checks. A
+  documentation-only change skips the Rust jobs but still runs
+  `Markdown`.
+- When a CI job fails, rerun that job's command locally; for a test job,
+  rerun the failing tests by name rather than the whole suite.
+- Before requesting review, ensure every CI job passes on the pushed
+  branch.
