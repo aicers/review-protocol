@@ -1,9 +1,9 @@
 use anyhow::{Context, anyhow, bail};
-use oinq::frame;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::Connection;
 use super::node::{InstallOutcome, NodePowerOutcome, TerminalPreflight};
+use crate::legacy_transport::frame;
 use crate::{
     client,
     types::{
@@ -1538,14 +1538,10 @@ fn encode_request<T: serde::Serialize + ?Sized>(
     request_code: client::RequestCode,
     payload: &T,
 ) -> anyhow::Result<Vec<u8>> {
-    let code: u32 = request_code.into();
-    let Ok(mut buf) =
-        bincode::serde::encode_to_vec(code, bincode::config::standard().with_fixed_int_encoding())
-    else {
-        unreachable!("serialization of u32 into memory buffer should not fail")
-    };
-    bincode::serde::encode_into_std_write(payload, &mut buf, bincode::config::standard())?;
-    Ok(buf)
+    Ok(bincode::serde::encode_to_vec(
+        crate::wire::request(u32::from(request_code), payload),
+        bincode::config::standard(),
+    )?)
 }
 
 /// Rejects an [`Install`](NodePackageRequest::Install) handed to a
@@ -3467,7 +3463,7 @@ mod tests {
         let client_handle = tokio::spawn(async move {
             let (mut send, mut recv) = handler_conn.accept_bi().await.unwrap();
             let mut buf = Vec::new();
-            oinq::message::recv_request_raw(&mut recv, &mut buf)
+            crate::legacy_transport::message::recv_request_raw(&mut recv, &mut buf)
                 .await
                 .unwrap();
             crate::request::send_response(

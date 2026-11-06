@@ -5,6 +5,16 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added opt-in transport-backed sessions with role-specific domain handles,
+  unique incoming owners, peer certificate access, typed errors and outcome
+  certainty, explicit per-family frame budgets, and cancellation-safe framing
+  with explicit exchange aborts. Legacy Quinn APIs and protocol bytes remain
+  compatible.
+
 ## [0.24.0] - 2026-10-30
 
 ### Added
@@ -1126,6 +1136,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - `client::handshake` implements the application-level handshake process for the
   client after a QUIC connection is established.
 
+[Unreleased]: https://github.com/aicers/review-protocol/compare/0.24.0...HEAD
 [0.24.0]: https://github.com/aicers/review-protocol/compare/0.23.0...0.24.0
 [0.23.0]: https://github.com/aicers/review-protocol/compare/0.22.0...0.23.0
 [0.22.0]: https://github.com/aicers/review-protocol/compare/0.21.0...0.22.0

@@ -5,6 +5,7 @@ use std::io;
 use quinn::RecvStream;
 
 use self::super::EventStreamHandler;
+use crate::legacy_transport as oinq;
 
 /// Processes a unidirectional event stream with the given handler
 ///

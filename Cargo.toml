@@ -3,6 +3,10 @@ name = "review-protocol"
 version = "0.24.0"
 edition = "2024"
 
+# Publish rustdoc for both optional communication roles.
+[package.metadata.docs.rs]
+features = ["client", "server"]
+
 [features]
 client = [
   "async-trait",
@@ -13,6 +17,9 @@ client = [
   "rustls-pemfile",
   "semver",
   "thiserror",
+  "tokio",
+  "tokio/io-util",
+  "tokio/time",
 ]
 server = [
   "async-trait",
@@ -23,9 +30,10 @@ server = [
   "semver",
   "thiserror",
   "tokio",
-  # `AsyncReadExt`, which the package-install send loop pulls chunks
-  # with, lives behind `io-util`. The manager half only.
+  # Session acceptance selects both stream directions; framing uses I/O and deadlines.
+  "tokio/macros",
   "tokio/io-util",
+  "tokio/time",
 ]
 tokio = ["dep:tokio"]
 test-support = ["client", "server", "rcgen", "tokio/rt-multi-thread"]

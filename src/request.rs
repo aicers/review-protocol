@@ -46,6 +46,7 @@ use num_enum::FromPrimitive;
 pub use oinq::request::{parse_args, send_response};
 use thiserror::Error;
 
+use crate::legacy_transport as oinq;
 use crate::{
     client::RequestCode,
     types::{
