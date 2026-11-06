@@ -22,7 +22,10 @@ use crate::types::node::{
     NodeRemoteAccessResponse, NodeServiceRequest, NodeServiceResponse, NodeTimeSyncRequest,
     NodeTimeSyncResponse, NodeVersionRequest, NodeVersionResponse,
 };
-use crate::types::{CustomerDataDeletionReport, HostNetworkGroup};
+use crate::types::{
+    CloneModelRequest, CustomerDataDeletionReport, DetectorStatusReport, HostNetworkGroup,
+    ReportedRunState, TrainModelRequest,
+};
 
 /// A single-use typed response capability borrowing its request stream.
 ///
@@ -313,6 +316,50 @@ impl ServerRequestStream {
                     },
                 }
             }
+            code if code == u32::from(crate::server::RequestCode::UploadRunModel) => {
+                let request: (u32, Vec<u8>) = arguments(&frame, limit)?;
+                exchange.recycle(frame)?;
+                ServerRequest::UploadRunModel {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::server::RequestCode::ReportRun) => {
+                let request: (u32, ReportedRunState, Option<String>) = arguments(&frame, limit)?;
+                exchange.recycle(frame)?;
+                ServerRequest::ReportRun {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::server::RequestCode::ReportActiveRuns) => {
+                let request: Vec<u32> = arguments(&frame, limit)?;
+                exchange.recycle(frame)?;
+                ServerRequest::ReportActiveRuns {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::server::RequestCode::ReportDetectorStatus) => {
+                let request: DetectorStatusReport = arguments(&frame, limit)?;
+                exchange.recycle(frame)?;
+                ServerRequest::ReportDetectorStatus {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
             _ => return Err(malformed("unknown request code")),
         };
         Ok(Some(request))
@@ -322,6 +369,38 @@ impl ServerRequestStream {
 /// A typed manager-side invocation borrowing its stream until responded to.
 #[cfg(feature = "server")]
 pub enum ServerRequest<'a> {
+    /// The `UploadRunModel` engine operation.
+    UploadRunModel {
+        /// The peer-supplied arguments.
+        request: (u32, Vec<u8>),
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, ()>,
+    },
+
+    /// The `ReportRun` engine operation.
+    ReportRun {
+        /// The peer-supplied arguments.
+        request: (u32, ReportedRunState, Option<String>),
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, ()>,
+    },
+
+    /// The `ReportActiveRuns` engine operation.
+    ReportActiveRuns {
+        /// The peer-supplied arguments.
+        request: Vec<u32>,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, ()>,
+    },
+
+    /// The `ReportDetectorStatus` engine operation.
+    ReportDetectorStatus {
+        /// The peer-supplied arguments.
+        request: DetectorStatusReport,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, ()>,
+    },
+
     /// The `get_config` operation.
     GetConfig {
         /// The peer-supplied arguments.
@@ -578,6 +657,50 @@ impl AgentRequestStream {
                     },
                 }
             }
+            code if code == u32::from(crate::client::RequestCode::TrainModel) => {
+                let request: TrainModelRequest = arguments(&frame, limit)?;
+                exchange.recycle(frame)?;
+                AgentRequest::TrainModel {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::CloneModel) => {
+                let request: CloneModelRequest = arguments(&frame, limit)?;
+                exchange.recycle(frame)?;
+                AgentRequest::CloneModel {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::CancelRun) => {
+                let request: u32 = arguments(&frame, limit)?;
+                exchange.recycle(frame)?;
+                AgentRequest::CancelRun {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::RunDetectorOnce) => {
+                let request: i32 = arguments(&frame, limit)?;
+                exchange.recycle(frame)?;
+                AgentRequest::RunDetectorOnce {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
             _ => return Err(malformed("unknown request code")),
         };
         Ok(Some(request))
@@ -587,6 +710,38 @@ impl AgentRequestStream {
 /// A typed agent-side invocation borrowing its stream until responded to.
 #[cfg(feature = "client")]
 pub enum AgentRequest<'a> {
+    /// The `TrainModel` engine operation.
+    TrainModel {
+        /// The peer-supplied arguments.
+        request: TrainModelRequest,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, ()>,
+    },
+
+    /// The `CloneModel` engine operation.
+    CloneModel {
+        /// The peer-supplied arguments.
+        request: CloneModelRequest,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, ()>,
+    },
+
+    /// The `CancelRun` engine operation.
+    CancelRun {
+        /// The peer-supplied arguments.
+        request: u32,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, ()>,
+    },
+
+    /// The `RunDetectorOnce` engine operation.
+    RunDetectorOnce {
+        /// The peer-supplied arguments.
+        request: i32,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, ()>,
+    },
+
     /// The node service family.
     Service {
         /// The peer-supplied arguments.
@@ -668,6 +823,66 @@ pub enum AgentRequest<'a> {
 
 #[cfg(feature = "client")]
 impl super::AgentHandle {
+    /// Sends the `upload_run_model` engine operation.
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn upload_run_model(&self, run_id: u32, model: &[u8]) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::UploadRunModel),
+            (run_id, model),
+        )
+        .await
+    }
+
+    /// Sends the `report_run` engine operation.
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn report_run(
+        &self,
+        run_id: u32,
+        state: ReportedRunState,
+        reason: Option<&str>,
+    ) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::ReportRun),
+            (run_id, state, reason),
+        )
+        .await
+    }
+
+    /// Sends the `report_active_runs` engine operation.
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn report_active_runs(&self, run_ids: &[u32]) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::ReportActiveRuns),
+            run_ids,
+        )
+        .await
+    }
+
+    /// Sends the `report_detector_status` engine operation.
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn report_detector_status(
+        &self,
+        report: &DetectorStatusReport,
+    ) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::ReportDetectorStatus),
+            report,
+        )
+        .await
+    }
+
     /// Sends the `get_config` domain operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
@@ -795,6 +1010,62 @@ impl super::AgentHandle {
 
 #[cfg(feature = "server")]
 impl super::ServerHandle {
+    /// Sends the `send_train_model` engine operation.
+    ///
+    /// Success acknowledges acceptance; subsequent run state arrives in reports.
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn send_train_model(&self, request: &TrainModelRequest) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::client::RequestCode::TrainModel),
+            request,
+        )
+        .await
+    }
+
+    /// Sends the `send_clone_model` engine operation.
+    ///
+    /// Success acknowledges acceptance; subsequent run state arrives in reports.
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn send_clone_model(&self, request: &CloneModelRequest) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::client::RequestCode::CloneModel),
+            request,
+        )
+        .await
+    }
+
+    /// Requests cancellation of an engine run.
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn send_cancel_run(&self, run_id: u32) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::client::RequestCode::CancelRun),
+            run_id,
+        )
+        .await
+    }
+
+    /// Requests one round of an engine detector.
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn send_run_detector_once(&self, detector_id: i32) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::client::RequestCode::RunDetectorOnce),
+            detector_id,
+        )
+        .await
+    }
+
     /// Sends a typed node service operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
