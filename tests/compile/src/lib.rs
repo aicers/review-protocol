@@ -62,3 +62,27 @@ pub fn test_support(
 
 #[cfg(feature = "legacy")]
 pub mod legacy;
+
+#[cfg(feature = "client")]
+pub async fn engine_reports(
+    handle: &review_protocol::session::AgentHandle,
+    report: &review_protocol::types::DetectorStatusReport,
+) -> Result<(), review_protocol::session::SessionError> {
+    use review_protocol::types::ReportedRunState;
+    handle.upload_run_model(1, &[1, 2]).await?;
+    handle.report_run(1, ReportedRunState::Started, None).await?;
+    handle.report_active_runs(&[1]).await?;
+    handle.report_detector_status(report).await
+}
+
+#[cfg(feature = "server")]
+pub async fn engine_commands(
+    handle: &review_protocol::session::ServerHandle,
+    train: &review_protocol::types::TrainModelRequest,
+    clone: &review_protocol::types::CloneModelRequest,
+) -> Result<(), review_protocol::session::SessionError> {
+    handle.send_train_model(train).await?;
+    handle.send_clone_model(clone).await?;
+    handle.send_cancel_run(1).await?;
+    handle.send_run_detector_once(-3).await
+}
