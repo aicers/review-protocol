@@ -351,9 +351,10 @@ async fn preserves_typed_power_and_terminal_install_outcomes() {
     let mut source = std::io::Cursor::new(vec![1, 2, 3]);
     let (result, ()) = tokio::join!(server.node_package_install(request, &mut source), async {
         let mut stream = incoming.accept().await.unwrap();
-        let AgentRequest::Package { reply, .. } = stream.next().await.unwrap().unwrap() else {
+        let AgentRequest::Package { request, reply } = stream.next().await.unwrap().unwrap() else {
             panic!("wrong request");
         };
+        assert_eq!(request, install_request(3));
         assert!(
             reply
                 .preflight(Ok(InstallPreflight::AlreadyApplied))
@@ -384,6 +385,7 @@ fn install_request(size: u64) -> NodePackageRequest {
         on_failure: review_protocol::types::node::FailurePolicy::Rollback,
         bind_addrs: None,
         config_template: None,
+        privilege_profile: Some("restricted".into()),
     }
 }
 
@@ -964,4 +966,170 @@ async fn request_stream_distinguishes_clean_eof_from_truncation() {
         assert!(stream.next().await.is_err());
         assert!(recv.read(&mut [0]).await.is_err());
     }
+}
+
+#[tokio::test]
+async fn engine_commands_preserve_arguments_and_remote_rejection() {
+    use review_protocol::types::{CloneModelRequest, TrainModelRequest};
+    let (manager, _, _, mut incoming) = sessions(SessionOptions::legacy_compatible()).await;
+    let train = TrainModelRequest {
+        run_id: 300,
+        model: "model".into(),
+        definition: "event_kind = \"http\"".into(),
+    };
+    let clone = CloneModelRequest {
+        run_id: 301,
+        source: "model".into(),
+        target_name: "copy".into(),
+        strip_events: true,
+    };
+    let ((), ()) = tokio::join!(
+        async {
+            manager.send_train_model(&train).await.unwrap();
+            manager.send_clone_model(&clone).await.unwrap();
+            manager.send_cancel_run(300).await.unwrap();
+            let error = manager.send_run_detector_once(-3).await.unwrap_err();
+            assert!(
+                matches!(error, SessionError::RemoteRejection(message) if message == "detector disabled")
+            );
+        },
+        async {
+            let mut stream = incoming.accept().await.unwrap();
+            let AgentRequest::TrainModel { request, reply } = stream.next().await.unwrap().unwrap()
+            else {
+                panic!("wrong request")
+            };
+            assert_eq!(request, train);
+            reply.respond(Ok(())).await.unwrap();
+            stream.finish().unwrap();
+            let mut stream = incoming.accept().await.unwrap();
+            let AgentRequest::CloneModel { request, reply } = stream.next().await.unwrap().unwrap()
+            else {
+                panic!("wrong request")
+            };
+            assert_eq!(request, clone);
+            reply.respond(Ok(())).await.unwrap();
+            stream.finish().unwrap();
+            let mut stream = incoming.accept().await.unwrap();
+            let AgentRequest::CancelRun { request, reply } = stream.next().await.unwrap().unwrap()
+            else {
+                panic!("wrong request")
+            };
+            assert_eq!(request, 300);
+            reply.respond(Ok(())).await.unwrap();
+            stream.finish().unwrap();
+            let mut stream = incoming.accept().await.unwrap();
+            let AgentRequest::RunDetectorOnce { request, reply } =
+                stream.next().await.unwrap().unwrap()
+            else {
+                panic!("wrong request")
+            };
+            assert_eq!(request, -3);
+            reply
+                .respond(Err("detector disabled".into()))
+                .await
+                .unwrap();
+            stream.finish().unwrap();
+        }
+    );
+}
+
+#[tokio::test]
+async fn engine_reports_preserve_arguments_and_remote_rejection() {
+    use review_protocol::types::{DetectorState, DetectorStatusReport, ReportedRunState};
+    let (_, mut incoming, engine, _) = sessions(SessionOptions::legacy_compatible()).await;
+    let report = DetectorStatusReport {
+        detector_id: -3,
+        state: DetectorState::Disabled,
+        finished_at: None,
+        outcome: None,
+        reason: Some("disabled".into()),
+        events: 0,
+        sources: Vec::new(),
+    };
+    let ((), ()) = tokio::join!(
+        async {
+            engine.upload_run_model(300, &[1, 2, 3]).await.unwrap();
+            engine
+                .report_run(300, ReportedRunState::Failed, Some("failed"))
+                .await
+                .unwrap();
+            engine.report_active_runs(&[300, 301]).await.unwrap();
+            let error = engine.report_detector_status(&report).await.unwrap_err();
+            assert!(
+                matches!(error, SessionError::RemoteRejection(message) if message == "unknown detector")
+            );
+        },
+        async {
+            let mut stream = request_stream(&mut incoming).await;
+            let ServerRequest::UploadRunModel { request, reply } =
+                stream.next().await.unwrap().unwrap()
+            else {
+                panic!("wrong request")
+            };
+            assert_eq!(request, (300, vec![1, 2, 3]));
+            reply.respond(Ok(())).await.unwrap();
+            stream.finish().unwrap();
+            let mut stream = request_stream(&mut incoming).await;
+            let ServerRequest::ReportRun { request, reply } = stream.next().await.unwrap().unwrap()
+            else {
+                panic!("wrong request")
+            };
+            assert_eq!(
+                request,
+                (300, ReportedRunState::Failed, Some("failed".into()))
+            );
+            reply.respond(Ok(())).await.unwrap();
+            stream.finish().unwrap();
+            let mut stream = request_stream(&mut incoming).await;
+            let ServerRequest::ReportActiveRuns { request, reply } =
+                stream.next().await.unwrap().unwrap()
+            else {
+                panic!("wrong request")
+            };
+            assert_eq!(request, [300, 301]);
+            reply.respond(Ok(())).await.unwrap();
+            stream.finish().unwrap();
+            let mut stream = request_stream(&mut incoming).await;
+            let ServerRequest::ReportDetectorStatus { request, reply } =
+                stream.next().await.unwrap().unwrap()
+            else {
+                panic!("wrong request")
+            };
+            assert_eq!(request, report);
+            reply.respond(Err("unknown detector".into())).await.unwrap();
+            stream.finish().unwrap();
+        }
+    );
+}
+
+#[tokio::test]
+async fn time_sync_status_decodes_current_release_bytes() {
+    use oinq::frame::{FramedReader, FramedWriter};
+    use review_protocol::types::node::{NodeTimeSyncRequest, NodeTimeSyncResponse};
+    let (manager, agent) = raw_agent(SessionOptions::legacy_compatible()).await;
+    let (result, ()) = tokio::join!(manager.node_time_sync(NodeTimeSyncRequest::Status), async {
+        let (send, recv) = agent.accept_bi().await.unwrap();
+        let limit = FrameLimit::new(1024).unwrap();
+        let mut reader = FramedReader::new(recv, limit);
+        let frame = reader.read().await.unwrap().unwrap();
+        assert_eq!(frame.into_bytes(), [103, 0, 0, 0, 4]);
+        let mut writer = FramedWriter::new(send, limit);
+        // Ok(Status), enabled, synchronized, Some("ntp"), Some(-12).
+        // These bytes are independent of the session and legacy encoders.
+        writer
+            .start_raw(&[0, 1, 1, 1, 1, 3, b'n', b't', b'p', 1, 23])
+            .unwrap();
+        writer.flush().await.unwrap();
+        writer.into_inner().finish().unwrap();
+    });
+    assert_eq!(
+        result.unwrap(),
+        NodeTimeSyncResponse::Status {
+            enabled: true,
+            synchronized: true,
+            server: Some("ntp".into()),
+            offset_micros: Some(-12),
+        }
+    );
 }
