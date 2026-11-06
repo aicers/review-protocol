@@ -22,8 +22,11 @@ re-run its sync. The drift check in CI fails if this copy diverges.
 - Do NOT rely on literal `\n` escapes for a commit body — they land in
   the subject line as characters, and git reports success. Use a real
   multiline string, or `git commit -F` with a file or heredoc.
-- Reference issues in the body, not the title: `Closes #N` to close an
-  issue, or `Part of #N` when the commit addresses part of one.
+- Reference issues in the body, not the title, and only the issue the
+  commit delivers: `Closes #N` to close it, or `Part of #N` when the
+  commit addresses part of it. Every new version of the commit you
+  push, after an amend or a rebase, posts another entry on the timeline
+  of each issue it names.
 
 ## Branching and pushing
 
@@ -55,6 +58,53 @@ re-run its sync. The drift check in CI fails if this copy diverges.
   on the issue or pull request. Restore the one you want with
   `--body-file`. Do NOT retype it from memory — a body that reads like
   the original and is not is worse than the empty one it replaced.
+
+## Referring to other issues and PRs
+
+- Any reference GitHub recognizes as an issue or PR posts an entry on
+  that issue's or PR's timeline: a bare `#N`, `GH-N`, `owner/repo#N`,
+  its URL (a link to one of its comments or a URL with a query
+  included), and a Markdown or HTML link to that URL alike. Editing the
+  text or deleting the comment afterwards does not remove the entry, so
+  choose the form before you post.
+- Ask one question of every reference: once the other side sees it,
+  does it give them something to do or something to avoid?
+  - **Yes: link it.** Use `#N` within the repository and `owner/repo#N`
+    across repositories. This covers closes, part of, depends on or
+    blocks, follow-up of, taking over part of its work, parent or
+    child, and supersedes or duplicates. On a pull request, the
+    narrower bullet below applies. An issue that takes over part of
+    another's work links it: when AgentCoop's verification finds
+    work missing from an issue, it looks for an owner only among that
+    issue's open siblings and the issues of its repository that
+    mention it.
+  - **No: use a form that posts no entry.** A PR as its
+    `https://github.com/owner/repo/pull/N/files` URL; a commit as its
+    SHA and title; a range of commits as one
+    `https://github.com/owner/repo/compare/A...B` URL; an issue as its
+    full URL in a code span,
+    `` `https://github.com/owner/repo/issues/N` ``. Never a bare
+    `` `#N` `` in a code span: it names no repository. Describe what
+    must be left alone by what it is ("every other open PR based on
+    `main`"), not by listing numbers. If you find yourself returning to
+    the target as you work, your work relies on it, and the answer is
+    yes.
+- Quoting text with `>` posts entries again for every reference in it,
+  and a `<details>` block does not stop them. Put pasted logs and
+  command output in a fenced code block, where references post none.
+- Anywhere on a pull request (its body, a comment, a review, an inline
+  review comment), link an issue of the same repository only if the
+  pull request delivers it, and then as `Closes #N` or `Part of #N` in
+  the body, never in a code span. AgentCoop's verification takes every
+  merged pull request that mentions an issue anywhere as a candidate,
+  and an agent judges from its title and body whether it delivered that
+  issue; a `Part of #N` link is the only trace a partial delivery
+  leaves. State any other relationship in the issue.
+- Leave the references in the sections AgentCoop writes as they are:
+  `## Children`, `## Dependencies` and `## Execution order` in the
+  issues it files, and `## Implementation deviations`, between its HTML
+  comment markers, in any issue it implements. It reads some of them
+  back, and its verification walks the entries they post.
 
 ## Markdown lint configuration
 
@@ -507,27 +557,50 @@ configurations CI checks.
 Code behind a feature must compile and lint in every configuration that
 enables it, not only under `--all-features`.
 
-## CI requirements
+## Validation
 
-Before pushing, run what `check` runs, in full:
+- Run local checks on the host's own operating system: macOS on a Mac,
+  Linux on a Linux host. Do not use a container, a virtual machine or
+  another operating system in its place. A CI job or matrix entry for
+  another operating system or platform is left to CI.
+- A change is documentation-only when every changed path matches the
+  `docs` filter of the `changes` job in `.github/workflows/ci.yml` and
+  none matches its `code` filter. For such a change run only the
+  `Markdown` row, and build or test no code.
+- For any other change, run every row of the table below that applies to
+  the host before pushing. Run each test command as written, in full: do
+  not narrow it to the changed files or to selected test names.
 
-```sh
-cargo fmt -- --check --config group_imports=StdExternalCrate
-cargo clippy --tests -- -D warnings
-cargo clippy --tests --features client -- -D warnings
-cargo clippy --tests --features server -- -D warnings
-cargo clippy --tests --all-features -- -D warnings
-```
+<!-- markdownlint-disable MD013 -->
+| CI job | Local command |
+| --- | --- |
+| `check` | `cargo fmt -- --check --config group_imports=StdExternalCrate`, `cargo clippy --tests -- -D warnings`, `cargo clippy --tests --features client -- -D warnings`, `cargo clippy --tests --features server -- -D warnings`, `cargo clippy --tests --all-features -- -D warnings` |
+| `test`, no features | `cargo build`, `cargo test` |
+| `test`, `--features client` | `cargo build --features client`, `cargo test --features client` |
+| `test`, `--features server` | `cargo build --features server`, `cargo test --features server` |
+| `test`, `--all-features` | `cargo build --all-features`, `cargo test --all-features` |
+| `Markdown` | `markdownlint-cli2 "**/*.md" "#target"` |
+<!-- markdownlint-enable MD013 -->
 
-Four clippy runs, not one: `--all-features` alone would miss code that
-only compiles in a narrower configuration.
-
-`test` runs `cargo build` and `cargo test` over the same four feature
-sets on both `ubuntu-latest` and `macOS-latest`.
-
-`CI Gate` is the required status check, not the individual jobs. A
-documentation-only change skips the Rust jobs but still runs `Markdown`,
-which lints the tree and then runs the shared instruction-block drift
-check as its last step. The drift check lives there because `AGENTS.md`
-is itself Markdown, so a docs-only change is exactly the one that can
-edit a generated region — and a gated job would skip the check on it.
+- `test` runs each of the four feature sets on both `ubuntu-latest` and
+  `macOS-latest`; locally, run all four on the host. CI adds `--verbose`
+  to `cargo build` and `cargo test`, which changes only the output. The
+  tests bind QUIC endpoints on `[::1]`, so the host needs IPv6 loopback.
+- Four clippy runs, not one: `--all-features` alone would miss code that
+  only compiles in a narrower configuration.
+- Left to CI: `coverage`, which runs `cargo llvm-cov` and uploads the
+  report to Codecov with a repository secret; the tests it measures are
+  the `--all-features` row above. The `Documentation` workflow builds and
+  publishes `cargo doc`, and runs only on a push to `main` or by hand.
+  The shared instruction-block drift check runs as the last step of
+  `Markdown`; the generated regions of this file are never edited here.
+  It lives there because `AGENTS.md` is itself Markdown, so a docs-only
+  change is exactly the one that can edit a generated region — and a
+  gated job would skip the check on it.
+- `CI Gate` and `Markdown` are the required status checks. A
+  documentation-only change skips the Rust jobs but still runs
+  `Markdown`.
+- When a CI job fails, rerun that job's command locally; for a test job,
+  rerun the failing tests by name rather than the whole suite.
+- Before requesting review, ensure every CI job passes on the pushed
+  branch.

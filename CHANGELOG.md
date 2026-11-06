@@ -5,7 +5,98 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.24.0] - 2026-10-30
+
+### Added
+
+- `NodePackageRequest::Install::privilege_profile` selects, by name, one of
+  the privilege profiles a package's unit declares, so the agent renders the
+  unit with it. It is allowed on a first install and on an update; `None`
+  means no profile for a package that declares none and, on an update, keeps
+  the profile the instance last applied. An `Install` of the installed build
+  with a different profile is a full apply rather than `AlreadyApplied`.
+- `PackageState::privilege_profile` reports the name of the profile the
+  instance's unit was rendered with at its last committed apply, or `None`
+  for an instance whose package declares no profiles, a target that is not a
+  module, or an instance that is not installed. The crate carries both
+  fields' names verbatim and never parses, defaults or validates them.
+- `NodePackageError::UndeclaredPrivilegeProfile` is returned when the profile
+  in effect is not one the package's unit declares, and lists the declared
+  ones; `NodePackageError::UnexpectedPrivilegeProfile` when a request carries
+  a profile for a package whose unit declares none, a package with no unit,
+  or a target that is not a module; and
+  `NodePackageError::MissingPrivilegeProfile` when the unit declares profiles
+  and the apply has none in effect. Each is returned after the package is
+  opened and verified and before anything on the host changes, and is not
+  retryable with the same request.
+
+### Changed
+
+- `NodePackageRequest::Install` and `PackageState` have a new field,
+  `privilege_profile`. This is a breaking change: code that builds either
+  with a struct literal must initialize it (`None` keeps today's behaviour),
+  and a pattern that names their fields without `..` must name it too.
+  `NodePackageError` has three more variants, so an exhaustive match must
+  handle them. The encodings of `Install` and `PackageState` change, so a
+  manager and an agent exchanging `node.package` requests must both be built
+  against this release: an agent built against 0.23.0 silently ignores
+  `privilege_profile`, so a manager must not send one to it; an agent built
+  against this release answers an `Install` from a manager built against
+  0.23.0 as undecodable; and a manager built against 0.23.0 misreads, or
+  fails to decode, a `ListInstalled` answer of more than one entry from an
+  agent built against this release. `PROTOCOL_VERSION` and
+  `MIN_PROTOCOL_VERSION_REQ` are unchanged and no capability tag guards the
+  change.
+
+## [0.23.0] - 2026-10-22
+
+### Added
+
+- Requests between the Central Manager and an Unsupervised Engine. The Central
+  Manager can ask an engine to train a model
+  (`server::Connection::send_train_model` with a `TrainModelRequest`, whose
+  `definition` is a TOML document carried as an unparsed string and whose
+  schema its rustdoc states), clone a model (`send_clone_model` with a
+  `CloneModelRequest`), cancel a run (`send_cancel_run`) and run a detector
+  once (`send_run_detector_once`); an engine answers them through the new
+  `request::Handler` methods `train_model`, `clone_model`, `cancel_run` and
+  `run_detector_once`. An engine can upload a run's model
+  (`client::Connection::upload_run_model`), report a run's state
+  (`report_run`, with a `ReportedRunState`), report its active runs
+  (`report_active_runs`) and report a detector's status
+  (`report_detector_status`, with a `DetectorStatusReport` carrying
+  `DetectorState`, `RoundOutcome`, `SourceStatus` and `SourceState`); the
+  Central Manager answers them through the new `server::Handler` methods
+  `upload_run_model`, `report_run`, `report_active_runs` and
+  `report_detector_status`, each given the caller's peer name. Every new
+  `Handler` method defaults to answering "not supported". The `ServiceId`s
+  `ENGINE_TRAIN_MODEL`, `ENGINE_CLONE_MODEL`, `ENGINE_CANCEL_RUN`,
+  `ENGINE_RUN_DETECTOR_ONCE`, `SERVER_RUN_UPLOAD_MODEL`, `SERVER_RUN_REPORT`,
+  `SERVER_RUN_REPORT_ACTIVE` and `SERVER_DETECTOR_REPORT_STATUS` identify
+  them. `PROTOCOL_VERSION` and `MIN_PROTOCOL_VERSION_REQ` are unchanged; an
+  agent or manager built on an older release answers these requests with
+  "unknown request code".
+
+### Changed
+
+- `NodeTimeSyncResponse::Status` now also reports whether the host is
+  synchronized to its source (`synchronized`), the source in use (`server`)
+  and the host's offset from it at the last measurement (`offset_micros`).
+  This is a breaking change: code that builds a `Status` with a struct literal
+  must initialize the three new fields, and a pattern that names its fields
+  without `..` must name them too. The variant's encoding changes, so a manager
+  and an agent exchanging `Status` must both be built against this release.
+  `PROTOCOL_VERSION` and `MIN_PROTOCOL_VERSION_REQ` are unchanged and no
+  capability tag guards the change. `NodeTimeSyncRequest` and the other
+  response variants are unchanged.
+- The crypto backend of the QUIC transport, certificate generation and
+  `oinq` is aws-lc-rs instead of ring.
+- The client endpoint now always uses the aws-lc-rs rustls provider,
+  whatever providers the application compiles in or installs as the
+  process-level default. It previously used the process-level default and
+  panicked ("Could not automatically determine the process-level
+  CryptoProvider") when none was installed and more than one provider was
+  compiled in.
 
 ### Added
 
@@ -1043,7 +1134,8 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - `client::handshake` implements the application-level handshake process for the
   client after a QUIC connection is established.
 
-[Unreleased]: https://github.com/aicers/review-protocol/compare/0.22.0...main
+[0.24.0]: https://github.com/aicers/review-protocol/compare/0.23.0...0.24.0
+[0.23.0]: https://github.com/aicers/review-protocol/compare/0.22.0...0.23.0
 [0.22.0]: https://github.com/aicers/review-protocol/compare/0.21.0...0.22.0
 [0.21.0]: https://github.com/aicers/review-protocol/compare/0.20.0...0.21.0
 [0.20.0]: https://github.com/aicers/review-protocol/compare/0.19.0...0.20.0

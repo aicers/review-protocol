@@ -50,8 +50,8 @@ use crate::legacy_transport as oinq;
 use crate::{
     client::RequestCode,
     types::{
-        CustomerDataDeletionRequest, HostNetworkGroup, Process, ResourceUsage, SamplingPolicy,
-        TrafficFilterRule,
+        CloneModelRequest, CustomerDataDeletionRequest, HostNetworkGroup, Process, ResourceUsage,
+        SamplingPolicy, TrafficFilterRule, TrainModelRequest,
         node::{
             InstallPreflight, NodeEnrollRequest, NodeEnrollResponse, NodeHostnameRequest,
             NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
@@ -430,8 +430,15 @@ pub trait NodeHandler: Send {
     /// This is step 2 of the install exchange and is decided
     /// **before any bytes move** — from the framed request
     /// (`idempotency_key`, `(target, version, commit)`,
-    /// `bind_addrs`, `bootstrap_material`, `config_template`) and from
-    /// what the agent already knows about itself, never from the payload.
+    /// `bind_addrs`, `bootstrap_material`, `config_template`,
+    /// `privilege_profile`) and from what the agent already knows about
+    /// itself, never from the payload.
+    /// [`privilege_profile`](NodePackageRequest::Install::privilege_profile)
+    /// is read only to decide
+    /// [`AlreadyApplied`](InstallPreflight::AlreadyApplied) and is never
+    /// refused here: whether the package declares profiles is known only
+    /// once it is opened, so its refusals come from
+    /// [`node_package_install`](Self::node_package_install).
     /// An `Err`
     /// returned here is the terminal frame of the exchange: no
     /// package bytes are requested and
@@ -445,8 +452,12 @@ pub trait NodeHandler: Send {
     /// be re-applied: an operator would fix the cause, re-run the
     /// same build, and get a recorded success over a still-failed
     /// service.  The contract is therefore `AlreadyApplied` only when
-    /// the build is installed **and** its unit is not failed;
-    /// otherwise [`Proceed`](InstallPreflight::Proceed).
+    /// the build is installed, its unit is not failed, **and** the
+    /// request's `privilege_profile` is `None` or equals the profile
+    /// the instance last applied; otherwise
+    /// [`Proceed`](InstallPreflight::Proceed).  A different profile on
+    /// the installed build is a full apply of that build with the new
+    /// profile.
     ///
     /// [`InsufficientDiskSpace`](InstallPreflight::InsufficientDiskSpace)
     /// is decided from `size` alone, so nothing on the host is
@@ -672,6 +683,51 @@ pub trait Handler: Send {
     }
 
     async fn shutdown(&mut self) -> Result<(), String> {
+        return Err("not supported".to_string());
+    }
+
+    // ── Unsupervised Engine methods ────────────────────────────
+    //
+    // `Ok(())` means the engine accepted the request; the run's later
+    // states arrive through `client::Connection::report_run`.
+
+    /// Starts the training run the request describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the engine refuses it.
+    async fn train_model(&mut self, _request: &TrainModelRequest) -> Result<(), String> {
+        return Err("not supported".to_string());
+    }
+
+    /// Starts the clone run the request describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the engine refuses it.
+    async fn clone_model(&mut self, _request: &CloneModelRequest) -> Result<(), String> {
+        return Err("not supported".to_string());
+    }
+
+    /// Cancels the run with the given identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the engine refuses it.
+    async fn cancel_run(&mut self, _run_id: u32) -> Result<(), String> {
+        return Err("not supported".to_string());
+    }
+
+    /// Runs one round of the detector with the given identifier now.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the engine refuses it.
+    async fn run_detector_once(&mut self, _detector_id: i32) -> Result<(), String> {
         return Err("not supported".to_string());
     }
 
@@ -1570,6 +1626,36 @@ pub async fn handle<H: Handler>(
                     .map_err(HandlerError::SendError)?;
             }
 
+            // ── Unsupervised Engine dispatch ───────────────────
+            RequestCode::TrainModel => {
+                let request = decode_args::<TrainModelRequest>(send, code, body, None).await?;
+                let result = handler.train_model(&request).await;
+                send_response(send, &mut buf, result)
+                    .await
+                    .map_err(HandlerError::SendError)?;
+            }
+            RequestCode::CloneModel => {
+                let request = decode_args::<CloneModelRequest>(send, code, body, None).await?;
+                let result = handler.clone_model(&request).await;
+                send_response(send, &mut buf, result)
+                    .await
+                    .map_err(HandlerError::SendError)?;
+            }
+            RequestCode::CancelRun => {
+                let run_id = decode_args::<u32>(send, code, body, None).await?;
+                let result = handler.cancel_run(run_id).await;
+                send_response(send, &mut buf, result)
+                    .await
+                    .map_err(HandlerError::SendError)?;
+            }
+            RequestCode::RunDetectorOnce => {
+                let detector_id = decode_args::<i32>(send, code, body, None).await?;
+                let result = handler.run_detector_once(detector_id).await;
+                send_response(send, &mut buf, result)
+                    .await
+                    .map_err(HandlerError::SendError)?;
+            }
+
             // The fail-closed backstop for a code this build has not
             // assigned. An older binary, whose `RequestCode` has
             // neither a `NodePackage` nor a `NodeEnroll` variant,
@@ -1602,6 +1688,22 @@ mod tests {
         );
     }
 
+    /// The Unsupervised Engine codes take the non-node codes after
+    /// `DeleteCustomerData`.
+    #[test]
+    fn unsupervised_engine_request_codes() {
+        let cases: &[(RequestCode, u32)] = &[
+            (RequestCode::TrainModel, 23),
+            (RequestCode::CloneModel, 24),
+            (RequestCode::CancelRun, 25),
+            (RequestCode::RunDetectorOnce, 26),
+        ];
+        for &(code, num) in cases {
+            assert_eq!(u32::from(code), num);
+            assert_eq!(RequestCode::from_primitive(num), code);
+        }
+    }
+
     /// Verify that every node feature-family request code maps to a
     /// stable numeric value and round-trips through `FromPrimitive`.
     #[test]
@@ -1629,8 +1731,14 @@ mod tests {
     /// (non-node) codes and that unknown values still map to `Unknown`.
     #[test]
     fn node_request_codes_no_collision() {
-        // All existing non-node codes live in 0..=22; node codes
+        // All existing non-node codes live in 0..=26; node codes
         // start at 100. Verify that the gap maps to Unknown.
+        assert_eq!(
+            RequestCode::from_primitive(26),
+            RequestCode::RunDetectorOnce,
+            "26 is the last non-node code"
+        );
+        assert_eq!(RequestCode::from_primitive(27), RequestCode::Unknown);
         assert_eq!(RequestCode::from_primitive(50), RequestCode::Unknown);
         assert_eq!(RequestCode::from_primitive(99), RequestCode::Unknown);
         assert_eq!(
@@ -1664,6 +1772,56 @@ mod tests {
         let result = super::Handler::delete_customer_data(&mut NoopHandler, &request).await;
 
         assert_eq!(result.unwrap_err(), "not supported");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn unsupervised_engine_methods_default_not_supported() {
+        let train = crate::types::TrainModelRequest {
+            run_id: 7,
+            model: "http-baseline".to_string(),
+            definition: String::new(),
+        };
+        let clone = crate::types::CloneModelRequest {
+            run_id: 8,
+            source: "http-baseline".to_string(),
+            target_name: "http-baseline-copy".to_string(),
+            strip_events: false,
+        };
+        let mut handler = NoopHandler;
+
+        let results = [
+            super::Handler::train_model(&mut handler, &train).await,
+            super::Handler::clone_model(&mut handler, &clone).await,
+            super::Handler::cancel_run(&mut handler, 7).await,
+            super::Handler::run_detector_once(&mut handler, 1).await,
+        ];
+        for result in results {
+            assert_eq!(result.unwrap_err(), "not supported");
+        }
+    }
+
+    /// Each Unsupervised Engine request answered through `handle` with
+    /// the default implementation reaches the caller as "not
+    /// supported".
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn unsupervised_engine_dispatch_default_not_supported() {
+        let train = crate::types::TrainModelRequest {
+            run_id: 7,
+            model: "http-baseline".to_string(),
+            definition: "event_kind = \"http\"".to_string(),
+        };
+        let clone = crate::types::CloneModelRequest {
+            run_id: 8,
+            source: "http-baseline".to_string(),
+            target_name: "http-baseline-copy".to_string(),
+            strip_events: true,
+        };
+        node_dispatch_roundtrip::<_, ()>(RequestCode::TrainModel, train).await;
+        node_dispatch_roundtrip::<_, ()>(RequestCode::CloneModel, clone).await;
+        node_dispatch_roundtrip::<_, ()>(RequestCode::CancelRun, 7_u32).await;
+        node_dispatch_roundtrip::<_, ()>(RequestCode::RunDetectorOnce, -1_i32).await;
     }
 
     /// Dispatch round-trip test helper: sends a typed node request
@@ -1929,6 +2087,34 @@ mod tests {
                 servers: vec!["0.pool.ntp.org".into()],
             },
             NodeTimeSyncResponse::Done,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_time_sync_status_success_roundtrip() {
+        use crate::types::node::{NodeTimeSyncRequest, NodeTimeSyncResponse};
+        node_success_roundtrip(
+            RequestCode::NodeTimeSync,
+            NodeTimeSyncRequest::Status,
+            NodeTimeSyncResponse::Status {
+                enabled: true,
+                synchronized: true,
+                server: Some("cm.example.com".into()),
+                offset_micros: Some(-1_234),
+            },
+        )
+        .await;
+        node_success_roundtrip(
+            RequestCode::NodeTimeSync,
+            NodeTimeSyncRequest::Status,
+            NodeTimeSyncResponse::Status {
+                enabled: false,
+                synchronized: false,
+                server: None,
+                offset_micros: None,
+            },
         )
         .await;
     }
@@ -3112,6 +3298,84 @@ mod tests {
         assert!(server_res.is_ok());
     }
 
+    /// The Unsupervised Engine codes are non-node codes, so
+    /// `handle_node` answers each of them as it answers `DnsStart`.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_node_rejects_unsupervised_engine_codes() {
+        use crate::test::{TOKEN, channel};
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = StandaloneNodeHandler;
+            super::handle_node(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let train = crate::types::TrainModelRequest {
+            run_id: 7,
+            model: "http-baseline".to_string(),
+            definition: String::new(),
+        };
+        let clone = crate::types::CloneModelRequest {
+            run_id: 8,
+            source: "http-baseline".to_string(),
+            target_name: "http-baseline-copy".to_string(),
+            strip_events: false,
+        };
+        let answers: [Result<(), String>; 4] = [
+            crate::unary_request(
+                &mut client_send,
+                &mut client_recv,
+                u32::from(RequestCode::TrainModel),
+                &train,
+            )
+            .await
+            .expect("wire transport should succeed"),
+            crate::unary_request(
+                &mut client_send,
+                &mut client_recv,
+                u32::from(RequestCode::CloneModel),
+                &clone,
+            )
+            .await
+            .expect("wire transport should succeed"),
+            crate::unary_request(
+                &mut client_send,
+                &mut client_recv,
+                u32::from(RequestCode::CancelRun),
+                7_u32,
+            )
+            .await
+            .expect("wire transport should succeed"),
+            crate::unary_request(
+                &mut client_send,
+                &mut client_recv,
+                u32::from(RequestCode::RunDetectorOnce),
+                1_i32,
+            )
+            .await
+            .expect("wire transport should succeed"),
+        ];
+        for (answer, code) in answers.into_iter().zip(23..=26) {
+            assert_eq!(
+                answer.unwrap_err(),
+                format!("unknown request code: {code}"),
+                "handle_node should reject non-node code {code}"
+            );
+        }
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
     // ── node.package dispatch tests ──────────────────────────────
     //
     // These cover both entry points: the unary variants answered
@@ -3135,6 +3399,7 @@ mod tests {
             on_failure: FailurePolicy::Rollback,
             bind_addrs: None,
             config_template: None,
+            privilege_profile: None,
         }
     }
 
@@ -3150,6 +3415,7 @@ mod tests {
             commit: "0123456789abcdef".into(),
             lifecycle: Lifecycle::Running,
             bound_addrs: vec![],
+            privilege_profile: None,
         };
         vec![
             InstalledPackage {
@@ -3221,6 +3487,7 @@ mod tests {
                     commit: "0123456789abcdef".into(),
                     lifecycle: Lifecycle::Stopped,
                     bound_addrs: vec![],
+                    privilege_profile: None,
                 })),
                 NodePackageRequest::ListHostPorts => {
                     Ok(NodePackageResponse::HostPorts(host_ports()))
@@ -3414,6 +3681,7 @@ mod tests {
                 commit: "0123456789abcdef".into(),
                 lifecycle: Lifecycle::Stopped,
                 bound_addrs: vec![],
+                privilege_profile: None,
             }),
         )
         .await;
@@ -3464,6 +3732,7 @@ mod tests {
                 commit: "0123456789abcdef".into(),
                 lifecycle: Lifecycle::Stopped,
                 bound_addrs: vec![],
+                privilege_profile: None,
             }),
         )
         .await;
@@ -4524,10 +4793,12 @@ mod tests {
         )
     }
 
-    /// Encodes `req` as a 0.21.0 manager does and drops the last byte.
+    /// Encodes `req` as a manager built against this release does and
+    /// drops the last byte.
     ///
-    /// For an `Install` with `config_template: None` that byte is the
-    /// `None` tag, so the result is what a 0.20.0 manager sends.
+    /// For an `Install` with `privilege_profile: None` that byte is the
+    /// `None` tag of its tail field, so the result is what a manager
+    /// built against the previous release sends.
     #[cfg(feature = "server")]
     fn truncated_install(req: &crate::types::node::NodePackageRequest) -> Vec<u8> {
         let mut body = bincode::serde::encode_to_vec(req, bincode::config::standard())
@@ -4581,7 +4852,8 @@ mod tests {
         }
     }
 
-    /// A 0.20.0 `Install` sent to `handle` is answered with the error
+    /// An `Install` from a manager built against the previous release,
+    /// sent to `handle`, is answered with the error
     /// frame, read as the preflight verdict `install_exchange` expects.
     #[tokio::test]
     #[cfg(feature = "server")]

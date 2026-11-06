@@ -248,6 +248,119 @@ impl TestEnvironment {
 pub static TEST_ENV: LazyLock<Mutex<TestEnvironment>> =
     LazyLock::new(|| Mutex::new(TestEnvironment::new()));
 
+/// The run whose model, state and listing `TestServerHandler` accepts.
+#[cfg(all(feature = "client", feature = "server"))]
+#[allow(dead_code)] // used by tests only, like `TestServerHandler`
+pub(crate) const RUN_ID: u32 = 7;
+
+/// The run `TestServerHandler` rejects with "report rejected".
+#[cfg(all(feature = "client", feature = "server"))]
+#[allow(dead_code)] // used by tests only, like `TestServerHandler`
+pub(crate) const REJECTED_RUN_ID: u32 = 99;
+
+/// The model bytes `TestServerHandler` accepts for [`RUN_ID`].
+#[cfg(all(feature = "client", feature = "server"))]
+#[allow(dead_code)] // used by tests only, like `TestServerHandler`
+pub(crate) const RUN_MODEL: &[u8] = &[0x00, 0x01, 0xfe, 0xff];
+
+/// The run reports `TestServerHandler` accepts.
+#[cfg(all(feature = "client", feature = "server"))]
+#[allow(dead_code)] // used by tests only, like `TestServerHandler`
+pub(crate) const RUN_REPORTS: &[(u32, crate::types::ReportedRunState, Option<&str>)] = &[
+    (RUN_ID, crate::types::ReportedRunState::Started, None),
+    (
+        RUN_ID,
+        crate::types::ReportedRunState::Failed,
+        Some("training failed"),
+    ),
+    (
+        RUN_ID,
+        crate::types::ReportedRunState::Cancelled,
+        Some("cancelled by operator"),
+    ),
+];
+
+/// The active-run listing `TestServerHandler` accepts.
+#[cfg(all(feature = "client", feature = "server"))]
+#[allow(dead_code)] // used by tests only, like `TestServerHandler`
+pub(crate) const ACTIVE_RUN_IDS: &[u32] = &[RUN_ID, 8, u32::MAX];
+
+/// The detector whose status `TestServerHandler` rejects with "report
+/// rejected".
+#[cfg(all(feature = "client", feature = "server"))]
+#[allow(dead_code)] // used by tests only, like `TestServerHandler`
+pub(crate) const REJECTED_DETECTOR_ID: i32 = -1;
+
+/// Returns the detector status reports `TestServerHandler` accepts.
+///
+/// Between them they carry every `DetectorState`, `RoundOutcome` and
+/// `SourceState`, and both `None` and `Some` for every optional field.
+#[cfg(feature = "server")]
+#[allow(dead_code)] // used by tests only, like `TestServerHandler`
+pub(crate) fn detector_status_reports() -> Vec<crate::types::DetectorStatusReport> {
+    use crate::types::{
+        DetectorState, DetectorStatusReport, RoundOutcome, SourceState, SourceStatus,
+    };
+
+    vec![
+        DetectorStatusReport {
+            detector_id: 1,
+            state: DetectorState::Running,
+            finished_at: Some(1_760_000_000_000_000_000),
+            outcome: Some(RoundOutcome::Succeeded),
+            reason: None,
+            events: 12_345,
+            sources: vec![
+                SourceStatus {
+                    source: "piglet.node1.example.com".to_string(),
+                    state: SourceState::Served,
+                    reason: None,
+                },
+                SourceStatus {
+                    source: "piglet.node2.example.com".to_string(),
+                    state: SourceState::ServedByNoNode,
+                    reason: None,
+                },
+            ],
+        },
+        DetectorStatusReport {
+            detector_id: 2,
+            state: DetectorState::Disabled,
+            finished_at: Some(1_760_000_300_000_000_000),
+            outcome: Some(RoundOutcome::Failed),
+            reason: Some("source piglet.node3.example.com failed".to_string()),
+            events: 0,
+            sources: vec![SourceStatus {
+                source: "piglet.node3.example.com".to_string(),
+                state: SourceState::Failed,
+                reason: Some("connection refused".to_string()),
+            }],
+        },
+        DetectorStatusReport {
+            detector_id: 3,
+            state: DetectorState::NoModel,
+            finished_at: None,
+            outcome: None,
+            reason: None,
+            events: 0,
+            sources: Vec::new(),
+        },
+        DetectorStatusReport {
+            detector_id: i32::MAX,
+            state: DetectorState::PausedForRun,
+            finished_at: Some(-1),
+            outcome: Some(RoundOutcome::Succeeded),
+            reason: None,
+            events: u64::MAX,
+            sources: vec![SourceStatus {
+                source: "piglet.node1.example.com".to_string(),
+                state: SourceState::Served,
+                reason: None,
+            }],
+        },
+    ]
+}
+
 #[cfg(all(feature = "client", feature = "server"))]
 #[allow(dead_code)]
 pub(crate) struct TestServerHandler;
@@ -523,5 +636,74 @@ impl crate::server::Handler for TestServerHandler {
         _hosts: &[(IpAddr, Vec<crate::types::UserAgent>, Vec<String>)],
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    // Accepts `RUN_MODEL` for `RUN_ID` and rejects `REJECTED_RUN_ID`.
+    async fn upload_run_model(&self, peer: &str, run_id: u32, model: &[u8]) -> Result<(), String> {
+        if peer != "test-peer" {
+            return Err(format!("unexpected peer: {peer}"));
+        }
+        if run_id == REJECTED_RUN_ID {
+            Err("report rejected".to_string())
+        } else if run_id == RUN_ID && model == RUN_MODEL {
+            Ok(())
+        } else {
+            Err(format!("unexpected run model upload: {run_id} {model:?}"))
+        }
+    }
+
+    // Accepts each of `RUN_REPORTS` and rejects `REJECTED_RUN_ID`.
+    async fn report_run(
+        &self,
+        peer: &str,
+        run_id: u32,
+        state: crate::types::ReportedRunState,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
+        if peer != "test-peer" {
+            return Err(format!("unexpected peer: {peer}"));
+        }
+        if run_id == REJECTED_RUN_ID {
+            Err("report rejected".to_string())
+        } else if RUN_REPORTS.contains(&(run_id, state, reason)) {
+            Ok(())
+        } else {
+            Err(format!(
+                "unexpected run report: {run_id} {state:?} {reason:?}"
+            ))
+        }
+    }
+
+    // Accepts `ACTIVE_RUN_IDS` and rejects a listing with `REJECTED_RUN_ID`.
+    async fn report_active_runs(&self, peer: &str, run_ids: &[u32]) -> Result<(), String> {
+        if peer != "test-peer" {
+            return Err(format!("unexpected peer: {peer}"));
+        }
+        if run_ids.contains(&REJECTED_RUN_ID) {
+            Err("report rejected".to_string())
+        } else if run_ids == ACTIVE_RUN_IDS {
+            Ok(())
+        } else {
+            Err(format!("unexpected active runs: {run_ids:?}"))
+        }
+    }
+
+    // Accepts each of `detector_status_reports()` and rejects
+    // `REJECTED_DETECTOR_ID`.
+    async fn report_detector_status(
+        &self,
+        peer: &str,
+        report: &crate::types::DetectorStatusReport,
+    ) -> Result<(), String> {
+        if peer != "test-peer" {
+            return Err(format!("unexpected peer: {peer}"));
+        }
+        if report.detector_id == REJECTED_DETECTOR_ID {
+            Err("report rejected".to_string())
+        } else if detector_status_reports().contains(report) {
+            Ok(())
+        } else {
+            Err(format!("unexpected detector status report: {report:?}"))
+        }
     }
 }
