@@ -52,6 +52,10 @@ mod tests {
             (crate::client::RequestCode::NodeVersion, 108_u32),
             (crate::client::RequestCode::NodePackage, 109_u32),
             (crate::client::RequestCode::NodeEnroll, 110_u32),
+            (crate::client::RequestCode::TrainModel, 23_u32),
+            (crate::client::RequestCode::CloneModel, 24_u32),
+            (crate::client::RequestCode::CancelRun, 25_u32),
+            (crate::client::RequestCode::RunDetectorOnce, 26_u32),
             (crate::client::RequestCode::Unknown, u32::MAX),
         ] {
             assert_eq!(u32::from(code), expected);
@@ -101,6 +105,10 @@ mod tests {
                 crate::server::RequestCode::ReportCustomerDataDeletion,
                 40_u32,
             ),
+            (crate::server::RequestCode::UploadRunModel, 41_u32),
+            (crate::server::RequestCode::ReportRun, 42_u32),
+            (crate::server::RequestCode::ReportActiveRuns, 43_u32),
+            (crate::server::RequestCode::ReportDetectorStatus, 44_u32),
             (crate::server::RequestCode::Unknown, u32::MAX),
         ] {
             assert_eq!(u32::from(code), expected);
