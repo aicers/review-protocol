@@ -5,6 +5,33 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `NodePackageError::AppliedButUnhealthy` is returned once an apply's journal
+  committed and the new build did not end healthy, because its start failed,
+  the apply did not complete, or the build failed its health gate. It is
+  terminal for the attempt, since re-sending the same request repeats the same
+  apply, so a manager can conclude the exchange instead of re-sending it. Its
+  `disposition`, a new `UnhealthyDisposition`, says what the agent left in
+  place: the prior build restored (`RolledBack`), the new build kept under
+  `FailurePolicy::Hold` (`Held`), a first install unwound (`Unwound`), or a
+  reversal that failed or was blocked and that the agent's next operation on
+  the target settles first (`NotReversed`). Its `cause` is agent-asserted
+  display text, carried verbatim, which a consumer logs or shows and never
+  branches on.
+
+### Changed
+
+- `NodePackageError` has a new variant, `AppliedButUnhealthy`, so an
+  exhaustive match must handle it. The encodings of the existing variants are
+  unchanged. A manager built against 0.24.0 cannot decode a `Failed` frame
+  that carries it and treats the exchange as one without a terminal frame; an
+  agent built against 0.24.0 never sends it. `PROTOCOL_VERSION` and
+  `MIN_PROTOCOL_VERSION_REQ` are unchanged and no capability tag guards the
+  change.
+
 ## [0.24.0] - 2026-10-30
 
 ### Added
@@ -1126,6 +1153,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - `client::handshake` implements the application-level handshake process for the
   client after a QUIC connection is established.
 
+[Unreleased]: https://github.com/aicers/review-protocol/compare/0.24.0...main
 [0.24.0]: https://github.com/aicers/review-protocol/compare/0.23.0...0.24.0
 [0.23.0]: https://github.com/aicers/review-protocol/compare/0.22.0...0.23.0
 [0.22.0]: https://github.com/aicers/review-protocol/compare/0.21.0...0.22.0

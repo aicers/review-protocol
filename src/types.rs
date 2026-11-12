@@ -2025,6 +2025,54 @@ pub mod node {
         /// the first mutation, so nothing on the host changed. Terminal
         /// and **not** retryable with the same request.
         MissingPrivilegeProfile,
+        /// The apply's journal committed and the new build did not end
+        /// healthy: its start failed, the apply did not complete, or the
+        /// build failed its health gate.
+        ///
+        /// Terminal for the attempt: re-sending the same request repeats
+        /// the same apply, so the manager concludes the exchange on this
+        /// frame instead of re-sending it.
+        ///
+        /// It reports a verdict on the build. An end the agent itself
+        /// interrupted, such as a gate cut short by the agent's own
+        /// shutdown, is not reported this way.
+        AppliedButUnhealthy {
+            /// What the agent left in place after the failure.
+            disposition: UnhealthyDisposition,
+            /// Agent-asserted, human-readable display text, carried
+            /// verbatim. A consumer logs or shows it and never branches
+            /// on it.
+            cause: String,
+        },
+    }
+
+    /// What the agent left in place after an apply that committed and
+    /// did not end healthy, as reported by
+    /// [`NodePackageError::AppliedButUnhealthy`].
+    ///
+    /// # Wire compatibility
+    ///
+    /// bincode encodes enum variants by declaration order, so any
+    /// later variant must be **appended** at the end.  Never insert
+    /// a variant in the middle or reorder the existing ones.
+    #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub enum UnhealthyDisposition {
+        /// The prior build was restored.
+        ///
+        /// This holds whether or not the restored build then passed a
+        /// fresh health gate; the error's `cause` says which.
+        RolledBack,
+        /// The new build is kept installed under the
+        /// [`Hold`](FailurePolicy::Hold) failure policy.
+        Held,
+        /// A first install was unwound; the target is not installed.
+        Unwound,
+        /// Reversing the apply failed or was blocked, so the agent kept
+        /// its journal and the state is not yet the prior one.
+        ///
+        /// The agent's next operation on the target settles it first,
+        /// so a re-send would settle it and then repeat the same apply.
+        NotReversed,
     }
 
     impl NodePackageError {
@@ -2062,7 +2110,8 @@ pub mod node {
                 | Self::UnmanagedInstancePresent
                 | Self::UndeclaredPrivilegeProfile { .. }
                 | Self::UnexpectedPrivilegeProfile { .. }
-                | Self::MissingPrivilegeProfile => None,
+                | Self::MissingPrivilegeProfile
+                | Self::AppliedButUnhealthy { .. } => None,
             }
         }
     }
@@ -3674,6 +3723,22 @@ pub mod node {
                     profile: "dpdk".into(),
                 },
                 NodePackageError::MissingPrivilegeProfile,
+                NodePackageError::AppliedButUnhealthy {
+                    disposition: UnhealthyDisposition::RolledBack,
+                    cause: "piglet.service failed to start".into(),
+                },
+                NodePackageError::AppliedButUnhealthy {
+                    disposition: UnhealthyDisposition::Held,
+                    cause: "health gate timed out after 60s".into(),
+                },
+                NodePackageError::AppliedButUnhealthy {
+                    disposition: UnhealthyDisposition::Unwound,
+                    cause: "apply did not complete".into(),
+                },
+                NodePackageError::AppliedButUnhealthy {
+                    disposition: UnhealthyDisposition::NotReversed,
+                    cause: String::new(),
+                },
             ] {
                 assert_eq!(err.active_trust_epoch(), None);
                 assert_eq!(err, roundtrip(&err));
@@ -4104,6 +4169,28 @@ pub mod node {
                 variant_index(&encode(&NodePackageError::MissingPrivilegeProfile)),
                 10
             );
+            assert_eq!(
+                variant_index(&encode(&NodePackageError::AppliedButUnhealthy {
+                    disposition: UnhealthyDisposition::RolledBack,
+                    cause: "piglet.service failed to start".into(),
+                })),
+                11
+            );
+        }
+
+        /// Declaration order is the wire order: a later insertion,
+        /// rather than an append, breaks this test.
+        #[test]
+        fn unhealthy_disposition_variant_order_is_pinned() {
+            for (disposition, index) in [
+                (UnhealthyDisposition::RolledBack, 0),
+                (UnhealthyDisposition::Held, 1),
+                (UnhealthyDisposition::Unwound, 2),
+                (UnhealthyDisposition::NotReversed, 3),
+            ] {
+                assert_eq!(variant_index(&encode(&disposition)), index);
+                assert_eq!(disposition, roundtrip(&disposition));
+            }
         }
 
         /// `Lifecycle` rides the wire as its `u8` discriminant, and a

@@ -515,7 +515,13 @@ pub trait NodeHandler: Send {
     /// this response channel.  `Accepted` is the terminal frame; no
     /// `Done` follows it.  A typed apply failure travels as
     /// [`Failed`](NodePackageResponse::Failed), not through the error
-    /// channel.
+    /// channel.  That includes a failure after the apply committed: a
+    /// new build whose start failed, whose apply did not complete, or
+    /// that failed its health gate is reported as
+    /// [`AppliedButUnhealthy`](crate::types::node::NodePackageError::AppliedButUnhealthy),
+    /// with the [`UnhealthyDisposition`](crate::types::node::UnhealthyDisposition)
+    /// the agent left in place, so the manager concludes the exchange
+    /// rather than re-sending an apply whose outcome is already decided.
     ///
     /// # Contract
     ///
@@ -544,8 +550,9 @@ pub trait NodeHandler: Send {
     ///
     /// Returns an error message if the request is not supported or
     /// the payload could not be received.  A failure of the apply
-    /// itself is reported as
-    /// [`Failed`](NodePackageResponse::Failed) instead.
+    /// itself is reported as [`Failed`](NodePackageResponse::Failed)
+    /// instead — a post-commit start or health-gate failure as
+    /// [`AppliedButUnhealthy`](crate::types::node::NodePackageError::AppliedButUnhealthy).
     async fn node_package_install(
         &mut self,
         _req: NodePackageRequest,
@@ -940,8 +947,9 @@ pub trait Handler: Send {
     ///
     /// Returns an error message if the request is not supported or
     /// the payload could not be received.  A failure of the apply
-    /// itself is reported as
-    /// [`Failed`](NodePackageResponse::Failed) instead.
+    /// itself is reported as [`Failed`](NodePackageResponse::Failed)
+    /// instead — a post-commit start or health-gate failure as
+    /// [`AppliedButUnhealthy`](crate::types::node::NodePackageError::AppliedButUnhealthy).
     async fn node_package_install(
         &mut self,
         _req: NodePackageRequest,
@@ -3529,7 +3537,9 @@ mod tests {
             req: crate::types::node::NodePackageRequest,
             pkg: &mut super::PackageReader<'_>,
         ) -> Result<crate::types::node::NodePackageResponse, String> {
-            use crate::types::node::{NodePackageRequest, NodePackageResponse};
+            use crate::types::node::{
+                NodePackageError, NodePackageRequest, NodePackageResponse, UnhealthyDisposition,
+            };
 
             let NodePackageRequest::Install { target, .. } = req else {
                 return Err("the install path must only see an install".to_string());
@@ -3548,13 +3558,23 @@ mod tests {
             assert_eq!(payload.len() as u64, pkg.size());
             *self.received.lock().unwrap() = payload;
 
-            if target == "selfdisrupting" {
-                Ok(NodePackageResponse::Accepted)
-            } else {
-                Ok(NodePackageResponse::Done)
+            match target.as_str() {
+                "selfdisrupting" => Ok(NodePackageResponse::Accepted),
+                "unhealthy" => Ok(NodePackageResponse::Failed(
+                    NodePackageError::AppliedButUnhealthy {
+                        disposition: UnhealthyDisposition::RolledBack,
+                        cause: UNHEALTHY_CAUSE.to_string(),
+                    },
+                )),
+                _ => Ok(NodePackageResponse::Done),
             }
         }
     }
+
+    /// The `cause` the test handler reports for the `unhealthy`
+    /// target.
+    #[cfg(feature = "server")]
+    const UNHEALTHY_CAUSE: &str = "piglet.service failed to start; prior build restored";
 
     /// Round-trip helper for the unary `node.package` variants
     /// through `handle`.
@@ -3969,6 +3989,74 @@ mod tests {
         )
         .await;
         assert!(extra.is_err(), "no frame follows `Accepted`");
+
+        drop(client_send);
+        drop(client_recv);
+
+        let server_res = server_task.await.unwrap();
+        assert!(server_res.is_ok());
+    }
+
+    /// A post-commit start or health-gate failure reaches the manager
+    /// as `Failed(AppliedButUnhealthy)` on the install path — a
+    /// success-shaped terminal frame, not the error channel — so the
+    /// manager concludes the exchange instead of re-sending it.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn node_package_install_applied_but_unhealthy_is_terminal() {
+        use std::time::Duration;
+
+        use crate::test::{TOKEN, channel};
+        use crate::types::node::{
+            InstallPreflight, NodePackageError, NodePackageResponse, UnhealthyDisposition,
+        };
+
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = PackageHandler::default();
+            super::handle(&mut handler, &mut server_send, &mut server_recv).await
+        });
+
+        let sent = payload(600);
+        let verdict = send_install_request(
+            &mut client_send,
+            &mut client_recv,
+            install_request("unhealthy", sent.len() as u64),
+        )
+        .await
+        .expect("the verdict should be Ok");
+        assert_eq!(verdict, InstallPreflight::Proceed);
+
+        oinq::frame::send_raw(&mut client_send, &sent)
+            .await
+            .expect("should send the payload");
+
+        let mut buf = Vec::new();
+        let resp =
+            oinq::frame::recv::<Result<NodePackageResponse, String>>(&mut client_recv, &mut buf)
+                .await
+                .expect("should receive the terminal response");
+        let resp = resp.expect("a typed apply failure is success-shaped, not the error channel");
+        assert_eq!(
+            resp,
+            NodePackageResponse::Failed(NodePackageError::AppliedButUnhealthy {
+                disposition: UnhealthyDisposition::RolledBack,
+                cause: UNHEALTHY_CAUSE.to_string(),
+            })
+        );
+        assert_eq!(resp.active_trust_epoch(), None);
+
+        let extra = tokio::time::timeout(
+            Duration::from_millis(200),
+            oinq::frame::recv::<Result<NodePackageResponse, String>>(&mut client_recv, &mut buf),
+        )
+        .await;
+        assert!(extra.is_err(), "no frame follows `Failed`");
 
         drop(client_send);
         drop(client_recv);
