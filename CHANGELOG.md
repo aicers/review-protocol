@@ -5,7 +5,7 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.26.0] - 2026-11-14
 
 ### Changed
 
@@ -1164,7 +1164,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - `client::handshake` implements the application-level handshake process for the
   client after a QUIC connection is established.
 
-[Unreleased]: https://github.com/aicers/review-protocol/compare/0.25.0...main
+[0.26.0]: https://github.com/aicers/review-protocol/compare/0.25.0...0.26.0
 [0.25.0]: https://github.com/aicers/review-protocol/compare/0.24.0...0.25.0
 [0.24.0]: https://github.com/aicers/review-protocol/compare/0.23.0...0.24.0
 [0.23.0]: https://github.com/aicers/review-protocol/compare/0.22.0...0.23.0
