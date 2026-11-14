@@ -53,7 +53,7 @@ semver = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11.19"
 serde_repr = "0.1.19"
-structured = "0.16.0"
+structured = "0.17.0"
 thiserror = { version = "2", optional = true }
 tokio = { version = "1", features = ["sync"], optional = true }
 

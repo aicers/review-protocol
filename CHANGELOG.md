@@ -5,6 +5,17 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking change:** Bumped `structured` dependency to 0.17.0, which uses
+  Apache Arrow 57.3.2 instead of Arrow 56. The re-exported
+  `types::ColumnStatistics` now comes from `structured` 0.17, so a consumer
+  that names it or passes it to `structured` must use `structured` 0.17 as
+  well. Arrow 57.3.2 fixes the out-of-bounds read on RunEndEncoded arrays in
+  `arrow-data` 56.2.1 (RUSTSEC-2026-0442).
+
 ## [0.25.0] - 2026-11-12
 
 ### Added
@@ -1153,6 +1164,7 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - `client::handshake` implements the application-level handshake process for the
   client after a QUIC connection is established.
 
+[Unreleased]: https://github.com/aicers/review-protocol/compare/0.25.0...main
 [0.25.0]: https://github.com/aicers/review-protocol/compare/0.24.0...0.25.0
 [0.24.0]: https://github.com/aicers/review-protocol/compare/0.23.0...0.24.0
 [0.23.0]: https://github.com/aicers/review-protocol/compare/0.22.0...0.23.0
