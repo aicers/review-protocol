@@ -121,7 +121,8 @@ impl Exchange {
             frame.as_bytes(),
             &super::decode::Budget::new(self.limit.get()),
         )
-        .map(|(value, _)| value);
+        .map(|(value, _)| value)
+        .map_err(|e| e.within(self.certainty));
         self.recycle(frame)?;
         if result.is_err() {
             self.abort();

@@ -1,4 +1,5 @@
 **/*.rs.bk
 /.vscode/
 /target/
+/tests/compile/target/
 Cargo.lock

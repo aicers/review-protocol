@@ -14,6 +14,20 @@ pub(crate) fn request<T>(code: u32, payload: T) -> Request<T> {
     }
 }
 
+/// The text of the error frame that answers request `code` when its
+/// arguments cannot be decoded.
+///
+/// It is fixed apart from the code, deliberately: the decode error can
+/// quote the offending value, and the body can carry material such as
+/// [`BootstrapMaterial`](crate::types::node::BootstrapMaterial) whose
+/// `Debug` this crate redacts, while the manager logs what it receives.
+pub(crate) fn undecodable_args_message(code: u32) -> String {
+    format!(
+        "request code {code}: the arguments could not be decoded; the manager and the agent may \
+         be built against different review-protocol releases"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -49,9 +49,9 @@ pub(super) fn decode<'de, T: serde::Deserialize<'de>>(
     )
     .map_err(|error| {
         if budget.exceeded.get() || matches!(error, bincode::error::DecodeError::LimitExceeded) {
-            super::SessionError::LimitExceeded(oinq::frame::FrameError::Decode(error))
+            super::SessionError::limit(oinq::frame::FrameError::Decode(error))
         } else {
-            super::SessionError::Malformed(Box::new(error))
+            super::SessionError::malformed(error)
         }
     })
 }
@@ -445,7 +445,7 @@ mod tests {
             decode::<Vec<NeverAllocated>>(&declared_length, &Budget::new(1024)).unwrap_err();
         assert!(matches!(
             error,
-            super::super::SessionError::LimitExceeded(_)
+            super::super::SessionError::LimitExceeded { .. }
         ));
     }
 
@@ -456,7 +456,7 @@ mod tests {
         assert!(bytes.len() < 1024);
         assert!(matches!(
             decode::<Vec<Vec<String>>>(&bytes, &Budget::new(1024)),
-            Err(super::super::SessionError::LimitExceeded(_))
+            Err(super::super::SessionError::LimitExceeded { .. })
         ));
         assert_eq!(
             decode::<Vec<Vec<String>>>(&bytes, &Budget::new(8192))
@@ -479,7 +479,7 @@ mod tests {
         }
         assert!(matches!(
             decode::<Custom>(&[], &Budget::new(1024)),
-            Err(super::super::SessionError::Malformed(_))
+            Err(super::super::SessionError::Malformed { .. })
         ));
     }
 }

@@ -1133,20 +1133,6 @@ async fn dispatch_node_package<H: NodeHandler>(
         .map_err(HandlerError::SendError)
 }
 
-/// The text of the error frame that answers request `code` when its
-/// arguments cannot be decoded.
-///
-/// It is fixed apart from the code, deliberately: the decode error can
-/// quote the offending value, and the body can carry material such as
-/// [`BootstrapMaterial`](crate::types::node::BootstrapMaterial) whose
-/// `Debug` this crate redacts, while the manager logs what it receives.
-fn undecodable_args_message(code: u32) -> String {
-    format!(
-        "request code {code}: the arguments could not be decoded; the manager and the agent may \
-         be built against different review-protocol releases"
-    )
-}
-
 /// Decodes the arguments of request `code`, answering on the wire when
 /// they cannot be decoded.
 ///
@@ -1171,7 +1157,8 @@ async fn decode_args<'de, T: serde::Deserialize<'de>>(
     };
     // `body` borrows the dispatcher's buffer, so the frame gets its own.
     let mut buf = Vec::new();
-    let _ = oinq::message::send_err(send, &mut buf, undecodable_args_message(code)).await;
+    let _ =
+        oinq::message::send_err(send, &mut buf, crate::wire::undecodable_args_message(code)).await;
     Err(HandlerError::RecvError(e))
 }
 

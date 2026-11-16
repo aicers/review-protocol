@@ -577,7 +577,7 @@ enables it, not only under `--all-features`.
 <!-- markdownlint-disable MD013 -->
 | CI job | Local command |
 | --- | --- |
-| `check` | `cargo fmt -- --check --config group_imports=StdExternalCrate`, `cargo clippy --tests -- -D warnings`, `cargo clippy --tests --features client -- -D warnings`, `cargo clippy --tests --features server -- -D warnings`, `cargo clippy --tests --all-features -- -D warnings` |
+| `check` | `cargo fmt -- --check --config group_imports=StdExternalCrate`, `sh tests/check-surfaces.sh`, `cargo clippy --tests -- -D warnings`, `cargo clippy --tests --features client -- -D warnings`, `cargo clippy --tests --features server -- -D warnings`, `cargo clippy --tests --all-features -- -D warnings` |
 | `test`, no features | `cargo build`, `cargo test` |
 | `test`, `--features client` | `cargo build --features client`, `cargo test --features client` |
 | `test`, `--features server` | `cargo build --features server`, `cargo test --features server` |

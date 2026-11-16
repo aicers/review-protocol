@@ -15,7 +15,7 @@ assignments from that tag are in `agent-request-codes.txt` and
 that inspected source, so both sets of binary snapshots are identical.
 The protocol constants in both are `0.49.0` and `>=0.49.0`.
 
-The session foundation now builds on `0.24.0`. The captured handshake and
+The session foundation now builds on `0.26.0`. The captured handshake and
 response values remain unchanged. The request-code tests also pin the engine
 commands (23–26) and reports (41–44) added in `0.23.0`; transport tests carry
 `0.24.0` install requests with a selected privilege profile. These additions do
