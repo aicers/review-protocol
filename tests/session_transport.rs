@@ -206,7 +206,7 @@ async fn oversized_header_rejected_without_waiting_for_payload() {
                     .unwrap();
             let mut stream = request_stream(&mut incoming).await;
             let error = stream.next().await.err().unwrap();
-            assert!(matches!(error, SessionError::LimitExceeded(_)));
+            assert!(matches!(error, SessionError::LimitExceeded { .. }));
         },
         async {
             let (handle, incoming) =
@@ -521,7 +521,7 @@ async fn nested_response_allocations_are_classified_as_limits() {
         writer.flush().await.unwrap();
         writer.into_inner().finish().unwrap();
     });
-    assert!(matches!(result, Err(SessionError::LimitExceeded(_))));
+    assert!(matches!(result, Err(SessionError::LimitExceeded { .. })));
 }
 
 #[tokio::test]
@@ -682,7 +682,7 @@ async fn handshake_limit_and_base_only_wire_compatibility() {
     );
     assert!(matches!(
         manager_result,
-        Err(SessionError::LimitExceeded(_))
+        Err(SessionError::LimitExceeded { .. })
     ));
     assert!(node_result.is_err());
 }
@@ -961,7 +961,7 @@ async fn request_stream_distinguishes_clean_eof_from_truncation() {
         let mut stream = request_stream(&mut incoming).await;
         assert!(matches!(
             stream.next().await,
-            Err(SessionError::Malformed(_))
+            Err(SessionError::Malformed { .. })
         ));
         assert!(stream.next().await.is_err());
         assert!(recv.read(&mut [0]).await.is_err());
@@ -1132,4 +1132,247 @@ async fn time_sync_status_decodes_current_release_bytes() {
             offset_micros: Some(-12),
         }
     );
+}
+
+#[tokio::test]
+async fn agent_answers_unserved_and_undecodable_requests_like_the_legacy_dispatcher() {
+    use oinq::frame::{FramedReader, FramedWriter};
+    use review_protocol::types::node::{NodeHostnameRequest, NodeHostnameResponse};
+    let (_, mut incoming, manager, _) = raw_sessions(SessionOptions::legacy_compatible()).await;
+    let (send, recv) = manager.open_bi().await.unwrap();
+    let limit = FrameLimit::new(1024).unwrap();
+    let mut writer = FramedWriter::new(send, limit);
+    let mut reader = FramedReader::new(recv, limit);
+    let ((), ()) = tokio::join!(
+        async {
+            // `Allowlist` (15) is served by the legacy dispatcher, not by sessions.
+            writer.start((15_u32.to_le_bytes(), ())).unwrap();
+            writer.flush().await.unwrap();
+            let answer = reader.read().await.unwrap().unwrap();
+            assert_eq!(
+                answer.decode::<Result<(), String>>().unwrap(),
+                Err("unknown request code: 15".to_string())
+            );
+            // The stream continues after the unserved code.
+            writer
+                .start((
+                    102_u32.to_le_bytes(),
+                    NodeHostnameRequest::Set {
+                        hostname: "served".into(),
+                    },
+                ))
+                .unwrap();
+            writer.flush().await.unwrap();
+            let answer = reader.read().await.unwrap().unwrap();
+            assert_eq!(
+                answer
+                    .decode::<Result<NodeHostnameResponse, String>>()
+                    .unwrap(),
+                Ok(NodeHostnameResponse::Done)
+            );
+            // Variant 200 does not exist: the arguments cannot be decoded.
+            writer.start_raw(&[102, 0, 0, 0, 200]).unwrap();
+            writer.flush().await.unwrap();
+            let answer = reader.read().await.unwrap().unwrap();
+            assert_eq!(
+                answer.decode::<Result<(), String>>().unwrap(),
+                Err(
+                    "request code 102: the arguments could not be decoded; the manager and the \
+                     agent may be built against different review-protocol releases"
+                        .to_string()
+                )
+            );
+            // The stream ends with FIN after the answer, not with a reset.
+            assert!(reader.read().await.unwrap().is_none());
+        },
+        async {
+            let mut stream = incoming.accept().await.unwrap();
+            let AgentRequest::Hostname { reply, .. } = stream.next().await.unwrap().unwrap() else {
+                panic!("wrong request");
+            };
+            reply.respond(Ok(NodeHostnameResponse::Done)).await.unwrap();
+            let error = stream.next().await.err().unwrap();
+            assert!(matches!(
+                error,
+                SessionError::Malformed {
+                    certainty: None,
+                    ..
+                }
+            ));
+        }
+    );
+}
+
+#[tokio::test]
+async fn manager_answers_unserved_codes_like_the_legacy_dispatcher() {
+    use oinq::frame::{FramedReader, FramedWriter};
+    let (mut incoming, _, _, node) = raw_sessions(SessionOptions::legacy_compatible()).await;
+    let (send, recv) = node.open_bi().await.unwrap();
+    let limit = FrameLimit::new(1024).unwrap();
+    let mut writer = FramedWriter::new(send, limit);
+    let mut reader = FramedReader::new(recv, limit);
+    let ((), ()) = tokio::join!(
+        async {
+            for code in [999_u32, 36] {
+                writer.start((code.to_le_bytes(), ())).unwrap();
+                writer.flush().await.unwrap();
+            }
+            writer.into_inner().finish().unwrap();
+            let answer = reader.read().await.unwrap().unwrap();
+            assert_eq!(
+                answer.decode::<Result<String, String>>().unwrap(),
+                Err("unknown request code".to_string())
+            );
+            let answer = reader.read().await.unwrap().unwrap();
+            assert_eq!(
+                answer.decode::<Result<String, String>>().unwrap(),
+                Ok("configuration".to_string())
+            );
+            assert!(reader.read().await.unwrap().is_none());
+        },
+        async {
+            let mut stream = request_stream(&mut incoming).await;
+            let ServerRequest::GetConfig { reply, .. } = stream.next().await.unwrap().unwrap()
+            else {
+                panic!("wrong request");
+            };
+            reply.respond(Ok("configuration".into())).await.unwrap();
+            assert!(stream.next().await.unwrap().is_none());
+        }
+    );
+}
+
+#[tokio::test]
+async fn undecodable_event_leaves_the_stream_aligned() {
+    use review_protocol::types::{EventKind, EventMessage};
+    let (mut incoming, _, _, node) = raw_sessions(SessionOptions::legacy_compatible()).await;
+    let event = EventMessage {
+        time: jiff::Timestamp::UNIX_EPOCH,
+        kind: EventKind::HttpThreat,
+        fields: vec![7, 8, 9],
+    };
+    let payload = bincode::serde::encode_to_vec(&event, bincode::config::standard()).unwrap();
+    let mut send = node.open_uni().await.unwrap();
+    send.write_all(&[0, 0]).await.unwrap();
+    // A frame that is complete but does not decode as an event.
+    send.write_all(&1_u32.to_be_bytes()).await.unwrap();
+    send.write_all(&[255]).await.unwrap();
+    send.write_all(&u32::try_from(payload.len()).unwrap().to_be_bytes())
+        .await
+        .unwrap();
+    send.write_all(&payload).await.unwrap();
+    send.finish().unwrap();
+    let mut sequence = event_stream(&mut incoming).await;
+    assert!(matches!(
+        sequence.next().await,
+        Err(SessionError::Malformed { .. })
+    ));
+    assert_eq!(sequence.next().await.unwrap().unwrap().fields, event.fields);
+    assert!(sequence.next().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn install_failure_is_answered_after_draining_the_payload() {
+    use review_protocol::types::node::NodePackageResponse;
+    let mut options = SessionOptions::legacy_compatible();
+    options.package_chunks = FrameLimit::new(1024).unwrap();
+    let (server, _, _, mut incoming) = sessions(options).await;
+    let mut source = std::io::Cursor::new(vec![3; 4000]);
+    let (result, ()) = tokio::join!(
+        server.node_package_install(install_request(4000), &mut source),
+        async {
+            let mut stream = incoming.accept().await.unwrap();
+            let AgentRequest::Package { reply, .. } = stream.next().await.unwrap().unwrap() else {
+                panic!("wrong request");
+            };
+            let mut transfer = reply
+                .preflight(Ok(InstallPreflight::Proceed))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut buffer = Vec::new();
+            assert!(transfer.next_chunk(&mut buffer).await.unwrap());
+            // Storing failed after the first chunk; the rest is drained.
+            transfer
+                .respond(Err::<NodePackageResponse, _>("disk full".into()))
+                .await
+                .unwrap();
+            assert!(stream.next().await.unwrap().is_none());
+        }
+    );
+    assert!(matches!(result, Err(SessionError::RemoteRejection(text)) if text == "disk full"));
+    assert_eq!(source.position(), 4000);
+}
+
+#[tokio::test]
+async fn undecodable_or_oversized_response_after_sending_is_unknown() {
+    use oinq::frame::{FramedReader, FramedWriter};
+    let mut options = SessionOptions::legacy_compatible();
+    options.unary = FrameLimit::new(64).unwrap();
+    let (manager, node) = connections().await;
+    let info = claims();
+    let (server, agent) = tokio::join!(
+        ServerHandle::from_transport(manager.clone(), options.clone(), ">=0.48.0", "0.49.0"),
+        AgentHandle::from_transport(node, options, &info),
+    );
+    // Keep the manager session alive without accepting its streams.
+    let _server = server.unwrap();
+    let (agent, _) = agent.unwrap();
+    for response in [vec![7_u8], vec![0; 65]] {
+        let (result, ()) = tokio::join!(agent.get_config(), async {
+            let (send, recv) = manager.accept_bi().await.unwrap();
+            let limit = FrameLimit::new(1024).unwrap();
+            let mut reader = FramedReader::new(recv, limit);
+            let mut writer = FramedWriter::new(send, limit);
+            reader.read().await.unwrap().unwrap();
+            writer.start_raw(&response).unwrap();
+            writer.flush().await.unwrap();
+            let _ = writer.into_inner().finish();
+        });
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error,
+            SessionError::Malformed { .. } | SessionError::LimitExceeded { .. }
+        ));
+        assert_eq!(error.certainty(), Some(OutcomeCertainty::Unknown));
+    }
+    // An oversized local request is refused before anything is sent.
+    let error = agent.upload_run_model(1, &[0; 128]).await.unwrap_err();
+    assert!(matches!(error, SessionError::LimitExceeded { .. }));
+    assert_eq!(error.certainty(), Some(OutcomeCertainty::NotSent));
+}
+
+#[tokio::test]
+async fn incomplete_install_cannot_send_a_terminal_success() {
+    use review_protocol::types::node::NodePackageResponse;
+    let mut options = SessionOptions::legacy_compatible();
+    options.package_chunks = FrameLimit::new(1024).unwrap();
+    let (server, _, _, mut incoming) = sessions(options).await;
+    let (result, ()) = tokio::join!(
+        server.node_package_install(install_request(4000), std::io::Cursor::new(vec![3; 4000])),
+        async {
+            let mut stream = incoming.accept().await.unwrap();
+            let AgentRequest::Package { reply, .. } = stream.next().await.unwrap().unwrap() else {
+                panic!("wrong request");
+            };
+            let mut transfer = reply
+                .preflight(Ok(InstallPreflight::Proceed))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut buffer = Vec::new();
+            assert!(transfer.next_chunk(&mut buffer).await.unwrap());
+            assert!(matches!(
+                transfer.respond(Ok(NodePackageResponse::Done)).await,
+                Err(SessionError::Malformed { .. })
+            ));
+        }
+    );
+    assert!(matches!(
+        result,
+        Err(SessionError::Transport {
+            certainty: OutcomeCertainty::Unknown,
+            ..
+        })
+    ));
 }

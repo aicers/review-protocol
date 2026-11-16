@@ -83,18 +83,52 @@ impl Drop for ExchangeLease<'_> {
         }
     }
 }
+impl ExchangeLease<'_> {
+    /// Decodes the arguments of request `code` and recycles its frame.
+    ///
+    /// Arguments that cannot be decoded are answered with the legacy dispatcher's
+    /// error text before the stream ends at this frame boundary, so a peer reads
+    /// a remote rejection naming the code rather than a reset. The returned error
+    /// is the decoding or limit error; a failure to send the answer cannot replace
+    /// it. Cancelling the answer aborts the stream, which was ending anyway.
+    async fn arguments<T: DeserializeOwned>(
+        &mut self,
+        code: u32,
+        frame: oinq::frame::Frame,
+        limit: usize,
+    ) -> Result<T, SessionError> {
+        let result = arguments(&frame, limit);
+        self.recycle(frame)?;
+        let error = match result {
+            Ok(arguments) => return Ok(arguments),
+            Err(error) => error,
+        };
+        let answer = match error {
+            SessionError::LimitExceeded { .. } => format!(
+                "request code {code}: the arguments exceed the receiving peer's configured limit"
+            ),
+            _ => crate::wire::undecodable_args_message(code),
+        };
+        if self.start(Err::<(), String>(answer)).is_ok() && self.flush().await.is_ok() {
+            let _ = self.finish();
+        }
+        Err(error)
+    }
+}
 
 fn malformed(message: &'static str) -> SessionError {
-    SessionError::Malformed(Box::new(std::io::Error::new(
+    SessionError::malformed(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         message,
-    )))
+    ))
 }
 
 struct RequestOwner {
     exchange: Exchange,
     options: super::SessionOptions,
     ended: bool,
+    /// An answer to an unserved request code is prepared but not yet flushed.
+    answering: bool,
 }
 impl RequestOwner {
     fn new(send: oinq::SendStream, recv: oinq::RecvStream, options: super::SessionOptions) -> Self {
@@ -102,28 +136,108 @@ impl RequestOwner {
             exchange: Exchange::new(send, recv, options.unary),
             options,
             ended: false,
+            answering: false,
         }
     }
 
-    async fn next(&mut self) -> Result<Option<(u32, oinq::frame::Frame)>, SessionError> {
-        if self.ended {
-            return Ok(None);
+    /// Reads the next request whose code `serves` accepts.
+    ///
+    /// Any other code is answered with `unserved(code)` as a remote rejection,
+    /// as the legacy dispatchers do, and the stream continues with the next
+    /// frame. The answer's flush resumes on the next call when cancelled.
+    async fn next(
+        &mut self,
+        serves: fn(u32) -> bool,
+        unserved: fn(u32) -> String,
+    ) -> Result<Option<(u32, oinq::frame::Frame)>, SessionError> {
+        loop {
+            if self.answering {
+                self.exchange.flush().await?;
+                self.answering = false;
+            }
+            if self.ended {
+                return Ok(None);
+            }
+            let Some(frame) = self.exchange.next_frame().await? else {
+                self.ended = true;
+                self.exchange.complete();
+                return Ok(None);
+            };
+            let Some(code) = frame.as_bytes().get(..4) else {
+                self.exchange.cancel();
+                return Err(malformed("request code is truncated"));
+            };
+            let code = u32::from_le_bytes(
+                code.try_into()
+                    .expect("the request code slice has four bytes"),
+            );
+            if serves(code) {
+                return Ok(Some((code, frame)));
+            }
+            self.exchange.recycle(frame)?;
+            self.exchange.start(Err::<(), String>(unserved(code)))?;
+            self.answering = true;
         }
-        let Some(frame) = self.exchange.next_frame().await? else {
-            self.ended = true;
-            self.exchange.complete();
-            return Ok(None);
-        };
-        let Some(code) = frame.as_bytes().get(..4) else {
-            self.exchange.cancel();
-            return Err(malformed("request code is truncated"));
-        };
-        let code = u32::from_le_bytes(
-            code.try_into()
-                .expect("the request code slice has four bytes"),
-        );
-        Ok(Some((code, frame)))
     }
+}
+
+/// Whether [`ServerRequestStream::next`] dispatches request `code`.
+#[cfg(feature = "server")]
+fn server_serves(code: u32) -> bool {
+    use crate::server::RequestCode as C;
+    matches!(
+        C::from(code),
+        C::GetConfig
+            | C::GetModel
+            | C::GetPretrainedModel
+            | C::GetModelNames
+            | C::GetAllowlist
+            | C::GetBlocklist
+            | C::InsertModel
+            | C::UpdateModel
+            | C::RemoveModel
+            | C::ReportCustomerDataDeletion
+            | C::UploadRunModel
+            | C::ReportRun
+            | C::ReportActiveRuns
+            | C::ReportDetectorStatus
+    )
+}
+
+/// The legacy manager dispatcher's answer to a code it does not serve.
+#[cfg(feature = "server")]
+fn server_unserved(_code: u32) -> String {
+    "unknown request code".to_string()
+}
+
+/// Whether [`AgentRequestStream::next`] dispatches request `code`.
+#[cfg(feature = "client")]
+fn agent_serves(code: u32) -> bool {
+    use crate::client::RequestCode as C;
+    matches!(
+        C::from(code),
+        C::NodeService
+            | C::NodeNetworkInterface
+            | C::NodeHostname
+            | C::NodeTimeSync
+            | C::NodeLogging
+            | C::NodeRemoteAccess
+            | C::NodeObservation
+            | C::NodeVersion
+            | C::NodeEnroll
+            | C::NodePower
+            | C::NodePackage
+            | C::TrainModel
+            | C::CloneModel
+            | C::CancelRun
+            | C::RunDetectorOnce
+    )
+}
+
+/// The legacy agent dispatcher's answer to a code it does not serve.
+#[cfg(feature = "client")]
+fn agent_unserved(code: u32) -> String {
+    format!("unknown request code: {code}")
 }
 
 fn arguments<T: DeserializeOwned>(
@@ -200,15 +314,14 @@ impl ServerRequestStream {
     /// Returns classified transport, malformed request, or limit errors and aborts the stream.
     #[allow(clippy::too_many_lines)]
     pub async fn next(&mut self) -> Result<Option<ServerRequest<'_>>, SessionError> {
-        let Some((code, frame)) = self.0.next().await? else {
+        let Some((code, frame)) = self.0.next(server_serves, server_unserved).await? else {
             return Ok(None);
         };
         let limit = self.0.options.unary.get();
         let mut exchange = ExchangeLease(Some(&mut self.0.exchange));
         let request = match code {
             code if code == u32::from(crate::server::RequestCode::GetConfig) => {
-                let request: () = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: () = exchange.arguments(code, frame, limit).await?;
                 ServerRequest::GetConfig {
                     request,
                     reply: Reply {
@@ -218,8 +331,7 @@ impl ServerRequestStream {
                 }
             }
             code if code == u32::from(crate::server::RequestCode::GetModel) => {
-                let request: String = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: String = exchange.arguments(code, frame, limit).await?;
                 ServerRequest::GetModel {
                     request,
                     reply: Reply {
@@ -229,8 +341,7 @@ impl ServerRequestStream {
                 }
             }
             code if code == u32::from(crate::server::RequestCode::GetPretrainedModel) => {
-                let request: String = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: String = exchange.arguments(code, frame, limit).await?;
                 ServerRequest::GetPretrainedModel {
                     request,
                     reply: Reply {
@@ -240,8 +351,7 @@ impl ServerRequestStream {
                 }
             }
             code if code == u32::from(crate::server::RequestCode::GetModelNames) => {
-                let request: () = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: () = exchange.arguments(code, frame, limit).await?;
                 ServerRequest::GetModelNames {
                     request,
                     reply: Reply {
@@ -251,8 +361,7 @@ impl ServerRequestStream {
                 }
             }
             code if code == u32::from(crate::server::RequestCode::GetAllowlist) => {
-                let request: () = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: () = exchange.arguments(code, frame, limit).await?;
                 ServerRequest::GetAllowlist {
                     request,
                     reply: Reply {
@@ -262,8 +371,7 @@ impl ServerRequestStream {
                 }
             }
             code if code == u32::from(crate::server::RequestCode::GetBlocklist) => {
-                let request: () = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: () = exchange.arguments(code, frame, limit).await?;
                 ServerRequest::GetBlocklist {
                     request,
                     reply: Reply {
@@ -273,8 +381,7 @@ impl ServerRequestStream {
                 }
             }
             code if code == u32::from(crate::server::RequestCode::InsertModel) => {
-                let request: Vec<u8> = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: Vec<u8> = exchange.arguments(code, frame, limit).await?;
                 ServerRequest::InsertModel {
                     request,
                     reply: Reply {
@@ -284,8 +391,7 @@ impl ServerRequestStream {
                 }
             }
             code if code == u32::from(crate::server::RequestCode::UpdateModel) => {
-                let request: Vec<u8> = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: Vec<u8> = exchange.arguments(code, frame, limit).await?;
                 ServerRequest::UpdateModel {
                     request,
                     reply: Reply {
@@ -295,8 +401,7 @@ impl ServerRequestStream {
                 }
             }
             code if code == u32::from(crate::server::RequestCode::RemoveModel) => {
-                let request: String = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: String = exchange.arguments(code, frame, limit).await?;
                 ServerRequest::RemoveModel {
                     request,
                     reply: Reply {
@@ -306,8 +411,8 @@ impl ServerRequestStream {
                 }
             }
             code if code == u32::from(crate::server::RequestCode::ReportCustomerDataDeletion) => {
-                let request: CustomerDataDeletionReport = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: CustomerDataDeletionReport =
+                    exchange.arguments(code, frame, limit).await?;
                 ServerRequest::ReportCustomerDataDeletion {
                     request,
                     reply: Reply {
@@ -317,8 +422,7 @@ impl ServerRequestStream {
                 }
             }
             code if code == u32::from(crate::server::RequestCode::UploadRunModel) => {
-                let request: (u32, Vec<u8>) = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: (u32, Vec<u8>) = exchange.arguments(code, frame, limit).await?;
                 ServerRequest::UploadRunModel {
                     request,
                     reply: Reply {
@@ -328,8 +432,8 @@ impl ServerRequestStream {
                 }
             }
             code if code == u32::from(crate::server::RequestCode::ReportRun) => {
-                let request: (u32, ReportedRunState, Option<String>) = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: (u32, ReportedRunState, Option<String>) =
+                    exchange.arguments(code, frame, limit).await?;
                 ServerRequest::ReportRun {
                     request,
                     reply: Reply {
@@ -339,8 +443,7 @@ impl ServerRequestStream {
                 }
             }
             code if code == u32::from(crate::server::RequestCode::ReportActiveRuns) => {
-                let request: Vec<u32> = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: Vec<u32> = exchange.arguments(code, frame, limit).await?;
                 ServerRequest::ReportActiveRuns {
                     request,
                     reply: Reply {
@@ -350,8 +453,7 @@ impl ServerRequestStream {
                 }
             }
             code if code == u32::from(crate::server::RequestCode::ReportDetectorStatus) => {
-                let request: DetectorStatusReport = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: DetectorStatusReport = exchange.arguments(code, frame, limit).await?;
                 ServerRequest::ReportDetectorStatus {
                     request,
                     reply: Reply {
@@ -360,6 +462,7 @@ impl ServerRequestStream {
                     },
                 }
             }
+            // `*_serves` admits only the codes matched above.
             _ => return Err(malformed("unknown request code")),
         };
         Ok(Some(request))
@@ -524,15 +627,14 @@ impl AgentRequestStream {
     /// Returns classified transport, malformed request, or limit errors and aborts the stream.
     #[allow(clippy::too_many_lines)]
     pub async fn next(&mut self) -> Result<Option<AgentRequest<'_>>, SessionError> {
-        let Some((code, frame)) = self.0.next().await? else {
+        let Some((code, frame)) = self.0.next(agent_serves, agent_unserved).await? else {
             return Ok(None);
         };
         let limit = self.0.options.unary.get();
         let mut exchange = ExchangeLease(Some(&mut self.0.exchange));
         let request = match code {
             code if code == u32::from(crate::client::RequestCode::NodeService) => {
-                let request: NodeServiceRequest = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: NodeServiceRequest = exchange.arguments(code, frame, limit).await?;
                 AgentRequest::Service {
                     request,
                     reply: Reply {
@@ -542,8 +644,8 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::NodeNetworkInterface) => {
-                let request: NodeNetworkInterfaceRequest = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: NodeNetworkInterfaceRequest =
+                    exchange.arguments(code, frame, limit).await?;
                 AgentRequest::NetworkInterface {
                     request,
                     reply: Reply {
@@ -553,8 +655,7 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::NodeHostname) => {
-                let request: NodeHostnameRequest = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: NodeHostnameRequest = exchange.arguments(code, frame, limit).await?;
                 AgentRequest::Hostname {
                     request,
                     reply: Reply {
@@ -564,8 +665,7 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::NodeTimeSync) => {
-                let request: NodeTimeSyncRequest = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: NodeTimeSyncRequest = exchange.arguments(code, frame, limit).await?;
                 AgentRequest::TimeSync {
                     request,
                     reply: Reply {
@@ -575,8 +675,7 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::NodeLogging) => {
-                let request: NodeLoggingRequest = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: NodeLoggingRequest = exchange.arguments(code, frame, limit).await?;
                 AgentRequest::Logging {
                     request,
                     reply: Reply {
@@ -586,8 +685,8 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::NodeRemoteAccess) => {
-                let request: NodeRemoteAccessRequest = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: NodeRemoteAccessRequest =
+                    exchange.arguments(code, frame, limit).await?;
                 AgentRequest::RemoteAccess {
                     request,
                     reply: Reply {
@@ -597,8 +696,8 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::NodeObservation) => {
-                let request: NodeObservationRequest = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: NodeObservationRequest =
+                    exchange.arguments(code, frame, limit).await?;
                 AgentRequest::Observation {
                     request,
                     reply: Reply {
@@ -608,8 +707,7 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::NodeVersion) => {
-                let request: NodeVersionRequest = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: NodeVersionRequest = exchange.arguments(code, frame, limit).await?;
                 AgentRequest::Version {
                     request,
                     reply: Reply {
@@ -619,8 +717,7 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::NodeEnroll) => {
-                let request: NodeEnrollRequest = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: NodeEnrollRequest = exchange.arguments(code, frame, limit).await?;
                 AgentRequest::Enroll {
                     request,
                     reply: Reply {
@@ -630,8 +727,7 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::NodePower) => {
-                let request: NodePowerRequest = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: NodePowerRequest = exchange.arguments(code, frame, limit).await?;
                 AgentRequest::Power {
                     request,
                     reply: Reply {
@@ -641,8 +737,7 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::NodePackage) => {
-                let request: NodePackageRequest = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: NodePackageRequest = exchange.arguments(code, frame, limit).await?;
                 let remaining = match &request {
                     NodePackageRequest::Install { size, .. } => Some(*size),
                     _ => None,
@@ -658,8 +753,7 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::TrainModel) => {
-                let request: TrainModelRequest = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: TrainModelRequest = exchange.arguments(code, frame, limit).await?;
                 AgentRequest::TrainModel {
                     request,
                     reply: Reply {
@@ -669,8 +763,7 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::CloneModel) => {
-                let request: CloneModelRequest = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: CloneModelRequest = exchange.arguments(code, frame, limit).await?;
                 AgentRequest::CloneModel {
                     request,
                     reply: Reply {
@@ -680,8 +773,7 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::CancelRun) => {
-                let request: u32 = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: u32 = exchange.arguments(code, frame, limit).await?;
                 AgentRequest::CancelRun {
                     request,
                     reply: Reply {
@@ -691,8 +783,7 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::RunDetectorOnce) => {
-                let request: i32 = arguments(&frame, limit)?;
-                exchange.recycle(frame)?;
+                let request: i32 = exchange.arguments(code, frame, limit).await?;
                 AgentRequest::RunDetectorOnce {
                     request,
                     reply: Reply {
@@ -701,6 +792,7 @@ impl AgentRequestStream {
                     },
                 }
             }
+            // `*_serves` admits only the codes matched above.
             _ => return Err(malformed("unknown request code")),
         };
         Ok(Some(request))
@@ -1279,8 +1371,7 @@ impl PackageReply<'_> {
             return Ok(false);
         }
         let frame = self.exchange.frame().await?;
-        let length = u64::try_from(frame.as_bytes().len())
-            .map_err(|e| SessionError::Malformed(Box::new(e)))?;
+        let length = u64::try_from(frame.as_bytes().len()).map_err(SessionError::malformed)?;
         if length > *remaining {
             self.exchange.cancel();
             return Err(malformed("package chunk exceeds the declared size"));
@@ -1291,19 +1382,29 @@ impl PackageReply<'_> {
         Ok(true)
     }
 
-    /// Sends the terminal package response after a unary request or complete install.
+    /// Sends the terminal package response after a unary request or an install.
+    ///
+    /// An incomplete install cannot send a terminal success: an `Ok` response
+    /// before every declared byte was received is refused and aborts the stream.
+    /// An `Err` response, for example because the agent failed to store the
+    /// payload, first reads and discards the rest of the declared bytes, as the
+    /// legacy dispatcher drains for a failed handler, so the manager receives
+    /// the rejection rather than a reset.
     /// # Errors
     /// Returns malformed-state, encoding, limit, or transport errors.
     pub async fn respond(
         mut self,
         response: Result<NodePackageResponse, String>,
     ) -> Result<(), SessionError> {
-        if self.remaining.is_some_and(|remaining| remaining != 0)
-            || (self.remaining.is_some() && !self.receiving)
-        {
+        let incomplete = self.remaining.is_some_and(|remaining| remaining != 0);
+        if (self.remaining.is_some() && !self.receiving) || (incomplete && response.is_ok()) {
             return Err(malformed(
                 "install payload has not been completely received",
             ));
+        }
+        if incomplete {
+            let mut discard = Vec::new();
+            while self.next_chunk(&mut discard).await? {}
         }
         self.exchange.start(response)?;
         self.exchange.flush().await?;
@@ -1392,19 +1493,18 @@ impl super::ServerHandle {
             // Sender tuning only; the configured limit is always respected.
             let chunk_size = options.package_chunks.get().min(64 * 1024);
             if chunk_size == 0 && remaining > 0 {
-                return Err(SessionError::LimitExceeded(
-                    oinq::frame::FrameError::TooLarge {
-                        length: 1,
-                        limit: options.package_chunks,
-                    },
-                ));
+                return Err(SessionError::limit(oinq::frame::FrameError::TooLarge {
+                    length: 1,
+                    limit: options.package_chunks,
+                })
+                .within(certainty));
             }
             let mut buffer = vec![0; chunk_size];
             while remaining > 0 {
-                let want = usize::try_from(remaining.min(
-                    u64::try_from(chunk_size).map_err(|e| SessionError::Malformed(Box::new(e)))?,
-                ))
-                .map_err(|e| SessionError::Malformed(Box::new(e)))?;
+                let want = usize::try_from(
+                    remaining.min(u64::try_from(chunk_size).map_err(SessionError::malformed)?),
+                )
+                .map_err(SessionError::malformed)?;
                 let length = source
                     .read(&mut buffer[..want])
                     .await
@@ -1420,8 +1520,7 @@ impl super::ServerHandle {
                 }
                 exchange.start_raw(&buffer[..length])?;
                 exchange.flush().await?;
-                remaining -=
-                    u64::try_from(length).map_err(|e| SessionError::Malformed(Box::new(e)))?;
+                remaining -= u64::try_from(length).map_err(SessionError::malformed)?;
             }
             let response: Result<NodePackageResponse, String> = exchange.receive().await?;
             exchange.complete();

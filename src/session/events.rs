@@ -37,16 +37,30 @@ impl EventReceiver {
         }
     }
     /// Reads the next bounded event, retaining partial progress when cancelled.
+    ///
+    /// An event frame that was read completely but cannot be decoded, for example
+    /// an event kind added by a newer agent, returns a `Malformed` or
+    /// `LimitExceeded` error and leaves the stream aligned: calling `next` again
+    /// reads the following event, as the legacy `process_event_stream` keeps
+    /// reading after reporting the error. Every other error aborts the stream.
     /// # Errors
     /// Returns typed transport, truncation, malformed data, or allocation/payload-limit errors.
     pub async fn next(&mut self) -> Result<Option<crate::types::EventMessage>, SessionError> {
-        let result = self.read_next().await;
-        if result.is_err() {
-            self.abort();
+        match self.read_next().await {
+            Ok(Ok(event)) => Ok(event),
+            Ok(Err(undecodable)) => Err(undecodable),
+            Err(error) => {
+                self.abort();
+                Err(error)
+            }
         }
-        result
     }
-    async fn read_next(&mut self) -> Result<Option<crate::types::EventMessage>, SessionError> {
+
+    /// Reads the next frame; the inner error is a decoding failure of a frame
+    /// that was read completely and recycled, after which the stream is intact.
+    async fn read_next(
+        &mut self,
+    ) -> Result<Result<Option<crate::types::EventMessage>, SessionError>, SessionError> {
         while self.header_pos < 2 {
             let recv = self.raw.as_mut().ok_or_else(|| {
                 SessionError::frame(oinq::frame::FrameError::Poisoned, OutcomeCertainty::Unknown)
@@ -74,16 +88,17 @@ impl EventReceiver {
             .await
             .map_err(|e| SessionError::frame(e, OutcomeCertainty::Unknown))?
         else {
-            return Ok(None);
+            return Ok(Ok(None));
         };
-        let (event, _) = super::decode::decode(
+        let event = super::decode::decode(
             frame.as_bytes(),
             &super::decode::Budget::new(self.limit.get()),
-        )?;
+        )
+        .map(|(event, _)| Some(event));
         reader
             .recycle(frame.into_bytes())
             .map_err(|e| SessionError::frame(e, OutcomeCertainty::Unknown))?;
-        Ok(Some(event))
+        Ok(event)
     }
     fn abort(&mut self) {
         if let Some(mut recv) = self.raw.take() {

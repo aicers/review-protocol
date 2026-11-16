@@ -168,6 +168,11 @@
 //! | `Rejected` | The peer explicitly rejected the operation. |
 //! | `Unknown` | The operation may have taken effect; reconcile before retrying. |
 //!
+//! `Malformed` and `LimitExceeded` carry the certainty of the operation that
+//! observed them: an oversized local request is `NotSent`, and a response that
+//! is truncated, cannot be decoded, or exceeds its budget after the request was
+//! sent is `Unknown`. They carry none when raised while reading a peer's request.
+//!
 //! A transport failure or deadline after submitting a mutation is `Unknown`, even
 //! when no response was received. It is not a remote rejection. Certainty becomes
 //! conservatively unknown when flushing starts; a partial frame cannot prove that
@@ -187,7 +192,8 @@
 //! receive stream with application code 1. Generic stream drop is not relied on as
 //! a reset guarantee. Dropping an incoming request or package transfer also aborts
 //! its exchange. Once an exchange has failed, further reads fail without consuming
-//! new frames.
+//! new frames. An undecodable event is the exception described below: its frame
+//! was read completely, so the event sequence stays aligned.
 //!
 //! Cancelling a *borrowed sub-operation* retains progress when its owner is kept:
 //! `ServerIncoming::accept`, `AgentIncoming::accept`, request stream `next`,
@@ -236,6 +242,14 @@
 //! Callers may still advertise `0.48.0` or select an explicit `>=0.48.0` through
 //! `0.49.0` window. Protocol versions are independent of crate release versions.
 //! No wire-version increment or synchronized deployment is required.
+//!
+//! Request streams answer a peer as the legacy dispatchers do. A request code a
+//! session does not serve is answered with the legacy remote-rejection text
+//! (`unknown request code: N` on an agent, `unknown request code` on a manager)
+//! and the stream continues. Arguments that cannot be decoded are answered with
+//! the legacy text naming the code before the stream ends with FIN. An event that
+//! cannot be decoded is returned as an error without ending its sequence. An
+//! install answered before its payload is complete drains the rest first.
 //!
 //! Existing applications can continue using the legacy API. A migration selects
 //! limits based on real payload requirements and uses a released foundation.
@@ -293,8 +307,16 @@ pub enum SessionError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
     /// Invalid local or received protocol data.
-    #[error("malformed protocol data: {0}")]
-    Malformed(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("malformed protocol data: {source}")]
+    Malformed {
+        /// The outcome of the operation that observed the data, when it has one.
+        ///
+        /// A response that cannot be decoded after a request was sent is
+        /// `Unknown`: the peer may already have applied the request.
+        certainty: Option<OutcomeCertainty>,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// A peer protocol version outside the caller-selected window.
     #[error("protocol {version} is incompatible with {required}")]
     IncompatibleProtocol { version: String, required: String },
@@ -302,8 +324,16 @@ pub enum SessionError {
     #[error("remote rejection: {0}")]
     RemoteRejection(String),
     /// A configured encoded-payload or allocation budget was exceeded.
-    #[error("session limit exceeded: {0}")]
-    LimitExceeded(#[source] FrameError),
+    #[error("session limit exceeded: {source}")]
+    LimitExceeded {
+        /// The outcome of the operation that hit the limit, when it has one.
+        ///
+        /// An oversized local request is `NotSent`; an oversized response to a
+        /// sent request is `Unknown`.
+        certainty: Option<OutcomeCertainty>,
+        #[source]
+        source: FrameError,
+    },
     /// An explicitly returned deadline/cancellation error.
     #[error("operation deadline or cancellation ({certainty:?})")]
     Deadline {
@@ -323,11 +353,35 @@ impl SessionError {
             Self::Transport { certainty, .. } | Self::Deadline { certainty, .. } => {
                 Some(*certainty)
             }
+            Self::Malformed { certainty, .. } | Self::LimitExceeded { certainty, .. } => *certainty,
             Self::RemoteRejection(_) | Self::IncompatibleProtocol { .. } => {
                 Some(OutcomeCertainty::Rejected)
             }
-            _ => None,
         }
+    }
+
+    pub(crate) fn malformed(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::Malformed {
+            certainty: None,
+            source: source.into(),
+        }
+    }
+
+    pub(crate) fn limit(source: FrameError) -> Self {
+        Self::LimitExceeded {
+            certainty: None,
+            source,
+        }
+    }
+
+    /// Records the certainty of the enclosing operation on a data or limit
+    /// error that was raised without one, such as a decoding failure.
+    pub(crate) fn within(mut self, outcome: OutcomeCertainty) -> Self {
+        if let Self::Malformed { certainty, .. } | Self::LimitExceeded { certainty, .. } = &mut self
+        {
+            certainty.get_or_insert(outcome);
+        }
+        self
     }
 
     pub(crate) fn transport(
@@ -342,9 +396,15 @@ impl SessionError {
 
     pub(crate) fn frame(source: FrameError, certainty: OutcomeCertainty) -> Self {
         match source {
-            FrameError::TooLarge { .. } | FrameError::InvalidLimit => Self::LimitExceeded(source),
+            FrameError::TooLarge { .. } | FrameError::InvalidLimit => Self::LimitExceeded {
+                certainty: Some(certainty),
+                source,
+            },
             FrameError::Io(_) => Self::transport(source, certainty),
-            _ => Self::Malformed(Box::new(source)),
+            _ => Self::Malformed {
+                certainty: Some(certainty),
+                source: Box::new(source),
+            },
         }
     }
 }

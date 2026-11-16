@@ -23,10 +23,10 @@ impl super::ServerHandle {
         version_req: &str,
         highest_protocol_version: &str,
     ) -> Result<(Self, super::ServerIncoming), SessionError> {
-        let requirement = semver::VersionReq::parse(version_req)
-            .map_err(|e| SessionError::Malformed(Box::new(e)))?;
-        let highest = semver::Version::parse(highest_protocol_version)
-            .map_err(|e| SessionError::Malformed(Box::new(e)))?;
+        let requirement =
+            semver::VersionReq::parse(version_req).map_err(SessionError::malformed)?;
+        let highest =
+            semver::Version::parse(highest_protocol_version).map_err(SessionError::malformed)?;
         let operation = async {
             let (send, recv) = connection
                 .accept_bi()
@@ -50,7 +50,10 @@ impl super::ServerHandle {
                 exchange.flush().await?;
                 // Retain endpoint resources until the rejection bytes/FIN are
                 // acknowledged; this constructor returns no handle on failure.
-                exchange.finish_and_wait().await?;
+                // A rejected agent may close the connection as soon as it reads
+                // the rejection, so a failure here must not replace the version
+                // error, as the legacy handshake ignores it too.
+                let _ = exchange.finish_and_wait().await;
                 Err(SessionError::IncompatibleProtocol {
                     version: agent.protocol_version,
                     required,
@@ -193,7 +196,7 @@ mod tests {
             bad.extend_from_slice(&[2, 1, b'a']);
             assert!(matches!(
                 decode_agent(&bad, 4096),
-                Err(SessionError::Malformed(_))
+                Err(SessionError::Malformed { .. })
             ));
             // Omitting a whole final None field is a valid tail boundary.
             assert!(decode_agent(&full[..full.len() - 1], 4096).is_ok());
