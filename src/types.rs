@@ -3666,6 +3666,44 @@ pub mod node {
             assert!(rendered.contains("<redacted>"), "{rendered}");
         }
 
+        /// The wire bytes of a `BootstrapMaterial`, under the
+        /// configuration the wire uses (`bincode::config::standard()`),
+        /// are pinned, so that a `jiff` upgrade cannot change how
+        /// `expires_at` is encoded.
+        #[test]
+        fn bootstrap_material_wire_bytes_are_pinned() {
+            const EXPECTED: &[u8] = &[
+                0x10, 0x73, 0x65, 0x6e, 0x73, 0x6f, 0x72, 0x2d, 0x69, 0x6e, 0x73, 0x74, 0x61, 0x6c,
+                0x6c, 0x65, 0x72, 0x08, 0x73, 0x2e, 0x39, 0x66, 0x33, 0x63, 0x31, 0x62, 0x04, 0x30,
+                0x82, 0x01, 0x0a, 0xfd, 0x2a, 0xfe, 0xe3, 0x47, 0xe4, 0x95, 0x0d, 0x31, 0x23, 0x7b,
+                0x22, 0x72, 0x65, 0x67, 0x69, 0x73, 0x74, 0x72, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x5f,
+                0x69, 0x64, 0x22, 0x3a, 0x22, 0x73, 0x76, 0x63, 0x2d, 0x37, 0x66, 0x32, 0x61, 0x22,
+                0x7d, 0xff, 0xfe, 0x00, 0xc3, 0x28,
+            ];
+
+            let material = bootstrap_material();
+            let bytes = bincode::serde::encode_to_vec(&material, bincode::config::standard())
+                .expect("serialization should succeed");
+            assert_eq!(bytes, EXPECTED, "{bytes:?}");
+
+            let (decoded, read): (BootstrapMaterial, usize) =
+                bincode::serde::decode_from_slice(EXPECTED, bincode::config::standard())
+                    .expect("deserialization should succeed");
+            assert_eq!(read, EXPECTED.len());
+            assert_eq!(decoded.expires_at, material.expires_at);
+            assert_eq!(decoded, material);
+        }
+
+        /// The `Debug` text of a `BootstrapMaterial`, including the
+        /// rendering of its sub-second `expires_at`, is pinned.
+        #[test]
+        fn bootstrap_material_debug_is_pinned() {
+            const EXPECTED: &str = "BootstrapMaterial { role_id: \"sensor-installer\", wrapped_secret_id: \"<redacted>\", ca_anchor: [48, 130, 1, 10], expires_at: 2026-01-02T03:04:05.123456789Z, bootstrap_artifact: \"<redacted>\" }";
+
+            let rendered = format!("{:?}", bootstrap_material());
+            assert_eq!(rendered, EXPECTED);
+        }
+
         #[test]
         fn serde_roundtrip_node_package_error() {
             let identities = || {
@@ -4755,6 +4793,138 @@ mod tests {
         assert_eq!(
             event.fields, deserialized.fields,
             "Fields should match after round-trip"
+        );
+    }
+
+    /// The wire bytes of an `EventMessage`, under the configuration the
+    /// wire uses (`bincode::config::standard()`), are pinned, so that a
+    /// `jiff` upgrade cannot change how `time` is encoded.
+    #[cfg(any(feature = "client", feature = "server"))]
+    #[test]
+    fn event_message_wire_bytes_are_pinned() {
+        const EXPECTED: &[u8] = &[
+            0xfd, 0x00, 0x2c, 0xc9, 0x5b, 0x9a, 0x17, 0x3a, 0x31, 0x01, 0x04, 0xde, 0xad, 0xbe,
+            0xef,
+        ];
+
+        let time = jiff::Timestamp::new(1_773_586_804, 120_000_000)
+            .expect("2026-03-15T15:00:04.12Z is a valid timestamp");
+        let event = EventMessage {
+            time,
+            kind: EventKind::HttpThreat,
+            fields: vec![0xde, 0xad, 0xbe, 0xef],
+        };
+        let bytes = bincode::serde::encode_to_vec(&event, bincode::config::standard())
+            .expect("serialization should succeed");
+        assert_eq!(bytes, EXPECTED, "{bytes:?}");
+
+        let (decoded, read): (EventMessage, usize) =
+            bincode::serde::decode_from_slice(EXPECTED, bincode::config::standard())
+                .expect("deserialization should succeed");
+        assert_eq!(read, EXPECTED.len());
+        assert_eq!(decoded.time, time);
+        assert_eq!(decoded.kind, event.kind);
+        assert_eq!(decoded.fields, event.fields);
+    }
+
+    /// Encodes a `TimeCount` under the wire configuration, asserts the
+    /// bytes equal `expected`, and decodes `expected` back.
+    #[cfg(any(feature = "client", feature = "server"))]
+    fn assert_time_count_wire_bytes(time: jiff::civil::DateTime, expected: &[u8]) {
+        let time_count = TimeCount { time, count: 42 };
+        let bytes = bincode::serde::encode_to_vec(&time_count, bincode::config::standard())
+            .expect("serialization should succeed");
+        assert_eq!(bytes, expected, "{bytes:?}");
+
+        let (decoded, read): (TimeCount, usize) =
+            bincode::serde::decode_from_slice(expected, bincode::config::standard())
+                .expect("deserialization should succeed");
+        assert_eq!(read, expected.len());
+        assert_eq!(decoded.time, time);
+        assert_eq!(decoded.count, time_count.count);
+    }
+
+    /// The wire bytes of a `TimeCount` with a sub-second `time` are
+    /// pinned; `civil::DateTime` is carried as a string whose fraction
+    /// `jiff` formats.
+    #[cfg(any(feature = "client", feature = "server"))]
+    #[test]
+    fn time_count_wire_bytes_are_pinned() {
+        assert_time_count_wire_bytes(
+            jiff::civil::DateTime::new(2026, 3, 15, 15, 0, 4, 120_000_000)
+                .expect("2026-03-15T15:00:04.12 is a valid civil datetime"),
+            &[
+                0x16, 0x32, 0x30, 0x32, 0x36, 0x2d, 0x30, 0x33, 0x2d, 0x31, 0x35, 0x54, 0x31, 0x35,
+                0x3a, 0x30, 0x30, 0x3a, 0x30, 0x34, 0x2e, 0x31, 0x32, 0x2a,
+            ],
+        );
+    }
+
+    /// The wire bytes of a `TimeCount` with a whole-second `time` are
+    /// pinned, since the string form trims a zero fraction.
+    #[cfg(any(feature = "client", feature = "server"))]
+    #[test]
+    fn time_count_whole_second_wire_bytes_are_pinned() {
+        assert_time_count_wire_bytes(
+            jiff::civil::DateTime::new(2026, 3, 15, 15, 0, 4, 0)
+                .expect("2026-03-15T15:00:04 is a valid civil datetime"),
+            &[
+                0x13, 0x32, 0x30, 0x32, 0x36, 0x2d, 0x30, 0x33, 0x2d, 0x31, 0x35, 0x54, 0x31, 0x35,
+                0x3a, 0x30, 0x30, 0x3a, 0x30, 0x34, 0x2a,
+            ],
+        );
+    }
+
+    /// The derived `Debug` text of an `EventMessage`, which a caller
+    /// can log, is pinned with a sub-second and a whole-second `time`.
+    #[test]
+    fn event_message_debug_is_pinned() {
+        use super::{EventKind, EventMessage};
+
+        let event = |time| EventMessage {
+            time,
+            kind: EventKind::HttpThreat,
+            fields: vec![0xde, 0xad, 0xbe, 0xef],
+        };
+        let fractional = jiff::Timestamp::new(1_773_586_804, 120_000_000)
+            .expect("2026-03-15T15:00:04.12Z is a valid timestamp");
+        let whole = jiff::Timestamp::from_second(1_773_586_804)
+            .expect("2026-03-15T15:00:04Z is a valid timestamp");
+
+        assert_eq!(
+            format!("{:?}", event(fractional)),
+            "EventMessage { time: 2026-03-15T15:00:04.12Z, kind: HttpThreat, fields: [222, 173, 190, 239] }"
+        );
+        assert_eq!(
+            format!("{:?}", event(whole)),
+            "EventMessage { time: 2026-03-15T15:00:04Z, kind: HttpThreat, fields: [222, 173, 190, 239] }"
+        );
+    }
+
+    /// The derived `Debug` text of a `TimeCount`, which a caller can
+    /// log, is pinned with a sub-second and a whole-second `time`.
+    #[test]
+    fn time_count_debug_is_pinned() {
+        use super::TimeCount;
+
+        let fractional = TimeCount {
+            time: jiff::civil::DateTime::new(2026, 3, 15, 15, 0, 4, 120_000_000)
+                .expect("2026-03-15T15:00:04.12 is a valid civil datetime"),
+            count: 42,
+        };
+        let whole = TimeCount {
+            time: jiff::civil::DateTime::new(2026, 3, 15, 15, 0, 4, 0)
+                .expect("2026-03-15T15:00:04 is a valid civil datetime"),
+            count: 42,
+        };
+
+        assert_eq!(
+            format!("{fractional:?}"),
+            "TimeCount { time: 2026-03-15T15:00:04.12, count: 42 }"
+        );
+        assert_eq!(
+            format!("{whole:?}"),
+            "TimeCount { time: 2026-03-15T15:00:04, count: 42 }"
         );
     }
 
