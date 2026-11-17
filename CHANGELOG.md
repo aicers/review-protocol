@@ -15,6 +15,15 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   with explicit exchange aborts. Legacy Quinn APIs and protocol bytes remain
   compatible.
 
+### Changed
+
+- **Breaking change:** Bumped `jiff` to 1.0. The `jiff` types in this crate's
+  public API (such as `EventMessage::time`, `TimeCount::time` and
+  `BootstrapMaterial::expires_at`) are now jiff 1 types, so a consumer that
+  names them must use jiff 1 as well. `types::ColumnStatistics`, re-exported
+  from `structured` 0.17, still carries jiff 0.2's `civil::DateTime` in
+  `Element::DateTime`. The wire format is unchanged.
+
 ## [0.26.0] - 2026-11-14
 
 ### Changed
