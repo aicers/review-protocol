@@ -45,8 +45,25 @@ pub async fn server(
     let ServerStream::Requests(mut stream) = incoming.accept().await? else {
         return Ok(());
     };
-    if let Some(ServerRequest::GetConfig { reply, .. }) = stream.next().await? {
-        reply.respond(Ok("configuration".into())).await?;
+    if let Some(request) = stream.next().await? {
+        match request {
+            ServerRequest::GetConfig { reply, .. } => {
+                reply.respond(Ok("configuration".into())).await?;
+            }
+            ServerRequest::GetModel { .. }
+            | ServerRequest::GetPretrainedModel { .. }
+            | ServerRequest::GetModelNames { .. }
+            | ServerRequest::GetAllowlist { .. }
+            | ServerRequest::GetBlocklist { .. }
+            | ServerRequest::InsertModel { .. }
+            | ServerRequest::UpdateModel { .. }
+            | ServerRequest::RemoveModel { .. }
+            | ServerRequest::ReportCustomerDataDeletion { .. }
+            | ServerRequest::UploadRunModel { .. }
+            | ServerRequest::ReportRun { .. }
+            | ServerRequest::ReportActiveRuns { .. }
+            | ServerRequest::ReportDetectorStatus { .. } => {}
+        }
     }
     stream.finish()?;
     Ok(())
@@ -85,4 +102,44 @@ pub async fn engine_commands(
     handle.send_clone_model(clone).await?;
     handle.send_cancel_run(1).await?;
     handle.send_run_detector_once(-3).await
+}
+
+#[cfg(feature = "server")]
+pub async fn process_server_stream<H, E>(
+    incoming: review_protocol::session::ServerIncoming,
+    context: review_protocol::auth::AuthorizationContext,
+    policy: std::sync::Arc<dyn review_protocol::auth::AuthorizerV2>,
+    requests: std::sync::Arc<H>,
+    events: E,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    H: review_protocol::server::Handler + Sync,
+    E: review_protocol::server::EventStreamHandler + Send,
+{
+    use review_protocol::session::{ServerRequestOutcome, ServerStream};
+
+    let mut incoming = incoming.with_authorization(context, policy);
+    match incoming.accept().await? {
+        ServerStream::Requests(stream) => {
+            if let ServerRequestOutcome::Unhandled(request) = stream.run(requests).await? {
+                let (_code, _body) = (request.code(), request.body());
+                request
+                    .respond(Err::<(), _>("application rejection".into()))
+                    .await?
+                    .finish()?;
+            }
+        }
+        ServerStream::Events(stream) => stream.run(events).await?,
+    }
+    Ok(())
+}
+
+#[cfg(feature = "server")]
+pub fn exhaustive_session_error(error: review_protocol::session::SessionError) {
+    use review_protocol::session::SessionError;
+    match error {
+        SessionError::Transport { .. } | SessionError::Malformed { .. }
+        | SessionError::IncompatibleProtocol { .. } | SessionError::RemoteRejection(_)
+        | SessionError::LimitExceeded { .. } | SessionError::Deadline { .. } => {}
+    }
 }

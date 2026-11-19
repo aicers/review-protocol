@@ -31,7 +31,7 @@ use std::{
 use num_enum::FromPrimitive;
 use oinq::request::parse_args;
 
-use super::RequestCode;
+use super::{AUTHORIZATION_DENIED, RequestCode, UNKNOWN_REQUEST_CODE};
 use crate::legacy_transport as oinq;
 use crate::protocol_error::{DispatchError, ProtocolErrorKind};
 use crate::types::{
@@ -339,7 +339,7 @@ where
             oinq::request::send_response(
                 send,
                 &mut buf,
-                Err::<(), String>("authorization denied".to_string()),
+                Err::<(), String>(AUTHORIZATION_DENIED.to_owned()),
             )
             .await?;
             return Err(io::Error::new(
@@ -527,14 +527,14 @@ where
                 oinq::frame::send(
                     send,
                     &mut buf,
-                    Err("unknown request code") as Result<(), &str>,
+                    Err(UNKNOWN_REQUEST_CODE) as Result<(), &str>,
                 )
                 .await?;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     DispatchError::new(
                         crate::protocol_error::ProtocolErrorKind::NotSupported,
-                        "unknown request code",
+                        UNKNOWN_REQUEST_CODE,
                     ),
                 ));
             }
@@ -594,7 +594,7 @@ where
             oinq::request::send_response(
                 send,
                 &mut buf,
-                Err::<(), String>("authorization denied".to_string()),
+                Err::<(), String>(AUTHORIZATION_DENIED.to_owned()),
             )
             .await?;
             return Err(io::Error::new(
@@ -786,14 +786,14 @@ where
                 oinq::frame::send(
                     send,
                     &mut buf,
-                    Err("unknown request code") as Result<(), &str>,
+                    Err(UNKNOWN_REQUEST_CODE) as Result<(), &str>,
                 )
                 .await?;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     DispatchError::new(
                         crate::protocol_error::ProtocolErrorKind::NotSupported,
-                        "unknown request code",
+                        UNKNOWN_REQUEST_CODE,
                     ),
                 ));
             }

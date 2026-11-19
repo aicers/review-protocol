@@ -307,6 +307,8 @@ async fn retained_request_stream_resumes_partial_frame() {
             .unwrap(),
         Ok("resumed".into())
     );
+    assert!(reader.read().await.unwrap().is_none());
+    assert_eq!(send.stopped().await.unwrap().unwrap().get(), 1);
 }
 
 #[tokio::test]
@@ -514,14 +516,20 @@ async fn nested_response_allocations_are_classified_as_limits() {
         let mut reader = oinq::frame::FramedReader::new(recv, FrameLimit::new(4096).unwrap());
         reader.read().await.unwrap().unwrap();
         let mut writer = oinq::frame::FramedWriter::new(send, FrameLimit::new(4096).unwrap());
-        // Only 203 encoded bytes, but at least 4800 bytes of String elements.
+        // The encoded reply fits, but the String elements exceed the decode budget.
         writer
             .start(Ok::<_, String>(vec![String::new(); 200]))
             .unwrap();
         writer.flush().await.unwrap();
         writer.into_inner().finish().unwrap();
     });
-    assert!(matches!(result, Err(SessionError::LimitExceeded { .. })));
+    assert!(matches!(
+        result,
+        Err(SessionError::LimitExceeded {
+            source: oinq::frame::FrameError::Decode(_),
+            ..
+        })
+    ));
 }
 
 #[tokio::test]
@@ -1213,16 +1221,18 @@ async fn manager_answers_unserved_codes_like_the_legacy_dispatcher() {
     let mut reader = FramedReader::new(recv, limit);
     let ((), ()) = tokio::join!(
         async {
-            for code in [999_u32, 36] {
+            for code in [999_u32, 23, 36] {
                 writer.start((code.to_le_bytes(), ())).unwrap();
                 writer.flush().await.unwrap();
             }
             writer.into_inner().finish().unwrap();
-            let answer = reader.read().await.unwrap().unwrap();
-            assert_eq!(
-                answer.decode::<Result<String, String>>().unwrap(),
-                Err("unknown request code".to_string())
-            );
+            for _ in 0..2 {
+                let answer = reader.read().await.unwrap().unwrap();
+                assert_eq!(
+                    answer.decode::<Result<String, String>>().unwrap(),
+                    Err("unknown request code".to_string())
+                );
+            }
             let answer = reader.read().await.unwrap().unwrap();
             assert_eq!(
                 answer.decode::<Result<String, String>>().unwrap(),
@@ -1376,3 +1386,6 @@ async fn incomplete_install_cannot_send_a_terminal_success() {
         })
     ));
 }
+
+#[path = "session_transport/server_processing.rs"]
+mod server_processing;

@@ -56,37 +56,55 @@
 //! restored. Event senders and receivers own their streams privately; the existing
 //! two-byte event header is preserved.
 //!
-//! For example, a configuration-only runner can retain its stream across requests:
+//! ## Supervised server processing
+//!
+//! Use `ServerIncoming::with_authorization` to bind the application's authenticated
+//! context and `AuthorizerV2` before accepting streams. An existing `Authorizer`
+//! can be wrapped in `AuthorizerV2Adapter`. The request runner checks this policy
+//! before every invocation, including subsequent requests on the same stream.
+//! It passes the context's peer name to existing `server::Handler` methods that
+//! take a peer argument. The event runner takes a `server::EventStreamHandler`
+//! for a particular stream. Applications can supply peer-specific behavior in
+//! that handler.
 //!
 //! ```no_run
 //! # #[cfg(feature = "server")]
-//! # async fn serve(mut incoming: review_protocol::session::ServerIncoming)
-//! # -> Result<(), review_protocol::session::SessionError> {
-//! use review_protocol::session::{ServerRequest, ServerStream};
+//! # async fn serve_one<H, E>(
+//! #     incoming: review_protocol::session::ServerIncoming,
+//! #     context: review_protocol::auth::AuthorizationContext,
+//! #     policy: std::sync::Arc<dyn review_protocol::auth::AuthorizerV2>,
+//! #     requests: std::sync::Arc<H>,
+//! #     events: E,
+//! # ) -> Result<(), Box<dyn std::error::Error>>
+//! # where
+//! #     H: review_protocol::server::Handler + Sync,
+//! #     E: review_protocol::server::EventStreamHandler + Send,
+//! # {
+//! use review_protocol::session::{ServerRequestOutcome, ServerStream};
 //!
+//! let mut incoming = incoming.with_authorization(context, policy);
 //! match incoming.accept().await? {
-//!     ServerStream::Requests(mut stream) => {
-//!         while let Some(request) = stream.next().await? {
-//!             match request {
-//!                 ServerRequest::GetConfig { reply, .. } => {
-//!                     // Resolve identity and authorize this invocation before
-//!                     // obtaining the configuration from an application handler.
-//!                     reply.respond(Ok("configuration".into())).await?;
-//!                 }
-//!                 _ => break, // An unsupported invocation aborts this stream.
-//!             }
+//!     ServerStream::Requests(stream) => {
+//!         if let ServerRequestOutcome::Unhandled(request) = stream.run(requests).await? {
+//!             // This application has no extension for the delegated code.
+//!             request.into_stream().finish()?;
 //!         }
 //!     }
-//!     ServerStream::Events(mut events) => {
-//!         while let Some(event) = events.next().await? {
-//!             // Apply the application's event authorization and handler here.
-//!             let _ = event;
-//!         }
-//!     }
+//!     ServerStream::Events(stream) => stream.run(events).await?,
 //! }
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! Each `run` future owns one stream. For concurrent service, accept another
+//! stream while existing runners are supervised within the application's
+//! concurrency limit. Retain and join any spawned tasks, including after
+//! cancellation. Dropping an owned runner aborts the stream and cancels any
+//! in-progress callback. A callback may already have performed application work.
+//! To stop dispatch at a request boundary under application control, use
+//! `ServerRequestStream::next` with per-invocation authorization and call
+//! `finish` after the final reply. Borrowed framing reads can be suspended and
+//! resumed while their owners are kept.
 //!
 //! Retain a handle while serving requests. Connection clones share a transport
 //! connection and retain endpoint resources; streams retain connection resources.
@@ -165,7 +183,7 @@
 //! | Certainty | Meaning |
 //! | --- | --- |
 //! | `NotSent` | No request bytes were submitted to the transport. |
-//! | `Rejected` | The peer explicitly rejected the operation. |
+//! | `Rejected` | The receiving side explicitly rejected the operation. |
 //! | `Unknown` | The operation may have taken effect; reconcile before retrying. |
 //!
 //! `Malformed` and `LimitExceeded` carry the certainty of the operation that
@@ -201,7 +219,7 @@
 //! `EventSender::flush` can resume. Prepare each event once with `start`, then resume
 //! `flush` after cancellation; do not replace a pending event. Dropping the entire
 //! owner aborts its streams. Application callbacks and authorization run outside the
-//! framing machinery and require their own cancellation/lifecycle policy.
+//! framing machinery and follow the application's cancellation and lifecycle policy.
 //!
 //! ## Runtime and transport policy
 //!
@@ -243,13 +261,26 @@
 //! `0.49.0` window. Protocol versions are independent of crate release versions.
 //! No wire-version increment or synchronized deployment is required.
 //!
-//! Request streams answer a peer as the legacy dispatchers do. A request code a
-//! session does not serve is answered with the legacy remote-rejection text
-//! (`unknown request code: N` on an agent, `unknown request code` on a manager)
-//! and the stream continues. Arguments that cannot be decoded are answered with
-//! the legacy text naming the code before the stream ends with FIN. An event that
-//! cannot be decoded is returned as an error without ending its sequence. An
-//! install answered before its payload is complete drains the rest first.
+//! Owned server runners preserve the legacy dispatcher's multi-request loop.
+//! Handler results, including a default `not supported` or a service-specific
+//! error, are sent as provided and dispatch continues. A policy denial or
+//! unknown code ends dispatch with a typed error even if sending the legacy
+//! rejection text fails. Codes 2, 9, and 14 are delegated to the application with
+//! their raw arguments and the still-owned stream. Complete frames with invalid
+//! arguments end dispatch without a response.
+//!
+//! Low-level request `next` retains the foundation's behavior of answering
+//! unserved codes and continuing. It answers malformed arguments with a
+//! rejection naming the code before ending the stream. An install answered
+//! before its payload is complete drains the rest first.
+//!
+//! Event runners ignore both reserved header bytes, report a complete malformed
+//! event to `on_error`, and continue if the callback succeeds. Budget failures
+//! surface as typed errors. Only clean frame-boundary EOF calls `on_stream_end`.
+//! The bounded server path reports a partial frame header, payload, or request
+//! code as malformed data. Legacy framing could treat these inputs as EOF,
+//! which concealed incomplete messages. A partial two-byte event stream header
+//! still reports an unexpected EOF error.
 //!
 //! Existing applications can continue using the legacy API. A migration selects
 //! limits based on real payload requirements and uses a released foundation.
@@ -282,7 +313,10 @@ pub use operations::Reply;
 #[cfg(feature = "client")]
 pub use operations::{AgentIncoming, AgentRequest, AgentRequestStream, PackageReply};
 #[cfg(feature = "server")]
-pub use operations::{ServerIncoming, ServerRequest, ServerRequestStream, ServerStream};
+pub use operations::{
+    ServerIncoming, ServerRequest, ServerRequestOutcome, ServerRequestStream, ServerStream,
+    UnhandledServerRequest,
+};
 use thiserror::Error;
 
 /// The certainty of a failed operation's domain outcome.
@@ -290,7 +324,7 @@ use thiserror::Error;
 pub enum OutcomeCertainty {
     /// No request bytes were submitted to the transport.
     NotSent,
-    /// The peer explicitly rejected the request.
+    /// The receiving side explicitly rejected the request.
     Rejected,
     /// The operation may have taken effect; reconcile before retrying mutations.
     Unknown,
@@ -343,6 +377,50 @@ pub enum SessionError {
         #[source]
         source: Option<tokio::time::error::Elapsed>,
     },
+}
+
+/// A failure while running server request or event processing.
+#[cfg(feature = "server")]
+#[derive(Debug, Error)]
+pub enum ServerRunError {
+    /// A session framing or transport failure.
+    #[error(transparent)]
+    Session(#[from] SessionError),
+    /// The application has not bound an authorization policy to this request stream.
+    #[error("server request runner requires a bound authorization policy")]
+    MissingAuthorization,
+    /// The injected policy denied a request before dispatch.
+    #[error("authorization denied for {service}: {source}")]
+    AuthorizationDenied {
+        /// The service requested by the peer.
+        service: crate::service_id::ServiceId,
+        #[source]
+        source: crate::auth::AuthorizationError,
+    },
+    /// The server received a request code with no protocol assignment.
+    #[error("unknown request code: {code}")]
+    UnknownRequestCode {
+        /// The unrecognized numeric code.
+        code: u32,
+    },
+    /// An event callback returned an application error.
+    #[error("event handler failed: {0}")]
+    EventHandler(#[source] std::io::Error),
+}
+
+#[cfg(feature = "server")]
+impl ServerRunError {
+    /// Returns outcome certainty when the failure establishes one.
+    #[must_use]
+    pub fn certainty(&self) -> Option<OutcomeCertainty> {
+        match self {
+            Self::Session(error) => error.certainty(),
+            Self::AuthorizationDenied { .. } | Self::UnknownRequestCode { .. } => {
+                Some(OutcomeCertainty::Rejected)
+            }
+            Self::MissingAuthorization | Self::EventHandler(_) => None,
+        }
+    }
 }
 
 impl SessionError {

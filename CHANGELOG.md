@@ -5,6 +5,17 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Added owned server request and event runners for the existing handler traits.
+  Request runners authorize each invocation, cover the full legacy dispatcher
+  surface, and preserve sequential responses and registered-code handoffs.
+  Event runners preserve header tolerance and callback order and report
+  truncated frames separately from clean EOF. Applications supervise the
+  runners and choose their concurrency and frame budgets.
+
 ## [0.27.0] - 2026-11-18
 
 ### Added
