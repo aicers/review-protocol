@@ -4,9 +4,9 @@
 //! in giganto-client (`giganto_client::ingest::{network, sysmon, netflow}`)
 //! at tag `0.29.2`.
 //!
-//! `Debug` is derived on every struct except [`Http`], [`Ftp`], [`Ldap`]
-//! and [`Radius`], whose fields that can carry credentials are printed as
-//! `<redacted>`.
+//! `Debug` is derived on every struct except [`Http`], [`Ftp`], [`Ldap`],
+//! [`Radius`], [`ProcessCreate`] and [`FileCreateStreamHash`], whose
+//! fields that can carry credentials are printed as `<redacted>`.
 
 use std::{fmt, net::IpAddr};
 
@@ -785,7 +785,7 @@ pub struct Icmp {
 }
 
 /// The `ProcessCreate` raw event body, copying giganto-client's `ingest::sysmon::ProcessCreate`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessCreate {
     pub agent_name: String,
     pub agent_id: String,
@@ -810,6 +810,68 @@ pub struct ProcessCreate {
     pub parent_image: String,
     pub parent_command_line: String,
     pub parent_user: String,
+}
+
+/// `command_line` and `parent_command_line` hold every argument the
+/// process was started with, which can include a password or a client
+/// secret passed on the command line, so both are redacted rather than
+/// derived; every other field is printed as a derived `Debug` would
+/// print it.
+impl fmt::Debug for ProcessCreate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured so that a field added to the struct fails to
+        // compile here until it is printed or redacted.
+        let Self {
+            agent_name,
+            agent_id,
+            process_guid,
+            process_id,
+            image,
+            file_version,
+            description,
+            product,
+            company,
+            original_file_name,
+            command_line: _,
+            current_directory,
+            user,
+            logon_guid,
+            logon_id,
+            terminal_session_id,
+            integrity_level,
+            hashes,
+            parent_process_guid,
+            parent_process_id,
+            parent_image,
+            parent_command_line: _,
+            parent_user,
+        } = self;
+        f.debug_struct("ProcessCreate")
+            .field("agent_name", agent_name)
+            .field("agent_id", agent_id)
+            .field("process_guid", process_guid)
+            .field("process_id", process_id)
+            .field("image", image)
+            .field("file_version", file_version)
+            .field("description", description)
+            .field("product", product)
+            .field("company", company)
+            .field("original_file_name", original_file_name)
+            .field("command_line", &REDACTED)
+            .field("current_directory", current_directory)
+            .field("user", user)
+            .field("logon_guid", logon_guid)
+            .field("logon_id", logon_id)
+            .field("terminal_session_id", terminal_session_id)
+            .field("integrity_level", integrity_level)
+            .field("hashes", hashes)
+            .field("parent_process_guid", parent_process_guid)
+            .field("parent_process_id", parent_process_id)
+            .field("parent_image", parent_image)
+            .field("parent_command_line", &REDACTED)
+            .field("parent_user", parent_user)
+            .finish()
+    }
 }
 
 /// The `FileCreateTime` raw event body, copying giganto-client's `ingest::sysmon::FileCreationTimeChanged`.
@@ -923,7 +985,7 @@ pub struct RegistryKeyRename {
 }
 
 /// The `FileCreateStreamHash` raw event body, copying giganto-client's `ingest::sysmon::FileCreateStreamHash`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileCreateStreamHash {
     pub agent_name: String,
     pub agent_id: String,
@@ -935,6 +997,41 @@ pub struct FileCreateStreamHash {
     pub hash: Vec<String>,
     pub contents: String,
     pub user: String,
+}
+
+/// `contents` holds the captured contents of the named stream, such as a
+/// `Zone.Identifier` whose download URL can carry a signed access token,
+/// so it is redacted rather than derived; every other field is printed as
+/// a derived `Debug` would print it.
+impl fmt::Debug for FileCreateStreamHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured so that a field added to the struct fails to
+        // compile here until it is printed or redacted.
+        let Self {
+            agent_name,
+            agent_id,
+            process_guid,
+            process_id,
+            image,
+            target_filename,
+            creation_utc_time,
+            hash,
+            contents: _,
+            user,
+        } = self;
+        f.debug_struct("FileCreateStreamHash")
+            .field("agent_name", agent_name)
+            .field("agent_id", agent_id)
+            .field("process_guid", process_guid)
+            .field("process_id", process_id)
+            .field("image", image)
+            .field("target_filename", target_filename)
+            .field("creation_utc_time", creation_utc_time)
+            .field("hash", hash)
+            .field("contents", &REDACTED)
+            .field("user", user)
+            .finish()
+    }
 }
 
 /// The `PipeEvent` raw event body, copying giganto-client's `ingest::sysmon::PipeEvent`.
@@ -1063,6 +1160,10 @@ mod tests {
     const LDAP_ARGUMENT: &str = "ldap-bind-password-secret";
     const RADIUS_USER_PASSWD: &[u8] = b"radius-user-passwd-secret";
     const RADIUS_CHAP_PASSWD: &[u8] = b"radius-chap-passwd-secret";
+    const PROCESS_COMMAND_LINE: &str = "az login --password process-command-line-secret";
+    const PARENT_COMMAND_LINE: &str = "cmd.exe /c login --token parent-command-line-secret";
+    const STREAM_CONTENTS: &str =
+        "[ZoneTransfer]\r\nHostUrl=https://example.net/a.zip?sig=stream-contents-secret";
 
     /// The kinds and numbers the schema commits to.
     const TABLE: [(RawEventKind, u32); 36] = [
@@ -1690,7 +1791,7 @@ mod tests {
                 product: s("product"),
                 company: s("company"),
                 original_file_name: s("a.exe"),
-                command_line: s("a.exe -x"),
+                command_line: s(PROCESS_COMMAND_LINE),
                 current_directory: s("C:\\"),
                 user: s("user"),
                 logon_guid: s("logon-guid"),
@@ -1701,7 +1802,7 @@ mod tests {
                 parent_process_guid: s("parent-guid"),
                 parent_process_id: 1003,
                 parent_image: s("C:\\parent.exe"),
-                parent_command_line: s("parent.exe"),
+                parent_command_line: s(PARENT_COMMAND_LINE),
                 parent_user: s("parent-user"),
             }),
             RawEventBody::FileCreateTime(FileCreateTime {
@@ -1802,7 +1903,7 @@ mod tests {
                 target_filename: s("C:\\i.txt:Zone.Identifier"),
                 creation_utc_time: 127,
                 hash: strings("hash"),
-                contents: s("[ZoneTransfer]"),
+                contents: s(STREAM_CONTENTS),
                 user: s("user"),
             }),
             RawEventBody::PipeEvent(PipeEvent {
@@ -1909,6 +2010,9 @@ mod tests {
             format!("{LDAP_ARGUMENT:?}"),
             format!("{:?}", RADIUS_USER_PASSWD.to_vec()),
             format!("{:?}", RADIUS_CHAP_PASSWD.to_vec()),
+            format!("{PROCESS_COMMAND_LINE:?}"),
+            format!("{PARENT_COMMAND_LINE:?}"),
+            format!("{STREAM_CONTENTS:?}"),
         ];
         for body in bodies() {
             let rendered = format!("{body:?}");
@@ -1920,6 +2024,10 @@ mod tests {
                 RawEventBody::Ftp(_) => (true, r#"user: "anonymous""#),
                 RawEventBody::Ldap(_) => (true, r#"object: ["cn=admin-1", "cn=admin-2"]"#),
                 RawEventBody::Radius(_) => (true, "user_name: [117]"),
+                RawEventBody::ProcessCreate(_) => (true, r#"parent_image: "C:\\parent.exe""#),
+                RawEventBody::FileCreateStreamHash(_) => {
+                    (true, r#"target_filename: "C:\\i.txt:Zone.Identifier""#)
+                }
                 _ => (false, ""),
             };
             assert_eq!(rendered.contains(REDACTED), has_credentials, "{rendered}");
