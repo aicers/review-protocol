@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 pub use structured::ColumnStatistics;
 
+pub mod raw_event;
+
 /// A request to delete data belonging to a customer from a service.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustomerDataDeletionRequest {
@@ -335,6 +337,112 @@ pub enum EventCategory {
     Persistence = 12,
     PrivilegeEscalation = 13,
     ResourceDevelopment = 14,
+}
+
+/// The kind of a raw event, a subset of giganto-client's `RawEventKind` with
+/// the same names and numbers.
+///
+/// The numbering has intentional gaps: each variant keeps giganto-client's
+/// explicit number, and the kinds left out of this subset leave theirs unused.
+/// A kind is serialized as that number in every format, never as its name or
+/// declaration index.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize_repr,
+    Eq,
+    Hash,
+    IntoPrimitive,
+    PartialEq,
+    Serialize_repr,
+    TryFromPrimitive,
+)]
+#[repr(u32)]
+pub enum RawEventKind {
+    // Network
+    Conn = 0,
+    Dns = 1,
+    Http = 3,
+    Rdp = 4,
+    Smtp = 6,
+    Ntlm = 7,
+    Kerberos = 8,
+    Ssh = 9,
+    DceRpc = 10,
+    Ftp = 14,
+    Mqtt = 15,
+    Ldap = 16,
+    Tls = 17,
+    Smb = 18,
+    Nfs = 19,
+    Bootp = 21,
+    Dhcp = 22,
+    Radius = 23,
+    MalformedDns = 24,
+    Icmp = 25,
+
+    // Windows Sysmon
+    ProcessCreate = 31,
+    FileCreateTime = 32,
+    NetworkConnect = 33,
+    ProcessTerminate = 35,
+    ImageLoad = 37,
+    FileCreate = 41,
+    RegistryValueSet = 43,
+    RegistryKeyRename = 44,
+    FileCreateStreamHash = 45,
+    PipeEvent = 47,
+    DnsQuery = 52,
+    FileDelete = 53,
+    ProcessTamper = 55,
+    FileDeleteDetected = 56,
+
+    // Netflow
+    Netflow5 = 60,
+    Netflow9 = 61,
+}
+
+/// The body of a raw event, one variant per [`RawEventKind`] holding the
+/// [`raw_event`] struct of the same name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RawEventBody {
+    Conn(raw_event::Conn),
+    Dns(raw_event::Dns),
+    Http(raw_event::Http),
+    Rdp(raw_event::Rdp),
+    Smtp(raw_event::Smtp),
+    Ntlm(raw_event::Ntlm),
+    Kerberos(raw_event::Kerberos),
+    Ssh(raw_event::Ssh),
+    DceRpc(raw_event::DceRpc),
+    Ftp(raw_event::Ftp),
+    Mqtt(raw_event::Mqtt),
+    Ldap(raw_event::Ldap),
+    Tls(raw_event::Tls),
+    Smb(raw_event::Smb),
+    Nfs(raw_event::Nfs),
+    Bootp(raw_event::Bootp),
+    Dhcp(raw_event::Dhcp),
+    Radius(raw_event::Radius),
+    MalformedDns(raw_event::MalformedDns),
+    Icmp(raw_event::Icmp),
+    ProcessCreate(raw_event::ProcessCreate),
+    FileCreateTime(raw_event::FileCreateTime),
+    NetworkConnect(raw_event::NetworkConnect),
+    ProcessTerminate(raw_event::ProcessTerminate),
+    ImageLoad(raw_event::ImageLoad),
+    FileCreate(raw_event::FileCreate),
+    RegistryValueSet(raw_event::RegistryValueSet),
+    RegistryKeyRename(raw_event::RegistryKeyRename),
+    FileCreateStreamHash(raw_event::FileCreateStreamHash),
+    PipeEvent(raw_event::PipeEvent),
+    DnsQuery(raw_event::DnsQuery),
+    FileDelete(raw_event::FileDelete),
+    ProcessTamper(raw_event::ProcessTamper),
+    FileDeleteDetected(raw_event::FileDeleteDetected),
+    Netflow5(raw_event::Netflow5),
+    Netflow9(raw_event::Netflow9),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize_repr, Eq, PartialEq, Serialize_repr)]
