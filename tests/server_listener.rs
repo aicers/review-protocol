@@ -404,10 +404,11 @@ async fn accepted_attempt_can_finish_after_listener_drop() {
     let (pending, connecting) = accept_attempt(&listener, &endpoint).await;
     listener.shutdown();
     drop(listener);
-    let (session, reply) = timeout(TEST_TIMEOUT, async {
+    let (session, (_peer, reply)) = timeout(TEST_TIMEOUT, async {
         tokio::join!(pending.handshake(), async {
             let peer = connecting.await.unwrap();
-            exchange_claims(&peer, BASE).await
+            let reply = exchange_claims(&peer, BASE).await;
+            (peer, reply)
         })
     })
     .await
