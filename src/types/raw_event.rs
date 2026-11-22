@@ -4,8 +4,8 @@
 //! in giganto-client (`giganto_client::ingest::{network, sysmon, netflow}`)
 //! at tag `0.29.2`.
 //!
-//! `Debug` is derived on every struct except [`Http`], [`Ftp`] and
-//! [`Radius`], whose credential fields are printed as `<redacted>`.
+//! `Debug` is derived on every struct except [`Http`], [`Ftp`], [`Ldap`]
+//! and [`Radius`], whose credential fields are printed as `<redacted>`.
 
 use std::{fmt, net::IpAddr};
 
@@ -450,7 +450,7 @@ pub struct Mqtt {
 }
 
 /// The `Ldap` raw event body, copying giganto-client's `ingest::network::Ldap`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ldap {
     pub orig_addr: IpAddr,
     pub orig_port: u16,
@@ -470,6 +470,56 @@ pub struct Ldap {
     pub diagnostic_message: Vec<String>,
     pub object: Vec<String>,
     pub argument: Vec<String>,
+}
+
+/// `argument` carries the password of a simple bind captured from the
+/// session, so it is redacted rather than derived; every other field
+/// is printed as a derived `Debug` would print it.
+impl fmt::Debug for Ldap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured so that a field added to the struct fails to
+        // compile here until it is printed or redacted.
+        let Self {
+            orig_addr,
+            orig_port,
+            resp_addr,
+            resp_port,
+            proto,
+            start_time,
+            duration,
+            orig_pkts,
+            resp_pkts,
+            orig_l2_bytes,
+            resp_l2_bytes,
+            message_id,
+            version,
+            opcode,
+            result,
+            diagnostic_message,
+            object,
+            argument: _,
+        } = self;
+        f.debug_struct("Ldap")
+            .field("orig_addr", orig_addr)
+            .field("orig_port", orig_port)
+            .field("resp_addr", resp_addr)
+            .field("resp_port", resp_port)
+            .field("proto", proto)
+            .field("start_time", start_time)
+            .field("duration", duration)
+            .field("orig_pkts", orig_pkts)
+            .field("resp_pkts", resp_pkts)
+            .field("orig_l2_bytes", orig_l2_bytes)
+            .field("resp_l2_bytes", resp_l2_bytes)
+            .field("message_id", message_id)
+            .field("version", version)
+            .field("opcode", opcode)
+            .field("result", result)
+            .field("diagnostic_message", diagnostic_message)
+            .field("object", object)
+            .field("argument", &REDACTED)
+            .finish()
+    }
 }
 
 /// The `Tls` raw event body, copying giganto-client's `ingest::network::Tls`.
@@ -1003,6 +1053,7 @@ mod tests {
     const HTTP_PASSWORD: &str = "http-password-secret";
     const HTTP_COOKIE: &str = "session=http-cookie-secret";
     const FTP_PASSWORD: &str = "ftp-password-secret";
+    const LDAP_ARGUMENT: &str = "ldap-bind-password-secret";
     const RADIUS_USER_PASSWD: &[u8] = b"radius-user-passwd-secret";
     const RADIUS_CHAP_PASSWD: &[u8] = b"radius-chap-passwd-secret";
 
@@ -1421,7 +1472,7 @@ mod tests {
                 result: strings("success"),
                 diagnostic_message: strings("diag"),
                 object: strings("cn=admin"),
-                argument: strings("arg"),
+                argument: vec![s(LDAP_ARGUMENT)],
             }),
             RawEventBody::Tls(Tls {
                 orig_addr: v4(29),
@@ -1845,6 +1896,7 @@ mod tests {
             format!("{HTTP_PASSWORD:?}"),
             format!("{HTTP_COOKIE:?}"),
             format!("{FTP_PASSWORD:?}"),
+            format!("{LDAP_ARGUMENT:?}"),
             format!("{:?}", RADIUS_USER_PASSWD.to_vec()),
             format!("{:?}", RADIUS_CHAP_PASSWD.to_vec()),
         ];
@@ -1856,6 +1908,7 @@ mod tests {
             let (has_credentials, kept) = match &body {
                 RawEventBody::Http(_) => (true, r#"username: "user""#),
                 RawEventBody::Ftp(_) => (true, r#"user: "anonymous""#),
+                RawEventBody::Ldap(_) => (true, r#"object: ["cn=admin-1", "cn=admin-2"]"#),
                 RawEventBody::Radius(_) => (true, "user_name: [117]"),
                 _ => (false, ""),
             };
