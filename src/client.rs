@@ -452,9 +452,18 @@ impl ConnectionBuilder {
         let mut buf = Vec::new();
         frame::send(&mut send, &mut buf, &agent_info).await?;
         match frame::recv::<Result<&str, &str>>(&mut recv, &mut buf).await? {
-            Ok(_) => Ok(Connection {
+            Ok(server_version) => Ok(Connection {
                 endpoint,
-                connection,
+                conn: connection,
+                // The advertised version counts as well as the server's
+                // reply, which is only the server's ceiling: a `0.50.0`
+                // server refuses the list pulls of an agent that advertised
+                // `0.49.0`.
+                network_list_blocker: crate::network_list_blocker([
+                    self.protocol_version.as_str(),
+                    server_version,
+                ])
+                .map(str::to_owned),
             }),
             Err(e) => Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
@@ -502,11 +511,30 @@ impl ConnectionBuilder {
 #[derive(Clone, Debug)]
 pub struct Connection {
     endpoint: quinn::Endpoint,
-    connection: quinn::Connection,
+    conn: quinn::Connection,
+    /// The handshake version that keeps this connection off the allowlist and
+    /// blocklist pulls, or `None` when both sides speak the item lists.
+    network_list_blocker: Option<String>,
 }
 
 #[cfg(feature = "client")]
 impl Connection {
+    /// Refuses an allowlist or blocklist pull, before anything is sent, when
+    /// the version this agent advertised or the server's handshake reply is
+    /// earlier than the item lists.
+    pub(crate) fn check_network_lists(&self) -> std::io::Result<()> {
+        match &self.network_list_blocker {
+            None => Ok(()),
+            Some(version) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "protocol {version} is incompatible with {}",
+                    crate::NETWORK_LIST_ITEMS_REQ
+                ),
+            )),
+        }
+    }
+
     /// Gets the local address of the connection.
     ///
     /// # Errors
@@ -520,13 +548,13 @@ impl Connection {
     /// Gets the remote address of the connection.
     #[must_use]
     pub fn remote_addr(&self) -> SocketAddr {
-        self.connection.remote_address()
+        self.conn.remote_address()
     }
 
     /// If the connection is cloesd, returns the reason; otherwise, returns `None`.
     #[must_use]
     pub fn close_reason(&self) -> Option<std::io::Error> {
-        self.connection.close_reason().map(Into::into)
+        self.conn.close_reason().map(Into::into)
     }
 
     /// Initiates an outgoing bidirectional stream.
@@ -536,7 +564,7 @@ impl Connection {
     /// of this crate's own implementation to provide additional features.
     #[must_use]
     pub fn open_bi(&self) -> quinn::OpenBi<'_> {
-        self.connection.open_bi()
+        self.conn.open_bi()
     }
 
     /// Initiates an outgoing unidirectional stream.
@@ -546,7 +574,7 @@ impl Connection {
     /// of this crate's own implementation to provide additional features.
     #[must_use]
     pub fn open_uni(&self) -> quinn::OpenUni<'_> {
-        self.connection.open_uni()
+        self.conn.open_uni()
     }
 
     /// Accepts an incoming bidirectional stream.
@@ -556,7 +584,7 @@ impl Connection {
     /// of this crate's own implementation to provide additional features.
     #[must_use]
     pub fn accept_bi(&self) -> quinn::AcceptBi<'_> {
-        self.connection.accept_bi()
+        self.conn.accept_bi()
     }
 
     /// Closes the connection.
@@ -566,7 +594,7 @@ impl Connection {
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn close(&self, error_code: quinn::VarInt, reason: &[u8]) {
-        self.connection.close(error_code, reason);
+        self.conn.close(error_code, reason);
     }
 }
 

@@ -88,8 +88,8 @@ impl Connection {
     /// matching entry in that order.
     ///
     /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
-    /// decode as a different item list. See [`NetworkListItem`] for the
-    /// caller's version check.
+    /// decode as a different item list. This connection does not hold the
+    /// handshake version, so the caller checks it; see [`NetworkListItem`].
     ///
     /// # Errors
     ///
@@ -105,8 +105,8 @@ impl Connection {
     /// deduplicating.
     ///
     /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
-    /// decode as a different item list. See [`NetworkListItem`] for the
-    /// caller's version check.
+    /// decode as a different item list. This connection does not hold the
+    /// handshake version, so the caller checks it; see [`NetworkListItem`].
     ///
     /// # Errors
     ///

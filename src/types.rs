@@ -345,20 +345,28 @@ pub struct HostNetworkGroup {
 /// group holding one IPv4 host decodes as one item with an invented id and
 /// name and an empty group, and the host is lost without an error.
 ///
-/// No list operation checks the peer's protocol version, and the library's
-/// suggested floor, `MIN_PROTOCOL_VERSION_REQ`, still admits `0.49.0`. Keeping
-/// `0.49.0` peers away from these lists is the caller's responsibility:
+/// The library's suggested floor, `MIN_PROTOCOL_VERSION_REQ`, still admits
+/// `0.49.0`, so the list surfaces that hold the handshake versions check them:
 ///
-/// - A manager admits only agents that advertise `0.50.0` or later, by passing
-///   a `>=0.50.0` requirement to its handshake, or by checking the agent's
-///   advertised `protocol_version` (the `AgentInfo` the handshake returns, or
-///   `session::HandshakeMetadata::Agent`) before it pushes a list or answers
-///   a pull.
-/// - An agent advertises the protocol version it speaks. A `0.49.0` manager
-///   that passes its own protocol version as the handshake's ceiling rejects
-///   an agent advertising `0.50.0`; an agent built on these types that
-///   advertises `0.49.0`, or a manager whose ceiling overstates what it
-///   speaks, has no such protection.
+/// - The session agent's `get_allowlist` and `get_blocklist`, and the legacy
+///   `client::Connection`'s, refuse locally, sending nothing, unless both the
+///   protocol version the agent advertised and the manager's handshake reply
+///   are `0.50.0` or later.
+/// - A session manager's request stream, in both its runner and its
+///   low-level `next`, answers an allowlist or blocklist pull from an agent
+///   that advertised an earlier version with an error and does not invoke the
+///   handler.
+///
+/// The other surfaces hold no handshake version, and keeping `0.49.0` peers
+/// away from them is the caller's responsibility: the legacy
+/// `server::Connection`'s `send_allowlist` and `send_blocklist`, the legacy
+/// server dispatcher's pull handlers and the legacy agent request
+/// dispatcher's push handlers. A manager admits only agents that advertise
+/// `0.50.0` or later, by passing a `>=0.50.0` requirement to its handshake, or
+/// checks the agent's advertised `protocol_version` (the `AgentInfo` the
+/// handshake returns) before it pushes a list or answers a pull. An agent
+/// advertises the protocol version it speaks, and dispatches pushes only on a
+/// connection whose handshake reply is `0.50.0` or later.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkListItem {
     /// The entry's id.

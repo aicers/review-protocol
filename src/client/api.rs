@@ -109,14 +109,18 @@ impl Connection {
     /// Fetches the allowlist entries from the server, in the order the server
     /// sent them.
     ///
-    /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
-    /// decode as a different item list. See [`NetworkListItem`] for the
-    /// caller's version check.
+    /// Both the protocol version this connection advertised and the server's
+    /// handshake reply must be `0.50.0` or later: a `0.49.0` payload can decode
+    /// as a different item list (see [`NetworkListItem`]). Otherwise nothing
+    /// is sent.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or the response is invalid.
+    /// Returns an error of kind [`io::ErrorKind::Unsupported`] if either
+    /// handshake version is earlier than `0.50.0`, and an error if the request
+    /// fails or the response is invalid.
     pub async fn get_allowlist(&self) -> io::Result<Vec<NetworkListItem>> {
+        self.check_network_lists()?;
         let res: Result<Vec<NetworkListItem>, String> =
             request_exact(self, server::RequestCode::GetAllowlist, ()).await?;
         res.map_err(io::Error::other)
@@ -125,14 +129,18 @@ impl Connection {
     /// Fetches the blocklist entries from the server, in the order the server
     /// sent them.
     ///
-    /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
-    /// decode as a different item list. See [`NetworkListItem`] for the
-    /// caller's version check.
+    /// Both the protocol version this connection advertised and the server's
+    /// handshake reply must be `0.50.0` or later: a `0.49.0` payload can decode
+    /// as a different item list (see [`NetworkListItem`]). Otherwise nothing
+    /// is sent.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or the response is invalid.
+    /// Returns an error of kind [`io::ErrorKind::Unsupported`] if either
+    /// handshake version is earlier than `0.50.0`, and an error if the request
+    /// fails or the response is invalid.
     pub async fn get_blocklist(&self) -> io::Result<Vec<NetworkListItem>> {
+        self.check_network_lists()?;
         let res: Result<Vec<NetworkListItem>, String> =
             request_exact(self, server::RequestCode::GetBlocklist, ()).await?;
         res.map_err(io::Error::other)
@@ -826,6 +834,79 @@ mod tests {
             server_handle.await.unwrap();
             test_env.teardown(&server_conn);
         }
+    }
+
+    /// A connection that advertised `0.49.0` refuses its allowlist and
+    /// blocklist pulls before sending them: a server reply in the `0.49.0`
+    /// shape holding one IPv4 host is also a complete item list, which
+    /// full-frame decoding cannot refuse.
+    #[tokio::test]
+    async fn list_pull_refuses_an_agent_advertising_0_49_0() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        use crate::types::{HostNetworkGroup, NetworkListItem};
+
+        let group = HostNetworkGroup {
+            hosts: vec![IpAddr::V4(Ipv4Addr::new(2, b'x', b'y', 0))],
+            networks: Vec::new(),
+            ip_ranges: Vec::new(),
+        };
+        let reply =
+            bincode::serde::encode_to_vec(Ok::<_, String>(group), bincode::config::standard())
+                .unwrap();
+        let misread: Result<Vec<NetworkListItem>, String> =
+            crate::legacy_transport::decode_exact(&reply).unwrap();
+        assert_eq!(
+            misread,
+            Ok(vec![NetworkListItem {
+                id: 0,
+                name: "xy".into(),
+                group: HostNetworkGroup::default(),
+            }]),
+            "the legacy reply decodes in full as a different list"
+        );
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn, _) =
+            test_env.setup_advertising("0.49.0", |_builder| {}).await;
+        for res in [
+            client_conn.get_allowlist().await,
+            client_conn.get_blocklist().await,
+        ] {
+            let error = res.expect_err("the pull is refused");
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            assert_eq!(
+                error.to_string(),
+                "protocol 0.49.0 is incompatible with >=0.50.0"
+            );
+        }
+
+        // Nothing was sent: the first request the server receives is the
+        // next one.
+        let handler_conn = server_conn.clone();
+        let server_handle = tokio::spawn(async move {
+            let (mut send, mut recv) = handler_conn.as_quinn().accept_bi().await.unwrap();
+            let mut request = Vec::new();
+            crate::legacy_transport::frame::recv_raw(&mut recv, &mut request)
+                .await
+                .unwrap();
+            let reply =
+                bincode::serde::encode_to_vec(Ok::<_, String>("cfg"), bincode::config::standard())
+                    .unwrap();
+            crate::legacy_transport::frame::send_raw(&mut send, &reply)
+                .await
+                .unwrap();
+            send.finish().unwrap();
+            let _ = send.stopped().await;
+            request
+        });
+        assert_eq!(client_conn.get_config().await.unwrap(), "cfg");
+        let request = server_handle.await.unwrap();
+        assert_eq!(
+            request.first_chunk::<4>().copied().map(u32::from_le_bytes),
+            Some(u32::from(crate::server::RequestCode::GetConfig))
+        );
+        test_env.teardown(&server_conn);
     }
 
     #[tokio::test]

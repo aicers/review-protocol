@@ -22,7 +22,7 @@ use review_protocol::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::{event_stream, raw_sessions, request_stream};
+use super::{event_stream, raw_sessions, raw_sessions_at, request_stream};
 
 const REQUESTS: &[u8] = include_bytes!("../fixtures/current/server-requests.bin");
 const RESPONSES: &[u8] = include_bytes!("../fixtures/current/server-responses.bin");
@@ -38,6 +38,8 @@ const EVENTS: &[u8] = include_bytes!("../fixtures/current/server-events.bin");
 const TRUNCATED_EVENT: &[u8] = include_bytes!("../fixtures/current/server-truncated-event.bin");
 
 const GET_CONFIG: &[u8] = &[0, 0, 0, 4, 36, 0, 0, 0];
+const GET_ALLOWLIST: &[u8] = &[0, 0, 0, 4, 32, 0, 0, 0];
+const GET_BLOCKLIST: &[u8] = &[0, 0, 0, 4, 33, 0, 0, 0];
 const GET_LABEL_DB_PATTERNS: u32 = 15;
 
 /// Returns the detection event a fixture frame carries: a `LockyRansomware`
@@ -570,7 +572,13 @@ async fn runner_dispatches_every_built_in_on_one_stream() {
         SERVER_RUN_REPORT_ACTIVE,
         SERVER_DETECTOR_REPORT_STATUS,
     ];
-    let (incoming, _, _, node) = raw_sessions(SessionOptions::legacy_compatible()).await;
+    // The agent speaks the current protocol, so the list pulls reach the
+    // handler; an earlier agent's are answered without it.
+    let (incoming, _, _, node) = raw_sessions_at(
+        SessionOptions::legacy_compatible(),
+        review_protocol::PROTOCOL_VERSION,
+    )
+    .await;
     let handler = Arc::new(FixtureHandler::default());
     let trace = handler.0.clone();
     let policy = Policy {
@@ -1245,4 +1253,108 @@ async fn runner_delivers_every_detection_event_unvalidated() {
             service_id::SERVER_EVENT_INSERT_LABELS
         )]
     );
+}
+
+/// Splits a response stream into its frame bodies: a four-byte big-endian
+/// length, then that many bytes.
+fn response_frames(mut bytes: &[u8]) -> Vec<&[u8]> {
+    let mut frames = Vec::new();
+    while let Some((len, rest)) = bytes.split_first_chunk::<4>() {
+        let (body, rest) = rest.split_at(usize::try_from(u32::from_be_bytes(*len)).unwrap());
+        frames.push(body);
+        bytes = rest;
+    }
+    assert!(bytes.is_empty(), "a response frame is truncated");
+    frames
+}
+
+/// Checks that the answers to an allowlist pull, a blocklist pull and
+/// `get_config`, in that order, refuse both pulls for the advertised `0.49.0`
+/// and answer `get_config`.
+fn assert_list_pulls_refused(responses: &[u8]) {
+    let frames = response_frames(responses);
+    let [allowlist, blocklist, config] = frames.as_slice() else {
+        panic!("expected three responses, got {}", frames.len());
+    };
+    for (code, frame) in [(32, allowlist), (33, blocklist)] {
+        let (answer, _) = bincode::serde::decode_from_slice::<
+            Result<Vec<NetworkListItem>, String>,
+            _,
+        >(frame, bincode::config::standard())
+        .unwrap();
+        assert_eq!(
+            answer,
+            Err(format!(
+                "request code {code} requires protocol >=0.50.0, but the agent advertised 0.49.0"
+            ))
+        );
+    }
+    let (answer, _) = bincode::serde::decode_from_slice::<Result<String, String>, _>(
+        config,
+        bincode::config::standard(),
+    )
+    .unwrap();
+    assert_eq!(answer, Ok("configuration".to_string()));
+}
+
+/// The runner answers an allowlist or blocklist pull from an agent that
+/// advertised `0.49.0` with an error, without invoking the handler, and
+/// continues: the `0.50.0` item list it would send can decode on that agent as
+/// a different list.
+#[tokio::test]
+async fn runner_refuses_list_pulls_from_an_agent_before_item_lists() {
+    let (incoming, _, _, node) = raw_sessions(SessionOptions::legacy_compatible()).await;
+    let handler = Arc::new(FixtureHandler::default());
+    let trace = handler.0.clone();
+    let policy = Policy {
+        trace: trace.clone(),
+        deny: None,
+    };
+    let mut incoming = incoming.with_authorization(context(), Arc::new(policy));
+
+    let requests = [GET_ALLOWLIST, GET_BLOCKLIST, GET_CONFIG].concat();
+    let (mut send, mut recv) = open_requests(&node, &requests).await;
+    send.finish().unwrap();
+    assert!(matches!(
+        request_stream(&mut incoming).await.run(handler).await,
+        Ok(ServerRequestOutcome::Finished)
+    ));
+    let mut responses = Vec::new();
+    recv.read_to_end(&mut responses).await.unwrap();
+    assert_list_pulls_refused(&responses);
+    // The policy still runs first; only the handler is skipped.
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            Observation::Authorization(service_id::SERVER_LIST_ALLOWLIST),
+            Observation::Authorization(service_id::SERVER_LIST_BLOCKLIST),
+            Observation::Authorization(service_id::SERVER_CONFIG_GET),
+            Observation::Handler(service_id::SERVER_CONFIG_GET),
+        ]
+    );
+}
+
+/// The low-level stream answers the same list pulls with the same error and
+/// returns only the next request.
+#[tokio::test]
+async fn low_level_stream_refuses_list_pulls_from_an_agent_before_item_lists() {
+    use review_protocol::session::ServerRequest;
+
+    let (mut incoming, _, _, node) = raw_sessions(SessionOptions::legacy_compatible()).await;
+    let requests = [GET_ALLOWLIST, GET_BLOCKLIST, GET_CONFIG].concat();
+    let (mut send, mut recv) = open_requests(&node, &requests).await;
+    send.finish().unwrap();
+    let mut stream = request_stream(&mut incoming).await;
+    let Some(ServerRequest::GetConfig { reply, .. }) = stream.next().await.unwrap() else {
+        panic!("expected get_config");
+    };
+    reply
+        .respond(Ok("configuration".to_string()))
+        .await
+        .unwrap();
+    assert!(stream.next().await.unwrap().is_none());
+    stream.finish().unwrap();
+    let mut responses = Vec::new();
+    recv.read_to_end(&mut responses).await.unwrap();
+    assert_list_pulls_refused(&responses);
 }

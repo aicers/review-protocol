@@ -70,7 +70,14 @@ impl super::ServerHandle {
         } else {
             operation.await?
         };
-        let shared = Shared::new(connection, options, HandshakeMetadata::Agent(agent));
+        let network_list_blocker =
+            crate::network_list_blocker([agent.protocol_version.as_str()]).map(str::to_owned);
+        let shared = Shared::new(
+            connection,
+            options,
+            HandshakeMetadata::Agent(agent),
+            network_list_blocker,
+        );
         Ok((Self(shared.clone()), super::ServerIncoming::new(shared)))
     }
 }
@@ -118,10 +125,19 @@ impl super::AgentHandle {
         } else {
             operation.await?
         };
+        // The agent's own advertised version counts as well as the manager's
+        // reply, which is only the manager's ceiling: a `0.50.0` manager
+        // refuses the list pulls of an agent that advertised `0.49.0`.
+        let network_list_blocker = crate::network_list_blocker([
+            agent.protocol_version.as_str(),
+            protocol_version.as_str(),
+        ])
+        .map(str::to_owned);
         let shared = Shared::new(
             connection,
             options,
             HandshakeMetadata::Server { protocol_version },
+            network_list_blocker,
         );
         Ok((Self(shared.clone()), super::AgentIncoming::new(shared)))
     }

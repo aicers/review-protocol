@@ -6,7 +6,7 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use review_protocol::{
-    AgentInfo,
+    AgentInfo, PROTOCOL_VERSION,
     session::{
         AgentHandle, AgentIncoming, AgentRequest, ApplicationCode, CloseReason, Connection,
         DetectionEventReceiver, Endpoint, FrameLimit, OutcomeCertainty, ServerHandle,
@@ -122,10 +122,20 @@ async fn connections() -> (Connection, Connection) {
 async fn sessions(
     options: SessionOptions,
 ) -> (ServerHandle, ServerIncoming, AgentHandle, AgentIncoming) {
+    sessions_at(options, "0.49.0").await
+}
+
+/// Connects like [`sessions`], with the agent advertising `version` and the
+/// manager replying with `version` as its ceiling.
+async fn sessions_at(
+    options: SessionOptions,
+    version: &str,
+) -> (ServerHandle, ServerIncoming, AgentHandle, AgentIncoming) {
     let (server, agent) = connections().await;
-    let claims = claims();
+    let mut claims = claims();
+    claims.protocol_version = version.into();
     let (server, agent) = tokio::join!(
-        ServerHandle::from_transport(server, options.clone(), ">=0.48.0", "0.49.0"),
+        ServerHandle::from_transport(server, options.clone(), ">=0.48.0", version),
         AgentHandle::from_transport(agent, options, &claims)
     );
     let (server, server_incoming) = server.unwrap();
@@ -719,10 +729,20 @@ async fn handshake_limit_and_base_only_wire_compatibility() {
 async fn raw_sessions(
     options: SessionOptions,
 ) -> (ServerIncoming, AgentIncoming, Connection, Connection) {
+    raw_sessions_at(options, "0.49.0").await
+}
+
+/// Connects like [`raw_sessions`], with the agent advertising `version` and
+/// the manager replying with `version` as its ceiling.
+async fn raw_sessions_at(
+    options: SessionOptions,
+    version: &str,
+) -> (ServerIncoming, AgentIncoming, Connection, Connection) {
     let (manager, node) = connections().await;
-    let info = claims();
+    let mut info = claims();
+    info.protocol_version = version.into();
     let (server, agent) = tokio::join!(
-        ServerHandle::from_transport(manager.clone(), options.clone(), ">=0.48.0", "0.49.0"),
+        ServerHandle::from_transport(manager.clone(), options.clone(), ">=0.48.0", version),
         AgentHandle::from_transport(node.clone(), options, &info),
     );
     (server.unwrap().1, agent.unwrap().1, manager, node)
@@ -1221,7 +1241,8 @@ async fn list_pulls_preserve_every_item_in_order() {
     let items = network_list_items();
     let mut reversed = items.clone();
     reversed.reverse();
-    let (_, mut incoming, agent, _) = sessions(SessionOptions::legacy_compatible()).await;
+    let (_, mut incoming, agent, _) =
+        sessions_at(SessionOptions::legacy_compatible(), PROTOCOL_VERSION).await;
     let ((), ()) = tokio::join!(
         async {
             assert_eq!(agent.get_allowlist().await.unwrap(), items);
@@ -1246,9 +1267,10 @@ async fn list_pulls_preserve_every_item_in_order() {
     );
 }
 
-/// A `0.49.0` manager's allowlist or blocklist reply, a `HostNetworkGroup`
-/// with no explicit hosts but other entries, is refused as malformed rather
-/// than read as an empty item list, which a prefix decode would do.
+/// An allowlist or blocklist reply in the `0.49.0` shape, a
+/// `HostNetworkGroup` with no explicit hosts but other entries, from a manager
+/// whose handshake claimed `0.50.0`, is refused as malformed rather than read
+/// as an empty item list, which a prefix decode would do.
 #[tokio::test]
 async fn list_pulls_reject_legacy_host_network_group_reply() {
     use std::net::{IpAddr, Ipv4Addr};
@@ -1278,9 +1300,15 @@ async fn list_pulls_reject_legacy_host_network_group_reply() {
 
     let options = SessionOptions::legacy_compatible();
     let (manager, node) = connections().await;
-    let info = claims();
+    let mut info = claims();
+    info.protocol_version = PROTOCOL_VERSION.into();
     let (server, agent) = tokio::join!(
-        ServerHandle::from_transport(manager.clone(), options.clone(), ">=0.48.0", "0.49.0"),
+        ServerHandle::from_transport(
+            manager.clone(),
+            options.clone(),
+            ">=0.48.0",
+            PROTOCOL_VERSION
+        ),
         AgentHandle::from_transport(node, options, &info),
     );
     // Keep the manager session alive without accepting its streams.
@@ -1310,6 +1338,129 @@ async fn list_pulls_reject_legacy_host_network_group_reply() {
         assert!(matches!(error, SessionError::Malformed { .. }), "{error:?}");
         assert_eq!(error.certainty(), Some(OutcomeCertainty::Unknown));
     }
+}
+
+/// Checks that a `0.49.0` allowlist or blocklist reply can get past
+/// full-frame decoding: a `HostNetworkGroup` holding one IPv4 host is also a
+/// complete one-item `Vec<NetworkListItem>` with an invented id and name and an
+/// empty group. Only the handshake version keeps it out.
+fn assert_legacy_list_reply_decodes_in_full() {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use review_protocol::types::{HostNetworkGroup, NetworkListItem};
+
+    let group = HostNetworkGroup {
+        hosts: vec![IpAddr::V4(Ipv4Addr::new(2, b'x', b'y', 0))],
+        networks: Vec::new(),
+        ip_ranges: Vec::new(),
+    };
+    let reply =
+        bincode::serde::encode_to_vec(Ok::<_, String>(group), bincode::config::standard()).unwrap();
+    let (misread, consumed) = bincode::serde::decode_from_slice::<
+        Result<Vec<NetworkListItem>, String>,
+        _,
+    >(&reply, bincode::config::standard())
+    .unwrap();
+    assert_eq!(consumed, reply.len(), "the reply decodes in full");
+    assert_eq!(
+        misread,
+        Ok(vec![NetworkListItem {
+            id: 0,
+            name: "xy".into(),
+            group: HostNetworkGroup::default(),
+        }]),
+        "the host is lost without an error"
+    );
+}
+
+/// Answers the next request stream `manager` accepts with `reply` and returns
+/// the request's code.
+async fn answer_raw(manager: &Connection, reply: &[u8]) -> u32 {
+    use oinq::frame::{FramedReader, FramedWriter};
+
+    let (send, recv) = manager.accept_bi().await.unwrap();
+    let limit = FrameLimit::new(1024).unwrap();
+    let mut reader = FramedReader::new(recv, limit);
+    let mut writer = FramedWriter::new(send, limit);
+    let request = reader.read().await.unwrap().unwrap().into_bytes();
+    writer.start_raw(reply).unwrap();
+    writer.flush().await.unwrap();
+    let _ = writer.into_inner().finish();
+    u32::from_le_bytes(*request.first_chunk::<4>().unwrap())
+}
+
+/// Checks that `agent` refuses both list pulls for `version` without sending
+/// them: the first request `manager` then receives is `get_config`.
+async fn assert_list_pulls_refused_locally(
+    agent: &AgentHandle,
+    manager: &Connection,
+    version: &str,
+) {
+    for result in [agent.get_allowlist().await, agent.get_blocklist().await] {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, SessionError::IncompatibleProtocol { version: v, required }
+                if v == version && required == ">=0.50.0"),
+            "{error:?}"
+        );
+    }
+    let config =
+        bincode::serde::encode_to_vec(Ok::<_, String>("cfg"), bincode::config::standard()).unwrap();
+    let (code, ()) = tokio::join!(answer_raw(manager, &config), async {
+        assert_eq!(agent.get_config().await.unwrap(), "cfg");
+    });
+    assert_eq!(code, 36, "no list pull reached the manager");
+}
+
+/// An agent that advertised `0.49.0` refuses its own allowlist and blocklist
+/// pulls before sending them, even to a manager whose ceiling is `0.50.0`.
+#[tokio::test]
+async fn list_pulls_refuse_an_agent_advertising_0_49_0() {
+    assert_legacy_list_reply_decodes_in_full();
+    let options = SessionOptions::legacy_compatible();
+    let (manager, node) = connections().await;
+    let info = claims();
+    assert_eq!(info.protocol_version, "0.49.0");
+    let (server, agent) = tokio::join!(
+        ServerHandle::from_transport(
+            manager.clone(),
+            options.clone(),
+            ">=0.48.0",
+            PROTOCOL_VERSION
+        ),
+        AgentHandle::from_transport(node, options, &info),
+    );
+    let _server = server.unwrap();
+    let (agent, _) = agent.unwrap();
+    assert_list_pulls_refused_locally(&agent, &manager, "0.49.0").await;
+}
+
+/// An agent that advertised `0.50.0` refuses its allowlist and blocklist pulls
+/// before sending them when the manager's handshake reply is `0.49.0`.
+#[tokio::test]
+async fn list_pulls_refuse_a_manager_replying_0_49_0() {
+    use oinq::frame::{FramedReader, FramedWriter};
+
+    assert_legacy_list_reply_decodes_in_full();
+    let options = SessionOptions::legacy_compatible();
+    let (manager, node) = connections().await;
+    let mut info = claims();
+    info.protocol_version = PROTOCOL_VERSION.into();
+    let ((), agent) = tokio::join!(
+        async {
+            let (send, recv) = manager.accept_bi().await.unwrap();
+            let limit = FrameLimit::new(4096).unwrap();
+            let mut reader = FramedReader::new(recv, limit);
+            reader.read().await.unwrap().unwrap();
+            let mut writer = FramedWriter::new(send, limit);
+            writer.start(Ok::<_, String>("0.49.0".to_string())).unwrap();
+            writer.flush().await.unwrap();
+            writer.into_inner().finish().unwrap();
+        },
+        AgentHandle::from_transport(node, options, &info),
+    );
+    let (agent, _) = agent.unwrap();
+    assert_list_pulls_refused_locally(&agent, &manager, "0.49.0").await;
 }
 
 #[tokio::test]

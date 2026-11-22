@@ -225,7 +225,8 @@ pub(super) enum Decoding {
     /// pulls use this, so that a `0.49.0` peer's `HostNetworkGroup` reply,
     /// which starts with the same zero count as an empty item list when it
     /// has no explicit hosts, is refused rather than read as an empty list.
-    /// It does not catch every `0.49.0` reply; see `types::NetworkListItem`.
+    /// It does not catch every `0.49.0` reply, so the pulls also check the
+    /// handshake versions; see `types::NetworkListItem`.
     Exact,
 }
 

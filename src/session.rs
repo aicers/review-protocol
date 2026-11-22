@@ -259,11 +259,16 @@
 //! The protocol is `0.50.0`, and the library's `>=0.49.0` suggested floor is
 //! unchanged. `0.50.0` replaces the detection event, allowlist, blocklist and
 //! detector status payloads, with no path that reads the earlier shapes.
-//! The floor still admits `0.49.0` peers, and no operation checks the peer's
-//! version, so a manager that exchanges those payloads selects a `>=0.50.0`
-//! requirement or checks `HandshakeMetadata` first. For the allowlist and
-//! blocklist this matters most: some `0.49.0` lists decode as valid `0.50.0`
-//! item lists with their hosts lost; see `types::NetworkListItem`.
+//! The floor still admits `0.49.0` peers. Because some `0.49.0` allowlists and
+//! blocklists decode as valid `0.50.0` item lists with their hosts lost, the
+//! list pulls check the handshake: `AgentHandle::get_allowlist` and
+//! `get_blocklist` refuse locally, sending nothing, unless both the version the
+//! agent advertised and the manager's reply are `0.50.0` or later, and a
+//! manager's request stream answers those pulls with an error, without
+//! reaching its handler, when the agent advertised an earlier version. No other
+//! operation checks the peer's version, so a manager that exchanges the other
+//! changed payloads with a `0.49.0` peer selects a `>=0.50.0` requirement or
+//! checks `HandshakeMetadata` first.
 //! Callers may still advertise `0.48.0` or select an explicit `>=0.48.0` through
 //! `0.49.0` window. Protocol versions are independent of crate release versions.
 //!
@@ -357,7 +362,8 @@ pub enum SessionError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    /// A peer protocol version outside the caller-selected window.
+    /// A peer protocol version outside the caller-selected window, or a
+    /// handshake version outside the range an operation requires.
     #[error("protocol {version} is incompatible with {required}")]
     IncompatibleProtocol { version: String, required: String },
     /// An uninterpreted peer rejection, never classified by matching its text.
@@ -564,6 +570,9 @@ struct Shared {
     id: SessionId,
     metadata: HandshakeMetadata,
     certificates: Option<PeerCertificates>,
+    /// The handshake version that keeps this session off the allowlist and
+    /// blocklist exchanges, or `None` when both sides speak the item lists.
+    network_list_blocker: Option<String>,
 }
 
 impl Shared {
@@ -571,6 +580,7 @@ impl Shared {
         connection: Connection,
         options: SessionOptions,
         metadata: HandshakeMetadata,
+        network_list_blocker: Option<String>,
     ) -> Arc<Self> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let certificates = connection.peer_certificates().map(|chain| {
@@ -582,6 +592,7 @@ impl Shared {
             options,
             id: SessionId(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
             metadata,
+            network_list_blocker,
         })
     }
 }

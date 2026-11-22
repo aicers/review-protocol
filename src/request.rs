@@ -672,8 +672,8 @@ pub trait Handler: Send {
     /// Handles agent request 15, the allowlist entries in the order sent.
     ///
     /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
-    /// decode as a different item list. See [`NetworkListItem`] for the
-    /// caller's version check.
+    /// decode as a different item list. The dispatcher has no handshake
+    /// version to check, so the caller checks it; see [`NetworkListItem`].
     async fn allowlist(&mut self, _list: Vec<NetworkListItem>) -> Result<(), String> {
         return Err("not supported".to_string());
     }
@@ -681,8 +681,8 @@ pub trait Handler: Send {
     /// Handles agent request 16, the blocklist entries in the order sent.
     ///
     /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
-    /// decode as a different item list. See [`NetworkListItem`] for the
-    /// caller's version check.
+    /// decode as a different item list. The dispatcher has no handshake
+    /// version to check, so the caller checks it; see [`NetworkListItem`].
     async fn blocklist(&mut self, _list: Vec<NetworkListItem>) -> Result<(), String> {
         return Err("not supported".to_string());
     }
@@ -1169,7 +1169,8 @@ async fn decode_args<'de, T: serde::Deserialize<'de>>(
 /// The allowlist and blocklist pushes use this so that a `0.49.0` peer's
 /// `HostNetworkGroup` payload with no explicit hosts is refused rather than
 /// read as an empty item list; see `legacy_transport::decode_exact`. It does
-/// not catch every `0.49.0` payload; see `types::NetworkListItem`.
+/// not catch every `0.49.0` payload, and this dispatcher has no handshake
+/// version to check; see `types::NetworkListItem`.
 async fn decode_exact_args<'de, T: serde::Deserialize<'de>>(
     send: &mut quinn::SendStream,
     code: u32,

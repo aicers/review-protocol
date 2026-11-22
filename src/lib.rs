@@ -244,6 +244,28 @@ pub const PROTOCOL_VERSION: &str = "0.50.0";
 /// requirement is unaffected.
 pub const MIN_PROTOCOL_VERSION_REQ: &str = ">=0.49.0";
 
+/// The protocol requirement of the allowlist and blocklist exchanges, which
+/// carry `types::NetworkListItem` lists from `0.50.0` on.
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) const NETWORK_LIST_ITEMS_REQ: &str = ">=0.50.0";
+
+/// Returns the first of `versions` that is not a protocol version of at least
+/// `0.50.0`, the one that keeps a connection off the allowlist and blocklist
+/// exchanges, or `None` when every one of them speaks the item lists.
+///
+/// A version that does not parse is returned too: nothing shows that it
+/// speaks the item lists, and a `0.49.0` list payload can decode as a
+/// different item list rather than fail.
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) fn network_list_blocker<'a>(
+    versions: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    const FIRST: semver::Version = semver::Version::new(0, 50, 0);
+    versions
+        .into_iter()
+        .find(|version| semver::Version::parse(version).map_or(true, |version| version < FIRST))
+}
+
 /// The error type for a handshake failure.
 #[cfg(any(feature = "client", feature = "server"))]
 #[derive(Debug, Error)]

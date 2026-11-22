@@ -50,10 +50,20 @@ pub trait Handler {
         Err("not supported".to_string())
     }
 
+    /// Answers request 32, the allowlist entries in the order to send them.
+    ///
+    /// The session layer's request stream calls this only for an agent that
+    /// advertised protocol `0.50.0` or later. The legacy dispatchers hold no
+    /// handshake version, so their caller checks it; see [`NetworkListItem`].
     async fn get_allowlist(&self, _peer: &str) -> Result<Vec<NetworkListItem>, String> {
         Err("not supported".to_string())
     }
 
+    /// Answers request 33, the blocklist entries in the order to send them.
+    ///
+    /// The session layer's request stream calls this only for an agent that
+    /// advertised protocol `0.50.0` or later. The legacy dispatchers hold no
+    /// handshake version, so their caller checks it; see [`NetworkListItem`].
     async fn get_blocklist(&self, _peer: &str) -> Result<Vec<NetworkListItem>, String> {
         Err("not supported".to_string())
     }

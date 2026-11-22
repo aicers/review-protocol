@@ -152,4 +152,6 @@ frame, including the undecodable and truncated ones, is byte-identical to the
 Requests 32 and 33 now answer `Vec<NetworkListItem>` instead of a
 `HostNetworkGroup`, but their frames carry unit arguments and the fixture
 handler answers them `not supported`, so neither their requests nor their
-responses changed.
+responses changed. The session runner replays the request stream for an agent
+that advertised protocol 0.50.0: it answers these two pulls from an agent that
+advertised an earlier version with its own error, without the handler.

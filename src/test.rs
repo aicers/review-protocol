@@ -164,13 +164,31 @@ impl TestEnvironment {
     where
         F: FnOnce(&mut crate::client::ConnectionBuilder),
     {
+        self.setup_advertising(crate::PROTOCOL_VERSION, configure)
+            .await
+    }
+
+    /// Establishes a connection like [`setup_with`](Self::setup_with), with
+    /// the client advertising `protocol_version`. The server accepts that
+    /// version's compatible range up to [`crate::PROTOCOL_VERSION`].
+    pub async fn setup_advertising<F>(
+        &self,
+        protocol_version: &str,
+        configure: F,
+    ) -> (
+        crate::server::Connection,
+        crate::client::Connection,
+        crate::AgentInfo,
+    )
+    where
+        F: FnOnce(&mut crate::client::ConnectionBuilder),
+    {
         use crate::Status;
 
         // client configuration
         const CLIENT_NAME: &str = "test-client";
         const AGENT_NAME: &str = "test-agent";
         const AGENT_VERSION: &str = "1.0.0";
-        const PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
         let server_endpoint = loop {
             break match quinn::Endpoint::server(self.server_config.clone(), Self::SERVER_ADDR) {
@@ -186,6 +204,7 @@ impl TestEnvironment {
         };
 
         let handler_endpoint = server_endpoint.clone();
+        let version_req = protocol_version.to_owned();
         let server_handle = tokio::spawn(async move {
             let server_conn = match handler_endpoint.accept().await {
                 Some(conn) => match conn.await {
@@ -198,8 +217,8 @@ impl TestEnvironment {
             let agent_info = crate::server::handshake(
                 &server_conn,
                 client_addr,
-                PROTOCOL_VERSION,
-                PROTOCOL_VERSION,
+                &version_req,
+                crate::PROTOCOL_VERSION,
             )
             .await
             .unwrap();
@@ -215,7 +234,7 @@ impl TestEnvironment {
             Self::SERVER_ADDR,
             AGENT_NAME,
             AGENT_VERSION,
-            PROTOCOL_VERSION,
+            protocol_version,
             Status::Ready,
             client_cert_pem.as_bytes(),
             client_key_pem.as_bytes(),
