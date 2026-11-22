@@ -460,6 +460,9 @@ fn raw_event_body_kind(body: &RawEventBody) -> RawEventKind {
 }
 
 /// The rule of [`DetectionEvent::validate`] an event breaks, and how.
+// `Display` and `Error` are written by hand: this type builds with no optional
+// feature, and `thiserror` is a dependency of the `client` and `server`
+// features only.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DetectionEventError {
     /// Rule 1: `detail` belongs to another model than `detection_model`.

@@ -64,8 +64,8 @@
 //! before every invocation, including subsequent requests on the same stream.
 //! It passes the context's peer name to existing `server::Handler` methods that
 //! take a peer argument. The detection event runner takes a
-//! `server::DetectionEventStreamHandler` for a particular stream. Applications can supply peer-specific behavior in
-//! that handler.
+//! `server::DetectionEventStreamHandler` for a particular stream. Applications
+//! can supply peer-specific behavior in that handler.
 //!
 //! ```no_run
 //! # #[cfg(feature = "server")]
