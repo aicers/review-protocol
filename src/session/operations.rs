@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 #[cfg(feature = "server")]
 use super::ServerRunError;
+#[cfg(feature = "client")]
+use super::exchange::{Decoding, unary_as};
 use super::{
     OutcomeCertainty, SessionError, Shared,
     decode::decode,
@@ -30,7 +32,7 @@ use crate::types::node::{
     NodeTimeSyncResponse, NodeVersionRequest, NodeVersionResponse,
 };
 use crate::types::{
-    CloneModelRequest, CustomerDataDeletionReport, DetectorStatusReport, HostNetworkGroup,
+    CloneModelRequest, CustomerDataDeletionReport, DetectorStatusReport, NetworkListItem,
     ReportedRunState, TrainModelRequest,
 };
 #[cfg(feature = "server")]
@@ -38,8 +40,8 @@ use crate::{
     auth::{AuthorizationContext, AuthorizerV2},
     server::{Handler, RequestCode as ServerCode},
     types::{
-        ColumnStatisticsUpdate, DataSource, DataSourceKey, EventMessage, OutlierInfo,
-        SamplingPolicy, TimeSeriesUpdate, UpdateClusterRequest, UserAgent,
+        ColumnStatisticsUpdate, DataSource, DataSourceKey, DetectionEvent, HostNetworkGroup,
+        OutlierInfo, SamplingPolicy, TimeSeriesUpdate, UpdateClusterRequest, UserAgent,
     },
 };
 
@@ -195,10 +197,17 @@ impl RequestOwner {
             if serves(code) {
                 return Ok(Some((code, frame)));
             }
-            self.exchange.recycle(frame)?;
-            self.exchange.start(Err::<(), String>(unserved(code)))?;
-            self.answering = true;
+            self.refuse(frame, &unserved(code))?;
         }
+    }
+
+    /// Prepares `message` as the error answer to the request in `frame`; the
+    /// next [`Self::flush_unserved`] sends it.
+    fn refuse(&mut self, frame: oinq::frame::Frame, message: &str) -> Result<(), SessionError> {
+        self.exchange.recycle(frame)?;
+        self.exchange.start(Err::<(), &str>(message))?;
+        self.answering = true;
+        Ok(())
     }
 
     async fn flush_unserved(&mut self) -> Result<(), SessionError> {
@@ -238,6 +247,24 @@ fn server_delegates(code: ServerCode) -> bool {
 #[cfg(feature = "server")]
 fn server_unserved(_code: u32) -> String {
     crate::server::UNKNOWN_REQUEST_CODE.to_owned()
+}
+
+/// Returns the error a manager answers a list pull with when the agent
+/// advertised `version`, earlier than the item lists, or `None` for any other
+/// request code.
+#[cfg(feature = "server")]
+fn server_network_list_refusal(code: u32, blocker: Option<&str>) -> Option<String> {
+    let version = blocker?;
+    matches!(
+        ServerCode::from(code),
+        ServerCode::GetAllowlist | ServerCode::GetBlocklist
+    )
+    .then(|| {
+        format!(
+            "request code {code} requires protocol {}, but the agent advertised {version}",
+            crate::NETWORK_LIST_ITEMS_REQ
+        )
+    })
 }
 
 /// Whether [`AgentRequestStream::next`] dispatches request `code`.
@@ -289,8 +316,8 @@ fn arguments<'a, T: Deserialize<'a>>(
 pub enum ServerStream {
     /// A stream containing zero or more sequential requests.
     Requests(ServerRequestStream),
-    /// An ordered event sequence.
-    Events(super::EventReceiver),
+    /// An ordered detection event sequence.
+    DetectionEvents(super::DetectionEventReceiver),
 }
 
 /// The unique server-side owner of incoming stream acceptance.
@@ -338,11 +365,15 @@ impl ServerIncoming {
                 Ok(ServerStream::Requests(ServerRequestStream {
                     owner: RequestOwner::new(send, recv, self.shared.options.clone()),
                     authorization: self.authorization.clone(),
+                    network_list_blocker: self.shared.network_list_blocker.clone(),
                 }))
             }
             result = self.shared.connection.accept_uni() => {
                 let recv = result.map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent))?;
-                Ok(ServerStream::Events(super::EventReceiver::new(recv, self.shared.options.events)))
+                Ok(ServerStream::DetectionEvents(super::DetectionEventReceiver::new(
+                    recv,
+                    self.shared.options.detection_events,
+                )))
             }
         }
     }
@@ -362,6 +393,9 @@ struct ServerAuthorization {
 pub struct ServerRequestStream {
     owner: RequestOwner,
     authorization: Option<Arc<ServerAuthorization>>,
+    /// The agent's advertised version when it is earlier than the allowlist
+    /// and blocklist item lists.
+    network_list_blocker: Option<String>,
 }
 
 #[cfg(feature = "server")]
@@ -381,15 +415,28 @@ impl ServerRequestStream {
     /// continues. Use [`Self::run`] for the authorized legacy dispatcher, including
     /// its caller handoff and terminal unknown-code behavior.
     ///
+    /// An allowlist or blocklist pull from an agent that advertised a protocol
+    /// earlier than `0.50.0` is answered with an error the same way, and is not
+    /// returned: its reply would be an item list the agent can misread.
+    ///
     /// # Errors
     /// Returns classified transport, malformed request, or limit errors and aborts the stream.
     pub async fn next(&mut self) -> Result<Option<ServerRequest<'_>>, SessionError> {
-        let Some((code, frame)) = self.owner.next(server_serves, server_unserved).await? else {
-            return Ok(None);
-        };
-        self.decode_low_level_request(code, frame, true)
-            .await
-            .map(Some)
+        loop {
+            let Some((code, frame)) = self.owner.next(server_serves, server_unserved).await? else {
+                return Ok(None);
+            };
+            if let Some(message) =
+                server_network_list_refusal(code, self.network_list_blocker.as_deref())
+            {
+                self.owner.refuse(frame, &message)?;
+                continue;
+            }
+            return self
+                .decode_low_level_request(code, frame, true)
+                .await
+                .map(Some);
+        }
     }
 
     /// Processes requests sequentially using the authorization bound to this stream
@@ -400,6 +447,9 @@ impl ServerRequestStream {
     /// the identity in the authorization context. Handler error strings are
     /// sent unchanged and the stream continues. At clean EOF the response
     /// direction is finished. A delegated request returns ownership to the caller.
+    /// An authorized allowlist or blocklist pull from an agent that advertised
+    /// a protocol earlier than `0.50.0` is answered with an error without
+    /// invoking the handler, and the stream continues.
     ///
     /// This future owns the stream and holds a shared handler reference. Poll it
     /// or spawn and join it under application supervision. Dropping the future
@@ -436,6 +486,13 @@ impl ServerRequestStream {
             {
                 self.reject(crate::server::AUTHORIZATION_DENIED).await;
                 return Err(ServerRunError::AuthorizationDenied { service, source });
+            }
+            if let Some(message) =
+                server_network_list_refusal(code, self.network_list_blocker.as_deref())
+            {
+                self.owner.refuse(frame, &message)?;
+                self.owner.flush_unserved().await?;
+                continue;
             }
             if server_delegates(request_code) {
                 let mut body = frame.into_bytes();
@@ -729,9 +786,9 @@ server_operations! {
             => |h, _peer, name| h.get_pretrained_model(&name).await,
         GetModelNames(()) -> Vec<String>
             => |h, _peer, ()| h.get_model_names().await,
-        GetAllowlist(()) -> HostNetworkGroup
+        GetAllowlist(()) -> Vec<NetworkListItem>
             => |h, peer, ()| h.get_allowlist(peer).await,
-        GetBlocklist(()) -> HostNetworkGroup
+        GetBlocklist(()) -> Vec<NetworkListItem>
             => |h, peer, ()| h.get_blocklist(peer).await,
         InsertModel(Vec<u8>) -> u32
             => |h, _peer, model| h.insert_model(&model).await,
@@ -755,8 +812,8 @@ server_operations! {
             => |h, _peer, (clusters, model_id)| h.update_clusters(&clusters, model_id).await,
         UpdateOutliers((Vec<OutlierInfo>, u32, i64)) -> ()
             => |h, _peer, (outliers, model_id, timestamp)| h.update_outliers(&outliers, model_id, timestamp).await,
-        InsertEventLabels((u32, u32, Vec<EventMessage>)) -> ()
-            => |h, _peer, (model_id, round, labels)| h.insert_event_labels(model_id, round, &labels).await,
+        InsertDetectionEvents((u32, u32, Vec<DetectionEvent>)) -> ()
+            => |h, _peer, (model_id, round, events)| h.insert_detection_events(model_id, round, &events).await,
         InsertDataSource(DataSource) -> u32
             => |h, _peer, source| h.insert_data_source(&source).await,
         RenewCertificate(()) -> (String, String)
@@ -1119,6 +1176,18 @@ pub enum AgentRequest<'a> {
 
 #[cfg(feature = "client")]
 impl super::AgentHandle {
+    /// Refuses an allowlist or blocklist pull, before anything is sent, on a
+    /// session whose handshake shows a side earlier than the item lists.
+    fn check_network_lists(&self) -> Result<(), SessionError> {
+        match &self.0.network_list_blocker {
+            None => Ok(()),
+            Some(version) => Err(SessionError::IncompatibleProtocol {
+                version: version.clone(),
+                required: crate::NETWORK_LIST_ITEMS_REQ.to_owned(),
+            }),
+        }
+    }
+
     /// Sends the `upload_run_model` engine operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
@@ -1228,26 +1297,44 @@ impl super::AgentHandle {
         .await
     }
     /// Sends the `get_allowlist` domain operation.
+    ///
+    /// Both the protocol version this agent advertised and the manager's
+    /// handshake reply must be `0.50.0` or later: a `0.49.0` payload can decode
+    /// as a different item list (see [`NetworkListItem`]). Otherwise nothing
+    /// is sent.
     /// # Errors
-    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
-    pub async fn get_allowlist(&self) -> Result<HostNetworkGroup, SessionError> {
-        unary(
+    /// Returns [`SessionError::IncompatibleProtocol`] when either handshake
+    /// version is earlier than `0.50.0`, and classified transport, malformed
+    /// data, remote rejection, limit, or deadline errors.
+    pub async fn get_allowlist(&self) -> Result<Vec<NetworkListItem>, SessionError> {
+        self.check_network_lists()?;
+        unary_as(
             &self.0.connection,
             &self.0.options,
             u32::from(crate::server::RequestCode::GetAllowlist),
             (),
+            Decoding::Exact,
         )
         .await
     }
     /// Sends the `get_blocklist` domain operation.
+    ///
+    /// Both the protocol version this agent advertised and the manager's
+    /// handshake reply must be `0.50.0` or later: a `0.49.0` payload can decode
+    /// as a different item list (see [`NetworkListItem`]). Otherwise nothing
+    /// is sent.
     /// # Errors
-    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
-    pub async fn get_blocklist(&self) -> Result<HostNetworkGroup, SessionError> {
-        unary(
+    /// Returns [`SessionError::IncompatibleProtocol`] when either handshake
+    /// version is earlier than `0.50.0`, and classified transport, malformed
+    /// data, remote rejection, limit, or deadline errors.
+    pub async fn get_blocklist(&self) -> Result<Vec<NetworkListItem>, SessionError> {
+        self.check_network_lists()?;
+        unary_as(
             &self.0.connection,
             &self.0.options,
             u32::from(crate::server::RequestCode::GetBlocklist),
             (),
+            Decoding::Exact,
         )
         .await
     }

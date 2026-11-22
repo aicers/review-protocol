@@ -1,45 +1,48 @@
 //! Server-specific protocol implementation.
 //!
-//! # Unidirectional Event Stream Handling
+//! # Unidirectional Detection Event Stream Handling
 //!
 //! The `review-protocol` crate provides high-level APIs for handling
-//! unidirectional event streams from agents. This encapsulates all
+//! unidirectional detection event streams from agents. This encapsulates all
 //! protocol-level details and provides a clean interface for applications.
 //!
 //! ## Basic Usage
 //!
-//! Implement the `EventStreamHandler` trait to define how events should be
-//! processed:
+//! Implement the `DetectionEventStreamHandler` trait to define how detection
+//! events should be processed:
 //!
 //! ```rust,ignore
-//! use review_protocol::{server::EventStreamHandler, types::EventMessage};
+//! use review_protocol::{server::DetectionEventStreamHandler, types::DetectionEvent};
 //!
 //! struct MyEventHandler {
 //!     event_count: usize,
 //! }
 //!
 //! #[async_trait::async_trait]
-//! impl EventStreamHandler for MyEventHandler {
-//!     async fn handle_event(&mut self, event: EventMessage) -> std::io::Result<()> {
+//! impl DetectionEventStreamHandler for MyEventHandler {
+//!     async fn handle_detection_event(&mut self, event: DetectionEvent) -> std::io::Result<()> {
 //!         self.event_count += 1;
-//!         println!("Received event #{}: {:?}", self.event_count, event.kind);
+//!         println!(
+//!             "Received event #{}: {:?}",
+//!             self.event_count, event.detection_model
+//!         );
 //!         Ok(())
 //!     }
 //! }
 //! ```
 //!
-//! Then use the handler to process incoming event streams:
+//! Then use the handler to process incoming detection event streams:
 //!
 //! ```rust,ignore
-//! # use review_protocol::{server::{Connection, EventStreamHandler}, types::EventMessage};
+//! # use review_protocol::{server::{Connection, DetectionEventStreamHandler}, types::DetectionEvent};
 //! # struct MyEventHandler { event_count: usize }
 //! # #[async_trait::async_trait]
-//! # impl EventStreamHandler for MyEventHandler {
-//! #     async fn handle_event(&mut self, event: EventMessage) -> std::io::Result<()> { Ok(()) }
+//! # impl DetectionEventStreamHandler for MyEventHandler {
+//! #     async fn handle_detection_event(&mut self, event: DetectionEvent) -> std::io::Result<()> { Ok(()) }
 //! # }
 //! # async fn example(connection: Connection) -> anyhow::Result<()> {
 //! let handler = MyEventHandler { event_count: 0 };
-//! connection.accept_event_stream(handler).await?;
+//! connection.accept_detection_event_stream(handler).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -47,16 +50,16 @@
 //! ## Multiple Concurrent Streams
 //!
 //! Drive `accept_uni` directly and dispatch each stream to
-//! [`Connection::handle_event_stream`]. The caller owns the spawn
+//! [`Connection::handle_detection_event_stream`]. The caller owns the spawn
 //! lifetime, concurrency policy, and error handling:
 //!
 //! ```rust,ignore
 //! # use std::sync::Arc;
-//! # use review_protocol::{server::{Connection, EventStreamHandler}, types::EventMessage};
+//! # use review_protocol::{server::{Connection, DetectionEventStreamHandler}, types::DetectionEvent};
 //! # struct MyEventHandler;
 //! # #[async_trait::async_trait]
-//! # impl EventStreamHandler for MyEventHandler {
-//! #     async fn handle_event(&mut self, event: EventMessage) -> std::io::Result<()> { Ok(()) }
+//! # impl DetectionEventStreamHandler for MyEventHandler {
+//! #     async fn handle_detection_event(&mut self, event: DetectionEvent) -> std::io::Result<()> { Ok(()) }
 //! # }
 //! # impl MyEventHandler { fn new() -> Self { MyEventHandler } }
 //! # async fn example(connection: Connection) -> anyhow::Result<()> {
@@ -66,7 +69,7 @@
 //!     let handler = MyEventHandler::new();
 //!     tokio::spawn(async move {
 //!         let _permit = permit;
-//!         if let Err(e) = Connection::handle_event_stream(recv, handler).await {
+//!         if let Err(e) = Connection::handle_detection_event_stream(recv, handler).await {
 //!             tracing::warn!(error = %e, "event stream ended with error");
 //!         }
 //!     });
@@ -80,11 +83,11 @@
 //! Combine bidirectional and unidirectional stream handling:
 //!
 //! ```rust,ignore
-//! # use review_protocol::{server::{Connection, EventStreamHandler}, types::EventMessage};
+//! # use review_protocol::{server::{Connection, DetectionEventStreamHandler}, types::DetectionEvent};
 //! # struct MyEventHandler;
 //! # #[async_trait::async_trait]
-//! # impl EventStreamHandler for MyEventHandler {
-//! #     async fn handle_event(&mut self, event: EventMessage) -> std::io::Result<()> { Ok(()) }
+//! # impl DetectionEventStreamHandler for MyEventHandler {
+//! #     async fn handle_detection_event(&mut self, event: DetectionEvent) -> std::io::Result<()> { Ok(()) }
 //! # }
 //! # impl MyEventHandler {
 //! #     fn new() -> Self { MyEventHandler }
@@ -98,7 +101,7 @@
 //!         }
 //!
 //!         // Handle unidirectional event streams
-//!         res = connection.accept_event_stream(MyEventHandler::new()) => {
+//!         res = connection.accept_detection_event_stream(MyEventHandler::new()) => {
 //!             if let Err(e) = res {
 //!                 tracing::warn!(error = %e, "event stream ended with error");
 //!             }
@@ -111,10 +114,10 @@
 //!
 //! ## Error Handling
 //!
-//! The `EventStreamHandler` trait provides hooks for custom error handling:
+//! The `DetectionEventStreamHandler` trait provides hooks for custom error handling:
 //!
 //! ```rust,ignore
-//! use review_protocol::{server::EventStreamHandler, types::EventMessage};
+//! use review_protocol::{server::DetectionEventStreamHandler, types::DetectionEvent};
 //!
 //! struct ResilientHandler {
 //!     max_errors: usize,
@@ -122,8 +125,8 @@
 //! }
 //!
 //! #[async_trait::async_trait]
-//! impl EventStreamHandler for ResilientHandler {
-//!     async fn handle_event(&mut self, event: EventMessage) -> std::io::Result<()> {
+//! impl DetectionEventStreamHandler for ResilientHandler {
+//!     async fn handle_detection_event(&mut self, event: DetectionEvent) -> std::io::Result<()> {
 //!         // Process event
 //!         Ok(())
 //!     }
@@ -173,31 +176,34 @@ use semver::{Version, VersionReq};
 #[cfg(feature = "server")]
 pub use self::handler::{Handler, handle, handle_authorized, handle_authorized_with_context};
 #[cfg(feature = "server")]
-pub use self::stream::process_event_stream;
+pub use self::stream::process_detection_event_stream;
 #[cfg(feature = "server")]
 use crate::legacy_transport as oinq;
 #[cfg(feature = "server")]
-use crate::types::EventMessage;
+use crate::types::DetectionEvent;
 #[cfg(feature = "server")]
 use crate::{
     AgentInfo, HandshakeError, client, decode_agent_info, handle_handshake_recv_io_error,
     handle_handshake_send_io_error, types::LabelDb,
 };
 
-/// Trait for handling incoming event messages from unidirectional streams
+/// Trait for handling incoming detection events from unidirectional streams
 ///
-/// This trait provides a standardized interface for processing event messages
-/// received from unidirectional streams, abstracting away protocol-level details.
+/// This trait provides a standardized interface for processing detection
+/// events received from unidirectional streams, abstracting away
+/// protocol-level details.
 #[cfg(feature = "server")]
 #[async_trait::async_trait]
-pub trait EventStreamHandler {
-    /// Handles a single event message
+pub trait DetectionEventStreamHandler {
+    /// Handles a single detection event
     ///
-    /// Called for each successfully deserialized `EventMessage` received
-    /// from the unidirectional stream.
+    /// Called for each successfully deserialized `DetectionEvent` received
+    /// from the unidirectional stream. The event is delivered as decoded,
+    /// without [`DetectionEvent::validate`]; a handler that needs the rules
+    /// checked calls it and decides what to do with an event that fails.
     ///
     /// # Arguments
-    /// * `event` - The deserialized `EventMessage`
+    /// * `event` - The deserialized `DetectionEvent`
     ///
     /// # Returns
     /// * `Ok(())` - Continue processing messages
@@ -209,7 +215,7 @@ pub trait EventStreamHandler {
     /// * The event processing logic fails
     /// * The handler determines the event is invalid or cannot be processed
     /// * Any downstream processing of the event fails
-    async fn handle_event(&mut self, event: EventMessage) -> io::Result<()>;
+    async fn handle_detection_event(&mut self, event: DetectionEvent) -> io::Result<()>;
 
     /// Called when the stream ends normally
     ///
@@ -231,7 +237,7 @@ pub trait EventStreamHandler {
     /// The handler can decide whether to treat the error as fatal:
     /// return `Ok(())` to continue processing subsequent messages, or
     /// `Err(_)` to stop the stream and propagate the error to the
-    /// caller of [`Connection::handle_event_stream`].
+    /// caller of [`Connection::handle_detection_event_stream`].
     ///
     /// The default implementation is a no-op; the library does not
     /// log on the application's behalf. Override this method to wire
@@ -267,7 +273,7 @@ pub(crate) enum RequestCode {
     UpdateClusters = 10,
     UpdateModel = 11,
     UpdateOutliers = 12,
-    InsertEventLabels = 13,
+    InsertDetectionEvents = 13,
     GetDataSourceList = 14,
     GetLabelDbPatterns = 15,
     InsertDataSource = 20,
@@ -427,7 +433,7 @@ impl Connection {
     /// Accepts the next incoming unidirectional stream.
     ///
     /// This directly corresponds to the `accept_uni` method of the underlying
-    /// `quinn::Connection`. Pair it with [`Connection::handle_event_stream`]
+    /// `quinn::Connection`. Pair it with [`Connection::handle_detection_event_stream`]
     /// to dispatch each stream with caller-controlled concurrency and error
     /// handling.
     #[must_use]
@@ -441,14 +447,14 @@ impl Connection {
         self.conn.close(0u32.into(), b"");
     }
 
-    /// Accepts and handles the next unidirectional event stream
+    /// Accepts and handles the next unidirectional detection event stream
     ///
     /// This method waits for the next unidirectional stream from the agent
-    /// and processes it using the provided event handler. The method returns
+    /// and processes it using the provided detection event handler. The method returns
     /// when the stream ends or an error occurs.
     ///
     /// # Arguments
-    /// * `handler` - Implementation of `EventStreamHandler` trait
+    /// * `handler` - Implementation of `DetectionEventStreamHandler` trait
     ///
     /// # Returns
     /// * `Ok(())` - Stream processed successfully
@@ -462,28 +468,28 @@ impl Connection {
     ///
     /// # Example
     /// ```rust,ignore
-    /// # use review_protocol::server::{Connection, EventStreamHandler};
-    /// # use review_protocol::types::EventMessage;
+    /// # use review_protocol::server::{Connection, DetectionEventStreamHandler};
+    /// # use review_protocol::types::DetectionEvent;
     /// # struct MyEventHandler;
     /// # #[async_trait::async_trait]
-    /// # impl EventStreamHandler for MyEventHandler {
-    /// #     async fn handle_event(&mut self, event: EventMessage) -> std::io::Result<()> {
+    /// # impl DetectionEventStreamHandler for MyEventHandler {
+    /// #     async fn handle_detection_event(&mut self, event: DetectionEvent) -> std::io::Result<()> {
     /// #         Ok(())
     /// #     }
     /// # }
     /// # async fn example(connection: Connection) -> std::io::Result<()> {
     /// let handler = MyEventHandler;
-    /// connection.accept_event_stream(handler).await?;
+    /// connection.accept_detection_event_stream(handler).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn accept_event_stream<H>(&self, handler: H) -> io::Result<()>
+    pub async fn accept_detection_event_stream<H>(&self, handler: H) -> io::Result<()>
     where
-        H: EventStreamHandler + Send + 'static,
+        H: DetectionEventStreamHandler + Send + 'static,
     {
         let recv_stream = self.conn.accept_uni().await?;
 
-        self::stream::process_event_stream(recv_stream, handler).await
+        self::stream::process_detection_event_stream(recv_stream, handler).await
     }
 
     /// Handles a specific unidirectional stream with the given handler
@@ -493,7 +499,7 @@ impl Connection {
     ///
     /// # Arguments
     /// * `recv_stream` - The unidirectional receive stream
-    /// * `handler` - Implementation of `EventStreamHandler` trait
+    /// * `handler` - Implementation of `DetectionEventStreamHandler` trait
     ///
     /// # Returns
     /// * `Ok(())` - Stream processed successfully
@@ -506,29 +512,29 @@ impl Connection {
     ///
     /// # Example
     /// ```rust,ignore
-    /// # use review_protocol::server::{Connection, EventStreamHandler};
-    /// # use review_protocol::types::EventMessage;
+    /// # use review_protocol::server::{Connection, DetectionEventStreamHandler};
+    /// # use review_protocol::types::DetectionEvent;
     /// # struct MyEventHandler;
     /// # #[async_trait::async_trait]
-    /// # impl EventStreamHandler for MyEventHandler {
-    /// #     async fn handle_event(&mut self, event: EventMessage) -> std::io::Result<()> {
+    /// # impl DetectionEventStreamHandler for MyEventHandler {
+    /// #     async fn handle_detection_event(&mut self, event: DetectionEvent) -> std::io::Result<()> {
     /// #         Ok(())
     /// #     }
     /// # }
     /// # async fn example(recv_stream: quinn::RecvStream) -> anyhow::Result<()> {
     /// let handler = MyEventHandler;
-    /// Connection::handle_event_stream(recv_stream, handler).await?;
+    /// Connection::handle_detection_event_stream(recv_stream, handler).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn handle_event_stream<H>(
+    pub async fn handle_detection_event_stream<H>(
         recv_stream: quinn::RecvStream,
         handler: H,
     ) -> io::Result<()>
     where
-        H: EventStreamHandler + Send + 'static,
+        H: DetectionEventStreamHandler + Send + 'static,
     {
-        self::stream::process_event_stream(recv_stream, handler).await
+        self::stream::process_detection_event_stream(recv_stream, handler).await
     }
 }
 
@@ -884,13 +890,13 @@ mod tests {
     use std::io;
 
     #[cfg(feature = "server")]
-    use crate::EventStreamHandler;
+    use crate::DetectionEventStreamHandler;
     #[cfg(feature = "server")]
-    use crate::types::EventMessage;
+    use crate::types::DetectionEvent;
 
     #[cfg(feature = "server")]
     struct TestEventHandler {
-        events: Vec<EventMessage>,
+        events: Vec<DetectionEvent>,
         errors: Vec<String>,
         stream_ended: bool,
     }
@@ -908,8 +914,8 @@ mod tests {
 
     #[cfg(feature = "server")]
     #[async_trait::async_trait]
-    impl EventStreamHandler for TestEventHandler {
-        async fn handle_event(&mut self, event: EventMessage) -> io::Result<()> {
+    impl DetectionEventStreamHandler for TestEventHandler {
+        async fn handle_detection_event(&mut self, event: DetectionEvent) -> io::Result<()> {
             self.events.push(event);
             Ok(())
         }
@@ -928,20 +934,12 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "server")]
     async fn test_event_stream_handler_interface() {
-        use crate::types::EventKind;
-
         let mut handler = TestEventHandler::new();
 
-        let event = EventMessage {
-            time: jiff::Timestamp::now(),
-            kind: EventKind::DnsCovertChannel,
-            fields: vec![1, 2, 3, 4],
-        };
+        let event = crate::test::detection_events().remove(0);
 
-        assert!(handler.handle_event(event.clone()).await.is_ok());
-        assert_eq!(handler.events.len(), 1);
-        assert_eq!(handler.events[0].kind, EventKind::DnsCovertChannel);
-        assert_eq!(handler.events[0].fields, vec![1, 2, 3, 4]);
+        assert!(handler.handle_detection_event(event.clone()).await.is_ok());
+        assert_eq!(handler.events, [event]);
 
         assert!(handler.on_error("test error").await.is_ok());
         assert_eq!(handler.errors.len(), 1);
@@ -954,13 +952,11 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "server")]
     async fn test_event_handler_error_handling() {
-        use crate::types::EventKind;
-
         struct FailingHandler;
 
         #[async_trait::async_trait]
-        impl EventStreamHandler for FailingHandler {
-            async fn handle_event(&mut self, _event: EventMessage) -> io::Result<()> {
+        impl DetectionEventStreamHandler for FailingHandler {
+            async fn handle_detection_event(&mut self, _event: DetectionEvent) -> io::Result<()> {
                 Err(io::Error::other("processing failed"))
             }
 
@@ -974,13 +970,9 @@ mod tests {
         }
 
         let mut handler = FailingHandler;
-        let event = EventMessage {
-            time: jiff::Timestamp::now(),
-            kind: EventKind::HttpThreat,
-            fields: vec![],
-        };
+        let event = crate::test::detection_events().remove(1);
 
-        assert!(handler.handle_event(event).await.is_err());
+        assert!(handler.handle_detection_event(event).await.is_err());
         assert!(handler.on_error("test").await.is_err());
         assert!(handler.on_stream_end().await.is_err());
     }
@@ -991,8 +983,8 @@ mod tests {
         struct MinimalHandler;
 
         #[async_trait::async_trait]
-        impl EventStreamHandler for MinimalHandler {
-            async fn handle_event(&mut self, _event: EventMessage) -> io::Result<()> {
+        impl DetectionEventStreamHandler for MinimalHandler {
+            async fn handle_detection_event(&mut self, _event: DetectionEvent) -> io::Result<()> {
                 Ok(())
             }
         }
@@ -1085,12 +1077,12 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         struct TestHandler {
-            events: Arc<Mutex<Vec<EventMessage>>>,
+            events: Arc<Mutex<Vec<DetectionEvent>>>,
         }
 
         #[async_trait::async_trait]
-        impl EventStreamHandler for TestHandler {
-            async fn handle_event(&mut self, event: EventMessage) -> io::Result<()> {
+        impl DetectionEventStreamHandler for TestHandler {
+            async fn handle_detection_event(&mut self, event: DetectionEvent) -> io::Result<()> {
                 self.events.lock().unwrap().push(event);
                 Ok(())
             }
@@ -1116,20 +1108,16 @@ mod tests {
             // Write protocol header
             send.write_all(&[0, 0]).await.unwrap();
 
-            // Send test event
-            let event = EventMessage {
-                time: jiff::Timestamp::now(),
-                kind: crate::types::EventKind::DnsCovertChannel,
-                fields: vec![1, 2, 3, 4],
-            };
-
+            // Send every test event, including the one that fails
+            // `validate`, each in its own frame.
             let codec = bincode::config::standard();
-            let serialized = bincode::serde::encode_to_vec(&event, codec).unwrap();
-            #[allow(clippy::cast_possible_truncation)]
-            let len = serialized.len() as u32;
+            for event in crate::test::detection_events() {
+                let serialized = bincode::serde::encode_to_vec(&event, codec).unwrap();
+                let len = u32::try_from(serialized.len()).unwrap();
 
-            send.write_all(&len.to_be_bytes()).await.unwrap();
-            send.write_all(&serialized).await.unwrap();
+                send.write_all(&len.to_be_bytes()).await.unwrap();
+                send.write_all(&serialized).await.unwrap();
+            }
 
             // Close stream properly to signal EOF
             send.finish().unwrap();
@@ -1142,17 +1130,19 @@ mod tests {
         client_handle.await.unwrap();
 
         // Now accept and process the stream
-        let server_res = server_conn.accept_event_stream(handler).await;
+        let server_res = server_conn.accept_detection_event_stream(handler).await;
 
         assert!(server_res.is_ok());
 
+        // Every event arrives as sent and in order; the one that fails
+        // `validate` is delivered with the rest.
         let received_events = events.lock().unwrap();
-        assert_eq!(received_events.len(), 1);
-        assert_eq!(
-            received_events[0].kind,
-            crate::types::EventKind::DnsCovertChannel
+        assert_eq!(*received_events, crate::test::detection_events());
+        assert!(
+            received_events[crate::test::INVALID_DETECTION_EVENT]
+                .validate()
+                .is_err()
         );
-        assert_eq!(received_events[0].fields, vec![1, 2, 3, 4]);
 
         test_env.teardown(&server_conn_for_teardown);
     }
@@ -1163,12 +1153,12 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         struct TestHandler {
-            events: Arc<Mutex<Vec<EventMessage>>>,
+            events: Arc<Mutex<Vec<DetectionEvent>>>,
         }
 
         #[async_trait::async_trait]
-        impl EventStreamHandler for TestHandler {
-            async fn handle_event(&mut self, event: EventMessage) -> io::Result<()> {
+        impl DetectionEventStreamHandler for TestHandler {
+            async fn handle_detection_event(&mut self, event: DetectionEvent) -> io::Result<()> {
                 self.events.lock().unwrap().push(event);
                 Ok(())
             }
@@ -1192,16 +1182,11 @@ mod tests {
             send.write_all(&[0, 0]).await.unwrap();
 
             // Send test event
-            let event = EventMessage {
-                time: jiff::Timestamp::now(),
-                kind: crate::types::EventKind::HttpThreat,
-                fields: vec![5, 6, 7],
-            };
+            let event = crate::test::detection_events().remove(1);
 
             let codec = bincode::config::standard();
             let serialized = bincode::serde::encode_to_vec(&event, codec).unwrap();
-            #[allow(clippy::cast_possible_truncation)]
-            let len = serialized.len() as u32;
+            let len = u32::try_from(serialized.len()).unwrap();
 
             send.write_all(&len.to_be_bytes()).await.unwrap();
             send.write_all(&serialized).await.unwrap();
@@ -1219,14 +1204,16 @@ mod tests {
         // Now accept uni stream and handle it
         let server_conn_clone = server_conn.clone();
         let recv_stream = server_conn_clone.conn.accept_uni().await.unwrap();
-        let server_res = crate::server::Connection::handle_event_stream(recv_stream, handler).await;
+        let server_res =
+            crate::server::Connection::handle_detection_event_stream(recv_stream, handler).await;
 
         assert!(server_res.is_ok());
 
         let received_events = events.lock().unwrap();
-        assert_eq!(received_events.len(), 1);
-        assert_eq!(received_events[0].kind, crate::types::EventKind::HttpThreat);
-        assert_eq!(received_events[0].fields, vec![5, 6, 7]);
+        assert_eq!(
+            *received_events,
+            [crate::test::detection_events().remove(1)]
+        );
 
         test_env.teardown(&server_conn);
     }
@@ -1237,12 +1224,12 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         struct TestHandler {
-            events: Arc<Mutex<Vec<EventMessage>>>,
+            events: Arc<Mutex<Vec<DetectionEvent>>>,
         }
 
         #[async_trait::async_trait]
-        impl EventStreamHandler for TestHandler {
-            async fn handle_event(&mut self, event: EventMessage) -> io::Result<()> {
+        impl DetectionEventStreamHandler for TestHandler {
+            async fn handle_detection_event(&mut self, event: DetectionEvent) -> io::Result<()> {
                 self.events.lock().unwrap().push(event);
                 Ok(())
             }
@@ -1254,7 +1241,7 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let events_for_loop = events.clone();
 
-        // Spawn the recommended accept loop: accept_uni + handle_event_stream
+        // Spawn the recommended accept loop: accept_uni + handle_detection_event_stream
         // in a per-stream tokio::spawn, with the caller owning lifetime and
         // error handling.
         let server_conn_clone = server_conn.clone();
@@ -1264,7 +1251,8 @@ mod tests {
                     events: events_for_loop.clone(),
                 };
                 tokio::spawn(async move {
-                    let _ = crate::server::Connection::handle_event_stream(recv, handler).await;
+                    let _ = crate::server::Connection::handle_detection_event_stream(recv, handler)
+                        .await;
                 });
             }
         });
@@ -1278,16 +1266,11 @@ mod tests {
                 send.write_all(&[0, 0]).await.unwrap();
 
                 // Send test event
-                let event = EventMessage {
-                    time: jiff::Timestamp::now(),
-                    kind: crate::types::EventKind::DnsCovertChannel,
-                    fields: vec![u8::try_from(i).unwrap()],
-                };
+                let event = crate::test::detection_events().remove(i);
 
                 let codec = bincode::config::standard();
                 let serialized = bincode::serde::encode_to_vec(&event, codec).unwrap();
-                #[allow(clippy::cast_possible_truncation)]
-                let len = serialized.len() as u32;
+                let len = u32::try_from(serialized.len()).unwrap();
 
                 send.write_all(&len.to_be_bytes()).await.unwrap();
                 send.write_all(&serialized).await.unwrap();
@@ -1334,8 +1317,8 @@ mod tests {
         }
 
         #[async_trait::async_trait]
-        impl EventStreamHandler for SlowHandler {
-            async fn handle_event(&mut self, _event: EventMessage) -> io::Result<()> {
+        impl DetectionEventStreamHandler for SlowHandler {
+            async fn handle_detection_event(&mut self, _event: DetectionEvent) -> io::Result<()> {
                 let current = self.concurrent_count.fetch_add(1, Ordering::SeqCst) + 1;
 
                 // Update max concurrent count
@@ -1376,7 +1359,8 @@ mod tests {
                 };
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = crate::server::Connection::handle_event_stream(recv, handler).await;
+                    let _ = crate::server::Connection::handle_detection_event_stream(recv, handler)
+                        .await;
                 });
             }
         });
@@ -1390,16 +1374,11 @@ mod tests {
                 send.write_all(&[0, 0]).await.unwrap();
 
                 // Send test event
-                let event = EventMessage {
-                    time: jiff::Timestamp::now(),
-                    kind: crate::types::EventKind::DnsCovertChannel,
-                    fields: vec![u8::try_from(i).unwrap()],
-                };
+                let event = crate::test::detection_events().remove(i);
 
                 let codec = bincode::config::standard();
                 let serialized = bincode::serde::encode_to_vec(&event, codec).unwrap();
-                #[allow(clippy::cast_possible_truncation)]
-                let len = serialized.len() as u32;
+                let len = u32::try_from(serialized.len()).unwrap();
 
                 send.write_all(&len.to_be_bytes()).await.unwrap();
                 send.write_all(&serialized).await.unwrap();

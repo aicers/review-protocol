@@ -49,9 +49,13 @@ The `current/server-*.bin` fixtures were captured against the released
 include framing. Requests were composed from literal little-endian codes and
 bincode 2.0.1 standard serde argument declarations. The legacy
 `handle_authorized_with_context` emitted the captured response bytes over
-loopback. Event bytes were composed from the legacy two-byte header and
-`EventMessage` codec, then checked through `process_event_stream`.
+loopback. Event bytes were composed from the legacy two-byte header and that
+release's event codec, then checked through the legacy event stream helper.
+Protocol 0.50.0 re-composed the frames whose payload types it replaced; see
+below.
 
+<!-- The rows naming changed argument types cannot wrap. -->
+<!-- markdownlint-disable MD013 -->
 | Code | Request | Legacy handler | Successful result |
 | ---- | ------- | -------------- | ----------------- |
 | 0 | GetDataSource | `get_data_source` | Optional data source |
@@ -67,7 +71,7 @@ loopback. Event bytes were composed from the legacy two-byte header and
 | 10 | UpdateClusters | `update_clusters` | Unit |
 | 11 | UpdateModel | `update_model` | Model ID |
 | 12 | UpdateOutliers | `update_outliers` | Unit |
-| 13 | InsertEventLabels | `insert_event_labels` | Unit |
+| 13 | InsertDetectionEvents, arguments model ID, round and a `DetectionEvent` batch | `insert_detection_events` | Unit |
 | 14 | GetDataSourceList | Caller handoff | Caller-defined |
 | 15 | GetLabelDbPatterns | `get_labeldb_patterns` | Optional databases |
 | 20 | InsertDataSource | `insert_data_source` | Data source ID |
@@ -76,8 +80,8 @@ loopback. Event bytes were composed from the legacy two-byte header and
 | 25 | GetOutliers | `get_outliers` | Names and lists of IDs |
 | 26 | GetTorExitNodeList | `get_tor_exit_node_list` | Node strings |
 | 31 | GetInternalNetworkList | `get_internal_network_list` | Network group |
-| 32 | GetAllowlist | `get_allowlist` | Host network group |
-| 33 | GetBlocklist | `get_blocklist` | Host network group |
+| 32 | GetAllowlist | `get_allowlist` | Network list items |
+| 33 | GetBlocklist | `get_blocklist` | Network list items |
 | 34 | GetPretrainedModel | `get_pretrained_model` | Model bytes |
 | 35 | GetTrustedUserAgentList | `get_trusted_user_agent_list` | User agents |
 | 36 | GetConfig | `get_config` | Configuration string |
@@ -88,8 +92,10 @@ loopback. Event bytes were composed from the legacy two-byte header and
 | 41 | UploadRunModel | `upload_run_model` | Unit |
 | 42 | ReportRun | `report_run` | Unit |
 | 43 | ReportActiveRuns | `report_active_runs` | Unit |
-| 44 | ReportDetectorStatus | `report_detector_status` | Unit |
+| 44 | ReportDetectorStatus, argument a `DetectorStatusReport` with `detection_models` and `excluded` | `report_detector_status` | Unit |
 | Other | Unknown | None | None |
+
+<!-- markdownlint-enable MD013 -->
 
 The request and response streams exercise all 32 built-in operations,
 including default `not supported` responses, a handler refusal, and success
@@ -118,3 +124,34 @@ The truncated request fixture shows the legacy dispatcher returning clean
 completion after a partial payload. Typed framing reports truncation as an
 error to prevent incomplete messages from being counted as complete streams.
 A truncated two-byte event header remains an unexpected EOF.
+
+## Re-composed for protocol 0.50.0
+
+Protocol 0.50.0 replaced the detection event payload (request 13 and the
+event stream) and appended two fields to `DetectorStatusReport` (request
+44). The frames carrying those payloads were re-composed the same way as
+above, from literal codes and bincode 2.0.1 standard serde; every other
+frame, including the undecodable and truncated ones, is byte-identical to the
+0.27.0 capture.
+
+- `server-requests.bin`, request 13: arguments `(1, 2, [event A])`, where
+  event A is a `DetectionEvent` with time 0 (`00`), no sensor (`00`),
+  detection model `LockyRansomware` (`02`), raw event kind `Conn` (`00`), no
+  category (`00`), a `Subject` target (`01`) whose primary subject is
+  `Cluster` (`01`) 0/1 (`00 01`) with no related IPs (`00`) and a window of
+  0 to 0 (`00 00`), score `1.0` (`00 00 00 00 00 00 f0 3f`), and detail
+  `LockyRansomware` (`02`). The handler still answers `not supported`, so
+  the response is unchanged.
+- `server-requests.bin`, request 44: the 0.27.0 arguments followed by empty
+  `detection_models` and `excluded` (`00 00`). The response is unchanged.
+- `server-events.bin`: the reserved header `ab cd`, event A, the complete
+  undecodable frame `ff`, and event B, which is event A with cluster id 2
+  and score `2.0` (`00 00 00 00 00 00 00 40`). The undecodable frame still
+  fails on the leading `i128` time.
+
+Requests 32 and 33 now answer `Vec<NetworkListItem>` instead of a
+`HostNetworkGroup`, but their frames carry unit arguments and the fixture
+handler answers them `not supported`, so neither their requests nor their
+responses changed. The session runner replays the request stream for an agent
+that advertised protocol 0.50.0: it answers these two pulls from an agent that
+advertised an earlier version with its own error, without the handler.

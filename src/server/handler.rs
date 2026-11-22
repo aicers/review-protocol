@@ -35,9 +35,9 @@ use super::{AUTHORIZATION_DENIED, RequestCode, UNKNOWN_REQUEST_CODE};
 use crate::legacy_transport as oinq;
 use crate::protocol_error::{DispatchError, ProtocolErrorKind};
 use crate::types::{
-    ColumnStatisticsUpdate, CustomerDataDeletionReport, DataSource, DataSourceKey,
-    DetectorStatusReport, EventMessage, HostNetworkGroup, LabelDb, OutlierInfo, ReportedRunState,
-    SamplingPolicy, TimeSeriesUpdate, UpdateClusterRequest, UserAgent,
+    ColumnStatisticsUpdate, CustomerDataDeletionReport, DataSource, DataSourceKey, DetectionEvent,
+    DetectorStatusReport, HostNetworkGroup, LabelDb, NetworkListItem, OutlierInfo,
+    ReportedRunState, SamplingPolicy, TimeSeriesUpdate, UpdateClusterRequest, UserAgent,
 };
 
 /// A request handler that can handle a request to the server.
@@ -50,11 +50,21 @@ pub trait Handler {
         Err("not supported".to_string())
     }
 
-    async fn get_allowlist(&self, _peer: &str) -> Result<HostNetworkGroup, String> {
+    /// Answers request 32, the allowlist entries in the order to send them.
+    ///
+    /// The session layer's request stream calls this only for an agent that
+    /// advertised protocol `0.50.0` or later. The legacy dispatchers hold no
+    /// handshake version, so their caller checks it; see [`NetworkListItem`].
+    async fn get_allowlist(&self, _peer: &str) -> Result<Vec<NetworkListItem>, String> {
         Err("not supported".to_string())
     }
 
-    async fn get_blocklist(&self, _peer: &str) -> Result<HostNetworkGroup, String> {
+    /// Answers request 33, the blocklist entries in the order to send them.
+    ///
+    /// The session layer's request stream calls this only for an agent that
+    /// advertised protocol `0.50.0` or later. The legacy dispatchers hold no
+    /// handshake version, so their caller checks it; see [`NetworkListItem`].
+    async fn get_blocklist(&self, _peer: &str) -> Result<Vec<NetworkListItem>, String> {
         Err("not supported".to_string())
     }
 
@@ -133,11 +143,17 @@ pub trait Handler {
         Err("not supported".to_string())
     }
 
-    async fn insert_event_labels(
+    /// Handles request 13, the detection events of `model_id` in `round`.
+    ///
+    /// `events` holds every decodable event of the request, in order, as
+    /// decoded: the dispatcher does not call
+    /// [`DetectionEvent::validate`], so an event that fails it reaches this
+    /// method with the others.
+    async fn insert_detection_events(
         &self,
         _model_id: u32,
         _round: u32,
-        _event_labels: &[EventMessage],
+        _events: &[DetectionEvent],
     ) -> Result<(), String> {
         Err("not supported".to_string())
     }
@@ -439,11 +455,11 @@ where
                 let result = handler.insert_data_source(&data_source).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
-            RequestCode::InsertEventLabels => {
-                let (model_id, round, event_labels) =
-                    parse_args::<(u32, u32, Vec<EventMessage>)>(body)?;
+            RequestCode::InsertDetectionEvents => {
+                let (model_id, round, events) =
+                    parse_args::<(u32, u32, Vec<DetectionEvent>)>(body)?;
                 let result = handler
-                    .insert_event_labels(model_id, round, &event_labels)
+                    .insert_detection_events(model_id, round, &events)
                     .await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
@@ -698,11 +714,11 @@ where
                 let result = handler.insert_data_source(&data_source).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
-            RequestCode::InsertEventLabels => {
-                let (model_id, round, event_labels) =
-                    parse_args::<(u32, u32, Vec<EventMessage>)>(body)?;
+            RequestCode::InsertDetectionEvents => {
+                let (model_id, round, events) =
+                    parse_args::<(u32, u32, Vec<DetectionEvent>)>(body)?;
                 let result = handler
-                    .insert_event_labels(model_id, round, &event_labels)
+                    .insert_detection_events(model_id, round, &events)
                     .await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }

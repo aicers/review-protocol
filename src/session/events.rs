@@ -1,4 +1,4 @@
-//! Owned event framing with retained header and frame progress.
+//! Owned detection event framing with retained header and frame progress.
 use oinq::{ApplicationCode, frame::FrameLimit};
 #[cfg(feature = "server")]
 use oinq::{RecvStream, frame::FramedReader};
@@ -17,9 +17,10 @@ fn abort_code() -> ApplicationCode {
     ApplicationCode::new(1).expect("exchange abort code fits 62 bits")
 }
 
-/// A stream-owning incoming event sequence with cancellation-safe progress.
+/// A stream-owning incoming detection event sequence with cancellation-safe
+/// progress.
 #[cfg(feature = "server")]
-pub struct EventReceiver {
+pub struct DetectionEventReceiver {
     raw: Option<RecvStream>,
     reader: Option<FramedReader<RecvStream>>,
     header: [u8; 2],
@@ -28,7 +29,7 @@ pub struct EventReceiver {
 }
 
 #[cfg(feature = "server")]
-impl EventReceiver {
+impl DetectionEventReceiver {
     pub(super) fn new(recv: RecvStream, limit: FrameLimit) -> Self {
         Self {
             raw: Some(recv),
@@ -38,7 +39,8 @@ impl EventReceiver {
             limit,
         }
     }
-    /// Processes this event stream with the existing server event handler.
+    /// Processes this detection event stream with a server detection event
+    /// handler.
     ///
     /// Both header bytes are reserved and ignored. Events and decode-error
     /// callbacks run in stream order. A complete frame with malformed event
@@ -52,39 +54,43 @@ impl EventReceiver {
     ///
     /// # Errors
     /// Returns classified framing, truncation, transport, or budget failures,
-    /// or [`ServerRunError::EventHandler`] if a callback returns an I/O error.
+    /// or [`ServerRunError::DetectionEventHandler`] if a callback returns an I/O
+    /// error.
     pub async fn run<H>(mut self, mut handler: H) -> Result<(), ServerRunError>
     where
-        H: crate::server::EventStreamHandler + Send,
+        H: crate::server::DetectionEventStreamHandler + Send,
     {
         loop {
             match self.read_next().await? {
-                Ok(Some(event)) => handler.handle_event(event).await,
+                Ok(Some(event)) => handler.handle_detection_event(event).await,
                 Ok(None) => {
                     return handler
                         .on_stream_end()
                         .await
-                        .map_err(ServerRunError::EventHandler);
+                        .map_err(ServerRunError::DetectionEventHandler);
                 }
                 Err(SessionError::Malformed { source, .. }) => {
                     handler.on_error(&format!("decoding error: {source}")).await
                 }
                 Err(error) => return Err(error.into()),
             }
-            .map_err(ServerRunError::EventHandler)?;
+            .map_err(ServerRunError::DetectionEventHandler)?;
         }
     }
 
-    /// Reads the next bounded event, retaining partial progress when cancelled.
+    /// Reads the next bounded detection event, retaining partial progress when
+    /// cancelled.
     ///
     /// An event frame that was read completely but cannot be decoded, for example
-    /// an event kind added by a newer agent, returns a `Malformed` or
+    /// a detection model added by a newer agent, returns a `Malformed` or
     /// `LimitExceeded` error and leaves the stream aligned: calling `next` again
-    /// reads the following event, as the legacy `process_event_stream` keeps
-    /// reading after reporting the error. Every other error aborts the stream.
+    /// reads the following event, as the legacy `process_detection_event_stream`
+    /// keeps reading after reporting the error. Every other error aborts the
+    /// stream. A decoded event is returned as is, without
+    /// [`DetectionEvent::validate`](crate::types::DetectionEvent::validate).
     /// # Errors
     /// Returns typed transport, truncation, malformed data, or allocation/payload-limit errors.
-    pub async fn next(&mut self) -> Result<Option<crate::types::EventMessage>, SessionError> {
+    pub async fn next(&mut self) -> Result<Option<crate::types::DetectionEvent>, SessionError> {
         match self.read_next().await {
             Ok(Ok(event)) => Ok(event),
             Ok(Err(undecodable)) => Err(undecodable),
@@ -99,7 +105,7 @@ impl EventReceiver {
     /// that was read completely and recycled, after which the stream is intact.
     async fn read_next(
         &mut self,
-    ) -> Result<Result<Option<crate::types::EventMessage>, SessionError>, SessionError> {
+    ) -> Result<Result<Option<crate::types::DetectionEvent>, SessionError>, SessionError> {
         while self.header_pos < 2 {
             let recv = self.raw.as_mut().ok_or_else(|| {
                 SessionError::frame(oinq::frame::FrameError::Poisoned, OutcomeCertainty::Unknown)
@@ -149,22 +155,23 @@ impl EventReceiver {
     }
 }
 #[cfg(feature = "server")]
-impl Drop for EventReceiver {
+impl Drop for DetectionEventReceiver {
     fn drop(&mut self) {
         self.abort();
     }
 }
 
-/// A stream-owning event sender with explicit prepare/flush resumption.
+/// A stream-owning detection event sender with explicit prepare/flush
+/// resumption.
 #[cfg(feature = "client")]
-pub struct EventSender {
+pub struct DetectionEventSender {
     raw: Option<SendStream>,
     writer: Option<FramedWriter<SendStream>>,
     header_pos: usize,
     limit: FrameLimit,
 }
 #[cfg(feature = "client")]
-impl EventSender {
+impl DetectionEventSender {
     pub(super) fn new(send: SendStream, limit: FrameLimit) -> Self {
         Self {
             raw: Some(send),
@@ -173,10 +180,10 @@ impl EventSender {
             limit,
         }
     }
-    /// Prepares an event after the stream header has been flushed.
+    /// Prepares a detection event after the stream header has been flushed.
     /// # Errors
     /// Returns a pending-header error, encoding error, or payload-limit error.
-    pub fn start(&mut self, event: &crate::types::EventMessage) -> Result<(), SessionError> {
+    pub fn start(&mut self, event: &crate::types::DetectionEvent) -> Result<(), SessionError> {
         self.writer
             .as_mut()
             .ok_or_else(|| {
@@ -248,7 +255,7 @@ impl EventSender {
     }
 }
 #[cfg(feature = "client")]
-impl Drop for EventSender {
+impl Drop for DetectionEventSender {
     fn drop(&mut self) {
         self.abort();
     }
@@ -256,10 +263,11 @@ impl Drop for EventSender {
 
 #[cfg(feature = "client")]
 impl super::AgentHandle {
-    /// Opens an owned event stream; flushes its header before returning it.
+    /// Opens an owned detection event stream; flushes its header before
+    /// returning it.
     /// # Errors
     /// Returns classified transport or deadline errors. Cancelling aborts an opened stream.
-    pub async fn open_event_stream(&self) -> Result<EventSender, SessionError> {
+    pub async fn open_detection_event_stream(&self) -> Result<DetectionEventSender, SessionError> {
         let operation = async {
             let send = self
                 .0
@@ -267,7 +275,7 @@ impl super::AgentHandle {
                 .open_uni()
                 .await
                 .map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent))?;
-            let mut sender = EventSender::new(send, self.0.options.events);
+            let mut sender = DetectionEventSender::new(send, self.0.options.detection_events);
             sender.flush().await?;
             Ok(sender)
         };

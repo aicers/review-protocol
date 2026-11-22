@@ -11,15 +11,33 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use review_protocol::{
-    server::EventStreamHandler,
-    test::TEST_ENV,
-    types::{EventKind, EventMessage},
+    server::DetectionEventStreamHandler,
+    test::{TEST_ENV, detection_events},
+    types::{CryptocurrencyMiningPoolDetail, Detail, DetectionEvent, DetectionModel},
 };
 use tokio::time::timeout;
 
+/// Returns a synthetic detection event, cycling through `detection_events()`.
+fn sample_event(i: usize) -> DetectionEvent {
+    let events = detection_events();
+    events[i % events.len()].clone()
+}
+
+/// Returns a detection event whose detail carries `coin` as its only coin.
+fn large_event(coin: String) -> DetectionEvent {
+    let mut event = sample_event(1);
+    assert_eq!(
+        event.detection_model,
+        DetectionModel::CryptocurrencyMiningPool
+    );
+    event.detail =
+        Detail::CryptocurrencyMiningPool(CryptocurrencyMiningPoolDetail { coins: vec![coin] });
+    event
+}
+
 /// Test handler that collects events and errors
 struct CollectingHandler {
-    events: Arc<Mutex<Vec<EventMessage>>>,
+    events: Arc<Mutex<Vec<DetectionEvent>>>,
     errors: Arc<Mutex<Vec<String>>>,
     max_events: Option<usize>,
 }
@@ -53,8 +71,8 @@ impl CollectingHandler {
 }
 
 #[async_trait::async_trait]
-impl EventStreamHandler for CollectingHandler {
-    async fn handle_event(&mut self, event: EventMessage) -> std::io::Result<()> {
+impl DetectionEventStreamHandler for CollectingHandler {
+    async fn handle_detection_event(&mut self, event: DetectionEvent) -> std::io::Result<()> {
         let mut events = self.events.lock().expect("Failed to lock events");
         events.push(event);
 
@@ -101,11 +119,7 @@ async fn test_single_event_stream() {
 
         // Send test events
         for i in 0..5 {
-            let event = EventMessage {
-                time: jiff::Timestamp::now(),
-                kind: EventKind::HttpThreat,
-                fields: format!("value_{i}").into_bytes(),
-            };
+            let event = sample_event(i);
 
             let serialized =
                 bincode::serde::encode_to_vec(&event, bincode::config::standard()).unwrap();
@@ -120,7 +134,8 @@ async fn test_single_event_stream() {
     });
 
     // Server accepts stream - start after spawning client
-    let server_handle = tokio::spawn(async move { server_conn.accept_event_stream(handler).await });
+    let server_handle =
+        tokio::spawn(async move { server_conn.accept_detection_event_stream(handler).await });
 
     // Wait for completion
     let (server_result, client_result) = tokio::join!(server_handle, client_handle);
@@ -147,7 +162,7 @@ async fn test_multiple_concurrent_streams() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_loop = events.clone();
 
-    // Server accepts multiple streams using accept_uni + handle_event_stream,
+    // Server accepts multiple streams using accept_uni + handle_detection_event_stream,
     // with a Semaphore bounding concurrency at 3.
     let server_conn_for_teardown = server_conn.clone();
     let server_conn_clone = server_conn.clone();
@@ -164,8 +179,10 @@ async fn test_multiple_concurrent_streams() {
                         errors: Arc::new(Mutex::new(Vec::new())),
                         max_events: None,
                     };
-                    let _ = review_protocol::server::Connection::handle_event_stream(recv, handler)
-                        .await;
+                    let _ = review_protocol::server::Connection::handle_detection_event_stream(
+                        recv, handler,
+                    )
+                    .await;
                 });
             }
         })
@@ -185,11 +202,7 @@ async fn test_multiple_concurrent_streams() {
                 send_stream.write_all(&[0, 0]).await.unwrap();
 
                 for i in 0..2 {
-                    let event = EventMessage {
-                        time: jiff::Timestamp::now(),
-                        kind: EventKind::DnsCovertChannel,
-                        fields: format!("stream_{stream_id}_event_{i}").into_bytes(),
-                    };
+                    let event = sample_event(stream_id * 5 + i);
 
                     let serialized =
                         bincode::serde::encode_to_vec(&event, bincode::config::standard()).unwrap();
@@ -246,7 +259,8 @@ async fn test_error_handling_in_streams() {
 
     let server_conn_for_teardown = server_conn.clone();
 
-    let server_handle = tokio::spawn(async move { server_conn.accept_event_stream(handler).await });
+    let server_handle =
+        tokio::spawn(async move { server_conn.accept_detection_event_stream(handler).await });
 
     let client_handle = tokio::spawn(async move {
         let mut send_stream = client_conn.open_uni().await.unwrap();
@@ -254,11 +268,7 @@ async fn test_error_handling_in_streams() {
 
         // Send 3 events (handler should fail on 3rd)
         for i in 0..3 {
-            let event = EventMessage {
-                time: jiff::Timestamp::now(),
-                kind: EventKind::PortScan,
-                fields: format!("event_{i}").into_bytes(),
-            };
+            let event = sample_event(i);
 
             let serialized =
                 bincode::serde::encode_to_vec(&event, bincode::config::standard()).unwrap();
@@ -300,7 +310,8 @@ async fn test_protocol_compatibility() {
     let events_ref = handler.events.clone();
     let server_conn_for_teardown = server_conn.clone();
 
-    let server_handle = tokio::spawn(async move { server_conn.accept_event_stream(handler).await });
+    let server_handle =
+        tokio::spawn(async move { server_conn.accept_detection_event_stream(handler).await });
 
     // Simulate the exact format REview currently uses
     let client_handle = tokio::spawn(async move {
@@ -310,11 +321,7 @@ async fn test_protocol_compatibility() {
         send_stream.write_all(&[0, 0]).await.unwrap();
 
         // REview uses bincode v2 standard config
-        let event = EventMessage {
-            time: jiff::Timestamp::now(),
-            kind: EventKind::BlocklistConn,
-            fields: b"source_ip:192.168.1.100;dest_ip:10.0.0.1;protocol:TCP".to_vec(),
-        };
+        let event = sample_event(0);
 
         let serialized =
             bincode::serde::encode_to_vec(&event, bincode::config::standard()).unwrap();
@@ -333,8 +340,7 @@ async fn test_protocol_compatibility() {
 
     let events = events_ref.lock().unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].kind, EventKind::BlocklistConn);
-    assert_ne!(events[0].fields, [] as [u8; 0]);
+    assert_eq!(events[0], sample_event(0));
 
     test_env.teardown(&server_conn_for_teardown);
 }
@@ -353,7 +359,8 @@ async fn test_stream_with_malformed_data() {
 
     let server_conn_for_teardown = server_conn.clone();
 
-    let server_handle = tokio::spawn(async move { server_conn.accept_event_stream(handler).await });
+    let server_handle =
+        tokio::spawn(async move { server_conn.accept_detection_event_stream(handler).await });
 
     let client_handle = tokio::spawn(async move {
         let mut send_stream = client_conn.open_uni().await.unwrap();
@@ -362,11 +369,7 @@ async fn test_stream_with_malformed_data() {
         send_stream.write_all(&[0, 0]).await.unwrap();
 
         // Send a valid event first
-        let event = EventMessage {
-            time: jiff::Timestamp::now(),
-            kind: EventKind::HttpThreat,
-            fields: b"valid event".to_vec(),
-        };
+        let event = sample_event(1);
         let serialized =
             bincode::serde::encode_to_vec(&event, bincode::config::standard()).unwrap();
         #[allow(clippy::cast_possible_truncation)]
@@ -382,11 +385,7 @@ async fn test_stream_with_malformed_data() {
         send_stream.write_all(&bad_data).await.unwrap();
 
         // Send another valid event after the malformed one
-        let event2 = EventMessage {
-            time: jiff::Timestamp::now(),
-            kind: EventKind::DnsCovertChannel,
-            fields: b"valid event 2".to_vec(),
-        };
+        let event2 = sample_event(2);
         let serialized2 =
             bincode::serde::encode_to_vec(&event2, bincode::config::standard()).unwrap();
         #[allow(clippy::cast_possible_truncation)]
@@ -427,7 +426,8 @@ async fn test_empty_stream() {
 
     let server_conn_for_teardown = server_conn.clone();
 
-    let server_handle = tokio::spawn(async move { server_conn.accept_event_stream(handler).await });
+    let server_handle =
+        tokio::spawn(async move { server_conn.accept_detection_event_stream(handler).await });
 
     let client_handle = tokio::spawn(async move {
         let mut send_stream = client_conn.open_uni().await.unwrap();
@@ -462,7 +462,8 @@ async fn test_large_event_handling() {
 
     let server_conn_for_teardown = server_conn.clone();
 
-    let server_handle = tokio::spawn(async move { server_conn.accept_event_stream(handler).await });
+    let server_handle =
+        tokio::spawn(async move { server_conn.accept_detection_event_stream(handler).await });
 
     let client_handle = tokio::spawn(async move {
         let mut send_stream = client_conn.open_uni().await.unwrap();
@@ -471,12 +472,8 @@ async fn test_large_event_handling() {
         send_stream.write_all(&[0, 0]).await.unwrap();
 
         // Send a large event (1MB of data)
-        let large_data = vec![0x42; 1024 * 1024];
-        let event = EventMessage {
-            time: jiff::Timestamp::now(),
-            kind: EventKind::ExtraThreat,
-            fields: large_data,
-        };
+        let large_data = "B".repeat(1024 * 1024);
+        let event = large_event(large_data);
 
         let serialized =
             bincode::serde::encode_to_vec(&event, bincode::config::standard()).unwrap();
@@ -495,7 +492,10 @@ async fn test_large_event_handling() {
 
     let events = events_ref.lock().unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].fields.len(), 1024 * 1024);
+    let Detail::CryptocurrencyMiningPool(detail) = &events[0].detail else {
+        panic!("unexpected detail: {:?}", events[0].detail);
+    };
+    assert_eq!(detail.coins[0].len(), 1024 * 1024);
 
     test_env.teardown(&server_conn_for_teardown);
 }
@@ -510,8 +510,8 @@ async fn test_concurrent_stream_processing() {
     }
 
     #[async_trait::async_trait]
-    impl EventStreamHandler for CountingHandler {
-        async fn handle_event(&mut self, _event: EventMessage) -> std::io::Result<()> {
+    impl DetectionEventStreamHandler for CountingHandler {
+        async fn handle_detection_event(&mut self, _event: DetectionEvent) -> std::io::Result<()> {
             {
                 let mut count = self
                     .processed_count
@@ -545,8 +545,10 @@ async fn test_concurrent_stream_processing() {
                 tokio::spawn(async move {
                     let _permit = permit;
                     let handler = CountingHandler { processed_count };
-                    let _ = review_protocol::server::Connection::handle_event_stream(recv, handler)
-                        .await;
+                    let _ = review_protocol::server::Connection::handle_detection_event_stream(
+                        recv, handler,
+                    )
+                    .await;
                 });
             }
         })
@@ -564,11 +566,7 @@ async fn test_concurrent_stream_processing() {
                 send_stream.write_all(&[0, 0]).await.unwrap();
 
                 for i in 0..5 {
-                    let event = EventMessage {
-                        time: jiff::Timestamp::now(),
-                        kind: EventKind::DnsCovertChannel,
-                        fields: format!("stream_{stream_id}_event_{i}").into_bytes(),
-                    };
+                    let event = sample_event(stream_id * 5 + i);
 
                     let serialized =
                         bincode::serde::encode_to_vec(&event, bincode::config::standard()).unwrap();

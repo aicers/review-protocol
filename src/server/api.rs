@@ -7,8 +7,8 @@ use crate::legacy_transport::frame;
 use crate::{
     client,
     types::{
-        CloneModelRequest, CustomerDataDeletionRequest, HostNetworkGroup, SamplingPolicy,
-        TrafficFilterRule, TrainModelRequest,
+        CloneModelRequest, CustomerDataDeletionRequest, HostNetworkGroup, NetworkListItem,
+        SamplingPolicy, TrafficFilterRule, TrainModelRequest,
         node::{
             InstallPreflight, NodeEnrollRequest, NodeEnrollResponse, NodeHostnameRequest,
             NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
@@ -81,22 +81,37 @@ const PACKAGE_TRANSFER_ABORTED: u32 = 1;
 ///   [`send_allowlist`](Self::send_allowlist),
 ///   [`send_ping`](Self::send_ping)); continue using them as-is.
 impl Connection {
-    /// Sends the allowlist for network addresses.
+    /// Sends the allowlist entries.
+    ///
+    /// Every item is sent in the order given, without sorting, merging or
+    /// deduplicating; the agent attributes a skipped raw event to the first
+    /// matching entry in that order.
+    ///
+    /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
+    /// decode as a different item list. This connection does not hold the
+    /// handshake version, so the caller checks it; see [`NetworkListItem`].
     ///
     /// # Errors
     ///
     /// Returns an error if serialization failed or communication with the client failed.
-    pub async fn send_allowlist(&self, allowlist: &HostNetworkGroup) -> anyhow::Result<()> {
+    pub async fn send_allowlist(&self, allowlist: &[NetworkListItem]) -> anyhow::Result<()> {
         self.send_request(client::RequestCode::Allowlist, allowlist)
             .await
     }
 
-    /// Sends the blocklist for network addresses.
+    /// Sends the blocklist entries.
+    ///
+    /// Every item is sent in the order given, without sorting, merging or
+    /// deduplicating.
+    ///
+    /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
+    /// decode as a different item list. This connection does not hold the
+    /// handshake version, so the caller checks it; see [`NetworkListItem`].
     ///
     /// # Errors
     ///
     /// Returns an error if serialization failed or communication with the client failed.
-    pub async fn send_blocklist(&self, blocklist: &HostNetworkGroup) -> anyhow::Result<()> {
+    pub async fn send_blocklist(&self, blocklist: &[NetworkListItem]) -> anyhow::Result<()> {
         self.send_request(client::RequestCode::Blocklist, blocklist)
             .await
     }
@@ -1621,8 +1636,8 @@ mod tests {
         crate::{
             test::TEST_ENV,
             types::{
-                CustomerDataDeletionRequest, HostNetworkGroup, Process, ResourceUsage,
-                SamplingKind, SamplingPolicy,
+                CustomerDataDeletionRequest, HostNetworkGroup, NetworkListItem, Process,
+                ResourceUsage, SamplingKind, SamplingPolicy,
             },
         },
         ipnet::IpNet,
@@ -1840,16 +1855,18 @@ mod tests {
             }
         }
 
-        async fn allowlist(&mut self, list: HostNetworkGroup) -> Result<(), String> {
-            if list.hosts == [IP_ADDR_1] {
+        async fn allowlist(&mut self, list: Vec<NetworkListItem>) -> Result<(), String> {
+            if list == crate::test::network_list_items() {
                 Ok(())
             } else {
                 Err("unexpected domain list".to_string())
             }
         }
 
-        async fn blocklist(&mut self, list: HostNetworkGroup) -> Result<(), String> {
-            if list.hosts == [IP_ADDR_1] {
+        async fn blocklist(&mut self, list: Vec<NetworkListItem>) -> Result<(), String> {
+            let mut expected = crate::test::network_list_items();
+            expected.reverse();
+            if list == expected {
                 Ok(())
             } else {
                 Err("unexpected blocklist".to_string())
@@ -1936,11 +1953,7 @@ mod tests {
         let test_env = TEST_ENV.lock().await;
         let (server_conn, client_conn) = test_env.setup().await;
 
-        let allowlist_to_send = HostNetworkGroup {
-            hosts: vec![IP_ADDR_1],
-            networks: vec![],
-            ip_ranges: vec![],
-        };
+        let allowlist_to_send = crate::test::network_list_items();
 
         let mut handler = TestHandler;
         let handler_conn = client_conn.clone();
@@ -1963,11 +1976,8 @@ mod tests {
         let test_env = TEST_ENV.lock().await;
         let (server_conn, client_conn) = test_env.setup().await;
 
-        let blocklist_to_send = HostNetworkGroup {
-            hosts: vec![IP_ADDR_1],
-            networks: vec![],
-            ip_ranges: vec![],
-        };
+        let mut blocklist_to_send = crate::test::network_list_items();
+        blocklist_to_send.reverse();
 
         let mut handler = TestHandler;
         let handler_conn = client_conn.clone();
@@ -2082,7 +2092,7 @@ mod tests {
             run_id: 7,
             model: "http-baseline".to_string(),
             definition: concat!(
-                "event_kind = \"http\"\n",
+                "raw_event_kind = \"http\"\n",
                 "method = \"prefix\"\n",
                 "sources = [\"piglet.node2.example.com\"]\n",
                 "window_start = \"2026-10-14T00:00:00Z\"\n",

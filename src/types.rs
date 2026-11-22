@@ -13,7 +13,16 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 pub use structured::ColumnStatistics;
 
+mod detection;
 pub mod raw_event;
+
+pub use self::detection::{
+    CryptocurrencyMiningPoolDetail, Detail, DetectionEvent, DetectionEventError, DetectionModel,
+    EndpointRole, ExternalDdosDetail, FtpBruteForceDetail, LdapBruteForceDetail, MAX_RELATED_IPS,
+    MultiHostPortScanDetail, PortScanDetail, PrimarySubject, RdpBruteForceDetail, RelatedIp,
+    RepeatedHttpSessionsDetail, Target, ThreatRole, TimeWindow, UnusualDestinationPatternDetail,
+    WatchlistMatchDetail,
+};
 
 /// A request to delete data belonging to a customer from a service.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,7 +87,7 @@ pub struct TrainModelRequest {
     /// key: the name of the model is [`model`](Self::model) only.
     ///
     /// ```toml
-    /// event_kind = "http"                            # required; Giganto event kind (string)
+    /// raw_event_kind = "http"                        # required; Giganto raw event kind (string)
     /// method = "multidimension"                      # required; "multidimension" | "prefix" | "timeseries"
     /// sources = ["piglet.node2.example.com"]         # required; non-empty array of strings, no repeats
     /// window_start = "2026-10-14T00:00:00Z"          # required; RFC 3339 with offset; inclusive
@@ -177,6 +186,34 @@ pub struct DetectorStatusReport {
     pub events: u64,
     /// The state of each of the detector's sources in the last round.
     pub sources: Vec<SourceStatus>,
+    /// The status of each detection model in the last round.
+    pub detection_models: Vec<DetectionModelStatus>,
+    /// The raw events the last round skipped because they matched an
+    /// exclusion-list (allowlist) entry, counted per entry and UTC date.
+    pub excluded: Vec<ExcludedCount>,
+}
+
+/// The status of one detection model in a detector's round.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectionModelStatus {
+    /// The model.
+    pub detection_model: DetectionModel,
+    /// Why the model was skipped in the round; `None` when it ran.
+    pub skipped: Option<String>,
+    /// How many detection events the maximum emitted count cut.
+    pub truncated: u64,
+}
+
+/// The number of raw events skipped on one UTC date because they matched one
+/// exclusion-list (allowlist) entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExcludedCount {
+    /// The id of the matched exclusion-list (allowlist) entry.
+    pub entry: u64,
+    /// The UTC date the skipped raw events fall on.
+    pub day: jiff::civil::Date,
+    /// The number of raw events skipped.
+    pub count: u64,
 }
 
 /// Why a detector does or does not run.
@@ -292,6 +329,52 @@ pub struct HostNetworkGroup {
     pub hosts: Vec<IpAddr>,
     pub networks: Vec<IpNet>,
     pub ip_ranges: Vec<RangeInclusive<IpAddr>>,
+}
+
+/// An entry of the allowlist or the blocklist.
+///
+/// Every list surface delivers every item in the order supplied, without
+/// sorting, merging or deduplicating. A receiver of the allowlist attributes
+/// a skipped raw event to the first matching entry in received order.
+///
+/// Protocol `0.50.0` replaced the `0.49.0` allowlist and blocklist payload, a
+/// bare [`HostNetworkGroup`], with a list of these items, and bincode 2 does
+/// not describe its own layout. The list surfaces refuse a payload that leaves
+/// bytes over, which catches a `0.49.0` group with no explicit hosts, but some
+/// `0.49.0` groups are also complete, valid item lists: for some addresses, a
+/// group holding one IPv4 host decodes as one item with an invented id and
+/// name and an empty group, and the host is lost without an error.
+///
+/// The library's suggested floor, `MIN_PROTOCOL_VERSION_REQ`, still admits
+/// `0.49.0`, so the list surfaces that hold the handshake versions check them:
+///
+/// - The session agent's `get_allowlist` and `get_blocklist`, and the legacy
+///   `client::Connection`'s, refuse locally, sending nothing, unless both the
+///   protocol version the agent advertised and the manager's handshake reply
+///   are `0.50.0` or later.
+/// - A session manager's request stream, in both its runner and its
+///   low-level `next`, answers an allowlist or blocklist pull from an agent
+///   that advertised an earlier version with an error and does not invoke the
+///   handler.
+///
+/// The other surfaces hold no handshake version, and keeping `0.49.0` peers
+/// away from them is the caller's responsibility: the legacy
+/// `server::Connection`'s `send_allowlist` and `send_blocklist`, the legacy
+/// server dispatcher's pull handlers and the legacy agent request
+/// dispatcher's push handlers. A manager admits only agents that advertise
+/// `0.50.0` or later, by passing a `>=0.50.0` requirement to its handshake, or
+/// checks the agent's advertised `protocol_version` (the `AgentInfo` the
+/// handshake returns) before it pushes a list or answers a pull. An agent
+/// advertises the protocol version it speaks, and dispatches pushes only on a
+/// connection whose handshake reply is `0.50.0` or later.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkListItem {
+    /// The entry's id.
+    pub id: u64,
+    /// The entry's name.
+    pub name: String,
+    /// The hosts, networks and ranges the entry covers.
+    pub group: HostNetworkGroup,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -636,61 +719,6 @@ pub struct OutlierInfo {
     pub rank: i64,
     pub distance: f64,
     pub sensor: String,
-}
-
-#[derive(Serialize, Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[allow(clippy::module_name_repetitions)]
-pub enum EventKind {
-    DnsCovertChannel,
-    HttpThreat,
-    RdpBruteForce,
-    RepeatedHttpSessions,
-    ExtraThreat,
-    TorConnection,
-    DomainGenerationAlgorithm,
-    FtpBruteForce,
-    FtpPlainText,
-    PortScan,
-    MultiHostPortScan,
-    NonBrowser,
-    LdapBruteForce,
-    LdapPlainText,
-    ExternalDdos,
-    CryptocurrencyMiningPool,
-    BlocklistConn,
-    BlocklistDns,
-    BlocklistDceRpc,
-    BlocklistFtp,
-    BlocklistHttp,
-    BlocklistKerberos,
-    BlocklistLdap,
-    BlocklistMqtt,
-    BlocklistNfs,
-    BlocklistNtlm,
-    BlocklistRdp,
-    BlocklistSmb,
-    BlocklistSmtp,
-    BlocklistSsh,
-    BlocklistTls,
-    WindowsThreat,
-    NetworkThreat,
-    LockyRansomware,
-    SuspiciousTlsTraffic,
-    BlocklistBootp,
-    BlocklistDhcp,
-    TorConnectionConn,
-    BlocklistRadius,
-    BlocklistMalformedDns,
-    UnusualDestinationPattern,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct EventMessage {
-    #[serde(with = "jiff::fmt::serde::timestamp::nanosecond::required")]
-    pub time: jiff::Timestamp,
-    pub kind: EventKind,
-    #[serde(with = "serde_bytes")]
-    pub fields: Vec<u8>,
 }
 
 /// Types for the `node` agent family, grouping host-control and
@@ -4801,140 +4829,6 @@ mod tests {
     #[cfg(any(feature = "client", feature = "server"))]
     use super::*;
 
-    #[cfg(any(feature = "client", feature = "server"))]
-    #[test]
-    fn event_kind_serialization_round_trip() {
-        // Test that all EventKind variants can be serialized and deserialized
-        let test_cases = vec![
-            EventKind::DnsCovertChannel,
-            EventKind::HttpThreat,
-            EventKind::RdpBruteForce,
-            EventKind::RepeatedHttpSessions,
-            EventKind::ExtraThreat,
-            EventKind::TorConnection,
-            EventKind::DomainGenerationAlgorithm,
-            EventKind::FtpBruteForce,
-            EventKind::FtpPlainText,
-            EventKind::PortScan,
-            EventKind::MultiHostPortScan,
-            EventKind::NonBrowser,
-            EventKind::LdapBruteForce,
-            EventKind::LdapPlainText,
-            EventKind::ExternalDdos,
-            EventKind::CryptocurrencyMiningPool,
-            EventKind::BlocklistConn,
-            EventKind::BlocklistDns,
-            EventKind::BlocklistDceRpc,
-            EventKind::BlocklistFtp,
-            EventKind::BlocklistHttp,
-            EventKind::BlocklistKerberos,
-            EventKind::BlocklistLdap,
-            EventKind::BlocklistMqtt,
-            EventKind::BlocklistNfs,
-            EventKind::BlocklistNtlm,
-            EventKind::BlocklistRdp,
-            EventKind::BlocklistSmb,
-            EventKind::BlocklistSmtp,
-            EventKind::BlocklistSsh,
-            EventKind::BlocklistTls,
-            EventKind::WindowsThreat,
-            EventKind::NetworkThreat,
-            EventKind::LockyRansomware,
-            EventKind::SuspiciousTlsTraffic,
-            EventKind::BlocklistBootp,
-            EventKind::BlocklistDhcp,
-            EventKind::TorConnectionConn,
-            EventKind::BlocklistRadius,
-            EventKind::BlocklistMalformedDns,
-            EventKind::UnusualDestinationPattern,
-        ];
-
-        for kind in test_cases {
-            // Serialize with bincode (used in the protocol)
-            let serialized = bincode::serde::encode_to_vec(
-                kind,
-                bincode::config::standard().with_fixed_int_encoding(),
-            )
-            .expect("serialization should succeed");
-
-            // Deserialize back
-            let (deserialized, _len): (EventKind, usize) = bincode::serde::decode_from_slice(
-                &serialized,
-                bincode::config::standard().with_fixed_int_encoding(),
-            )
-            .expect("deserialization should succeed");
-
-            // Verify round-trip
-            assert_eq!(kind, deserialized, "EventKind {kind:?} failed round-trip");
-        }
-    }
-
-    #[cfg(any(feature = "client", feature = "server"))]
-    #[test]
-    fn event_message_with_blocklist_radius_serialization() {
-        // Test EventMessage with BlocklistRadius variant
-        let event = EventMessage {
-            time: jiff::Timestamp::now(),
-            kind: EventKind::BlocklistRadius,
-            fields: vec![1, 2, 3, 4, 5],
-        };
-
-        // Serialize with bincode (used in the protocol)
-        let serialized = bincode::serde::encode_to_vec(
-            &event,
-            bincode::config::standard().with_fixed_int_encoding(),
-        )
-        .expect("serialization should succeed");
-
-        // Deserialize back
-        let (deserialized, _len): (EventMessage, usize) = bincode::serde::decode_from_slice(
-            &serialized,
-            bincode::config::standard().with_fixed_int_encoding(),
-        )
-        .expect("deserialization should succeed");
-
-        // Verify the kind matches
-        assert_eq!(
-            event.kind, deserialized.kind,
-            "EventKind should match after round-trip"
-        );
-        assert_eq!(
-            event.fields, deserialized.fields,
-            "Fields should match after round-trip"
-        );
-    }
-
-    /// The wire bytes of an `EventMessage`, under the configuration the
-    /// wire uses (`bincode::config::standard()`), are pinned, so that a
-    /// `jiff` upgrade cannot change how `time` is encoded.
-    #[cfg(any(feature = "client", feature = "server"))]
-    #[test]
-    fn event_message_wire_bytes_are_pinned() {
-        const EXPECTED: &[u8] = &[
-            0xfd, 0x00, 0x2c, 0xc9, 0x5b, 0x9a, 0x17, 0x3a, 0x31, 0x01, 0x04, 0xde, 0xad, 0xbe,
-            0xef,
-        ];
-
-        let time = jiff::Timestamp::new(1_773_586_804, 120_000_000)
-            .expect("2026-03-15T15:00:04.12Z is a valid timestamp");
-        let event = EventMessage {
-            time,
-            kind: EventKind::HttpThreat,
-            fields: vec![0xde, 0xad, 0xbe, 0xef],
-        };
-        let bytes = bincode::serde::encode_to_vec(&event, bincode::config::standard())
-            .expect("serialization should succeed");
-        assert_eq!(bytes, EXPECTED, "{bytes:?}");
-
-        let (decoded, read): (EventMessage, usize) =
-            bincode::serde::decode_from_slice(EXPECTED, bincode::config::standard())
-                .expect("deserialization should succeed");
-        assert_eq!(read, EXPECTED.len());
-        assert_eq!(decoded.time, time);
-        assert_eq!(decoded.kind, event.kind);
-        assert_eq!(decoded.fields, event.fields);
-    }
-
     /// Encodes a `TimeCount` under the wire configuration, asserts the
     /// bytes equal `expected`, and decodes `expected` back.
     #[cfg(any(feature = "client", feature = "server"))]
@@ -4980,32 +4874,6 @@ mod tests {
                 0x13, 0x32, 0x30, 0x32, 0x36, 0x2d, 0x30, 0x33, 0x2d, 0x31, 0x35, 0x54, 0x31, 0x35,
                 0x3a, 0x30, 0x30, 0x3a, 0x30, 0x34, 0x2a,
             ],
-        );
-    }
-
-    /// The derived `Debug` text of an `EventMessage`, which a caller
-    /// can log, is pinned with a sub-second and a whole-second `time`.
-    #[test]
-    fn event_message_debug_is_pinned() {
-        use super::{EventKind, EventMessage};
-
-        let event = |time| EventMessage {
-            time,
-            kind: EventKind::HttpThreat,
-            fields: vec![0xde, 0xad, 0xbe, 0xef],
-        };
-        let fractional = jiff::Timestamp::new(1_773_586_804, 120_000_000)
-            .expect("2026-03-15T15:00:04.12Z is a valid timestamp");
-        let whole = jiff::Timestamp::from_second(1_773_586_804)
-            .expect("2026-03-15T15:00:04Z is a valid timestamp");
-
-        assert_eq!(
-            format!("{:?}", event(fractional)),
-            "EventMessage { time: 2026-03-15T15:00:04.12Z, kind: HttpThreat, fields: [222, 173, 190, 239] }"
-        );
-        assert_eq!(
-            format!("{:?}", event(whole)),
-            "EventMessage { time: 2026-03-15T15:00:04Z, kind: HttpThreat, fields: [222, 173, 190, 239] }"
         );
     }
 

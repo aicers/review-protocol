@@ -116,13 +116,27 @@ impl Exchange {
     }
 
     pub(super) async fn receive<T: DeserializeOwned>(&mut self) -> Result<T, SessionError> {
+        self.receive_as(Decoding::Prefix).await
+    }
+
+    async fn receive_as<T: DeserializeOwned>(
+        &mut self,
+        decoding: Decoding,
+    ) -> Result<T, SessionError> {
         let frame = self.frame().await?;
-        let result = super::decode::decode(
-            frame.as_bytes(),
-            &super::decode::Budget::new(self.limit.get()),
-        )
-        .map(|(value, _)| value)
-        .map_err(|e| e.within(self.certainty));
+        let bytes = frame.as_bytes();
+        let result = super::decode::decode(bytes, &super::decode::Budget::new(self.limit.get()))
+            .and_then(|(value, consumed)| {
+                let trailing = bytes.len().saturating_sub(consumed);
+                if decoding == Decoding::Exact && trailing != 0 {
+                    Err(SessionError::malformed(format!(
+                        "{trailing} unexpected trailing bytes after the payload"
+                    )))
+                } else {
+                    Ok(value)
+                }
+            })
+            .map_err(|e| e.within(self.certainty));
         self.recycle(frame)?;
         if result.is_err() {
             self.abort();
@@ -202,11 +216,35 @@ impl Drop for Exchange {
     }
 }
 
+/// How much of a response frame its value must consume.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Decoding {
+    /// The value may be followed by bytes that are ignored.
+    Prefix,
+    /// The value must consume the whole frame. The allowlist and blocklist
+    /// pulls use this, so that a `0.49.0` peer's `HostNetworkGroup` reply,
+    /// which starts with the same zero count as an empty item list when it
+    /// has no explicit hosts, is refused rather than read as an empty list.
+    /// It does not catch every `0.49.0` reply, so the pulls also check the
+    /// handshake versions; see `types::NetworkListItem`.
+    Exact,
+}
+
 pub(super) async fn unary<I: Serialize, O: DeserializeOwned>(
     connection: &Connection,
     options: &SessionOptions,
     code: u32,
     input: I,
+) -> Result<O, SessionError> {
+    unary_as(connection, options, code, input, Decoding::Prefix).await
+}
+
+pub(super) async fn unary_as<I: Serialize, O: DeserializeOwned>(
+    connection: &Connection,
+    options: &SessionOptions,
+    code: u32,
+    input: I,
+    decoding: Decoding,
 ) -> Result<O, SessionError> {
     let mut certainty = OutcomeCertainty::NotSent;
     let operation = async {
@@ -218,7 +256,7 @@ pub(super) async fn unary<I: Serialize, O: DeserializeOwned>(
         exchange.start_request(code, input)?;
         certainty = OutcomeCertainty::Unknown;
         exchange.flush().await?;
-        let response: Result<O, String> = exchange.receive().await?;
+        let response: Result<O, String> = exchange.receive_as(decoding).await?;
         exchange.complete();
         response.map_err(SessionError::RemoteRejection)
     };

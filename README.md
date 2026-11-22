@@ -30,24 +30,27 @@ access, and bounded framing over oinq 0.14.0. Constructors require explicit
 `SessionOptions`; `legacy_compatible()` selects the existing `u32` wire bound,
 and applications can configure separate limits for each message family.
 
-## Unidirectional Event Stream API
+## Unidirectional Detection Event Stream API
 
-The crate provides a high-level API for handling unidirectional event streams,
-encapsulating protocol details behind a clean trait-based interface.
+The crate provides a high-level API for handling unidirectional detection event
+streams, encapsulating protocol details behind a clean trait-based interface.
 
 ### Basic Usage
 
-Implement the `EventStreamHandler` trait to process events:
+Implement the `DetectionEventStreamHandler` trait to process detection events:
 
 ```rust
-use review_protocol::{server::EventStreamHandler, types::EventMessage};
+use review_protocol::{server::DetectionEventStreamHandler, types::DetectionEvent};
 
 struct MyEventHandler;
 
 #[async_trait::async_trait]
-impl EventStreamHandler for MyEventHandler {
-  async fn handle_event(&mut self, event: EventMessage) -> io::Result<()> {
-    println!("Received event: {:?}", event.kind);
+impl DetectionEventStreamHandler for MyEventHandler {
+  async fn handle_detection_event(
+    &mut self,
+    event: DetectionEvent,
+  ) -> io::Result<()> {
+    println!("Received event: {:?}", event.detection_model);
     Ok(())
   }
 }
@@ -56,12 +59,12 @@ impl EventStreamHandler for MyEventHandler {
 Then handle incoming streams. For a single stream:
 
 ```rust
-connection.accept_event_stream(MyEventHandler).await?;
+connection.accept_detection_event_stream(MyEventHandler).await?;
 ```
 
 For multiple concurrent streams, drive `accept_uni` and dispatch each
-stream to `Connection::handle_event_stream` inside a `tokio::spawn`. The
-caller owns the spawn lifetime, concurrency policy, and error handling:
+stream to `Connection::handle_detection_event_stream` inside a `tokio::spawn`.
+The caller owns the spawn lifetime, concurrency policy, and error handling:
 
 ```rust
 use std::sync::Arc;
@@ -73,7 +76,8 @@ while let Ok(recv) = connection.accept_uni().await {
     let handler = MyEventHandler;
     tokio::spawn(async move {
         let _permit = permit;
-        if let Err(e) = Connection::handle_event_stream(recv, handler).await {
+        let result = Connection::handle_detection_event_stream(recv, handler).await;
+        if let Err(e) = result {
             tracing::warn!(error = %e, "event stream ended with error");
         }
     });

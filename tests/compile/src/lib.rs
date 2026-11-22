@@ -114,7 +114,7 @@ pub async fn process_server_stream<H, E>(
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     H: review_protocol::server::Handler + Sync,
-    E: review_protocol::server::EventStreamHandler + Send,
+    E: review_protocol::server::DetectionEventStreamHandler + Send,
 {
     use review_protocol::session::{ServerRequestOutcome, ServerStream};
 
@@ -129,7 +129,7 @@ where
                     .finish()?;
             }
         }
-        ServerStream::Events(stream) => stream.run(events).await?,
+        ServerStream::DetectionEvents(stream) => stream.run(events).await?,
     }
     Ok(())
 }

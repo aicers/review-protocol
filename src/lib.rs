@@ -203,7 +203,7 @@ use std::{collections::BTreeSet, net::SocketAddr};
 
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "server")]
-pub use server::EventStreamHandler;
+pub use server::DetectionEventStreamHandler;
 #[cfg(any(feature = "client", feature = "server"))]
 use thiserror::Error;
 
@@ -228,7 +228,7 @@ use crate::types::{AuditHealth, ManifestFormatRange, ProvisioningFingerprint, St
 ///
 /// The value is maintained by hand, and nothing in this crate can check it
 /// against the deployed fleet.
-pub const PROTOCOL_VERSION: &str = "0.49.0";
+pub const PROTOCOL_VERSION: &str = "0.50.0";
 
 /// The protocol version requirement a manager that intends to route the
 /// `node.package` (code 109) and `node.enroll` (code 110) request families
@@ -243,6 +243,28 @@ pub const PROTOCOL_VERSION: &str = "0.49.0";
 /// this is a value a caller may pass, and a caller that passes its own
 /// requirement is unaffected.
 pub const MIN_PROTOCOL_VERSION_REQ: &str = ">=0.49.0";
+
+/// The protocol requirement of the allowlist and blocklist exchanges, which
+/// carry `types::NetworkListItem` lists from `0.50.0` on.
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) const NETWORK_LIST_ITEMS_REQ: &str = ">=0.50.0";
+
+/// Returns the first of `versions` that is not a protocol version of at least
+/// `0.50.0`, the one that keeps a connection off the allowlist and blocklist
+/// exchanges, or `None` when every one of them speaks the item lists.
+///
+/// A version that does not parse is returned too: nothing shows that it
+/// speaks the item lists, and a `0.49.0` list payload can decode as a
+/// different item list rather than fail.
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) fn network_list_blocker<'a>(
+    versions: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    const FIRST: semver::Version = semver::Version::new(0, 50, 0);
+    versions
+        .into_iter()
+        .find(|version| semver::Version::parse(version).map_or(true, |version| version < FIRST))
+}
 
 /// The error type for a handshake failure.
 #[cfg(any(feature = "client", feature = "server"))]
@@ -1252,17 +1274,20 @@ mod tests {
         assert!(res.is_err());
     }
 
-    /// The two constants sit in the protocol namespace, whose successor to the
-    /// deployed `0.48.0` is `0.49.0`. Gated on the features that pull `semver`
-    /// in.
+    /// The two constants sit in the protocol namespace: the current protocol
+    /// is `0.50.0`, and the suggested floor still admits `0.49.0` and refuses
+    /// the deployed `0.48.0`. Gated on the features that pull `semver` in.
     #[test]
     #[cfg(any(feature = "client", feature = "server"))]
     fn protocol_version_constants() {
         let version = semver::Version::parse(crate::PROTOCOL_VERSION).unwrap();
-        assert_eq!(version, semver::Version::new(0, 49, 0));
+        assert_eq!(crate::PROTOCOL_VERSION, "0.50.0");
+        assert_eq!(version, semver::Version::new(0, 50, 0));
 
         let req = semver::VersionReq::parse(crate::MIN_PROTOCOL_VERSION_REQ).unwrap();
+        assert_eq!(crate::MIN_PROTOCOL_VERSION_REQ, ">=0.49.0");
         assert!(req.matches(&version));
+        assert!(req.matches(&semver::Version::parse("0.49.0").unwrap()));
         assert!(!req.matches(&semver::Version::parse("0.48.0").unwrap()));
     }
 

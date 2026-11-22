@@ -10,8 +10,8 @@ use super::Connection;
 use crate::{
     server,
     types::{
-        DataSource, DataSourceKey, DetectorStatusReport, HostNetworkGroup, ReportedRunState,
-        SamplingPolicy, UserAgent,
+        DataSource, DataSourceKey, DetectorStatusReport, HostNetworkGroup, NetworkListItem,
+        ReportedRunState, SamplingPolicy, UserAgent,
     },
     unary_request,
 };
@@ -106,25 +106,43 @@ impl Connection {
         res.map_err(io::Error::other)
     }
 
-    /// Fetches the list of allowed networks from the server.
+    /// Fetches the allowlist entries from the server, in the order the server
+    /// sent them.
+    ///
+    /// Both the protocol version this connection advertised and the server's
+    /// handshake reply must be `0.50.0` or later: a `0.49.0` payload can decode
+    /// as a different item list (see [`NetworkListItem`]). Otherwise nothing
+    /// is sent.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or the response is invalid.
-    pub async fn get_allowlist(&self) -> io::Result<HostNetworkGroup> {
-        let res: Result<HostNetworkGroup, String> =
-            request(self, server::RequestCode::GetAllowlist, ()).await?;
+    /// Returns an error of kind [`io::ErrorKind::Unsupported`] if either
+    /// handshake version is earlier than `0.50.0`, and an error if the request
+    /// fails or the response is invalid.
+    pub async fn get_allowlist(&self) -> io::Result<Vec<NetworkListItem>> {
+        self.check_network_lists()?;
+        let res: Result<Vec<NetworkListItem>, String> =
+            request_exact(self, server::RequestCode::GetAllowlist, ()).await?;
         res.map_err(io::Error::other)
     }
 
-    /// Fetches the list of blocked networks from the server.
+    /// Fetches the blocklist entries from the server, in the order the server
+    /// sent them.
+    ///
+    /// Both the protocol version this connection advertised and the server's
+    /// handshake reply must be `0.50.0` or later: a `0.49.0` payload can decode
+    /// as a different item list (see [`NetworkListItem`]). Otherwise nothing
+    /// is sent.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or the response is invalid.
-    pub async fn get_blocklist(&self) -> io::Result<HostNetworkGroup> {
-        let res: Result<HostNetworkGroup, String> =
-            request(self, server::RequestCode::GetBlocklist, ()).await?;
+    /// Returns an error of kind [`io::ErrorKind::Unsupported`] if either
+    /// handshake version is earlier than `0.50.0`, and an error if the request
+    /// fails or the response is invalid.
+    pub async fn get_blocklist(&self) -> io::Result<Vec<NetworkListItem>> {
+        self.check_network_lists()?;
+        let res: Result<Vec<NetworkListItem>, String> =
+            request_exact(self, server::RequestCode::GetBlocklist, ()).await?;
         res.map_err(io::Error::other)
     }
 
@@ -375,21 +393,25 @@ impl Connection {
         res.map_err(io::Error::other)
     }
 
-    /// Inserts event labels into the server.
+    /// Sends the detection events `model_id` produced in `round` to the
+    /// server.
+    ///
+    /// The events are sent as given; this does not call
+    /// [`DetectionEvent::validate`](crate::types::DetectionEvent::validate).
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails or the response is invalid.
-    pub async fn insert_event_labels(
+    pub async fn insert_detection_events(
         &self,
         model_id: u32,
         round: u32,
-        event_labels: &[crate::types::EventMessage],
+        events: &[crate::types::DetectionEvent],
     ) -> io::Result<()> {
         let res: Result<(), String> = request(
             self,
-            server::RequestCode::InsertEventLabels,
-            &(model_id, round, event_labels),
+            server::RequestCode::InsertDetectionEvents,
+            &(model_id, round, events),
         )
         .await?;
         res.map_err(io::Error::other)
@@ -478,6 +500,21 @@ where
 {
     let (mut send, mut recv) = conn.open_bi().await?;
     unary_request(&mut send, &mut recv, u32::from(code), input).await
+}
+
+/// Sends a request like [`request`] and rejects a response with bytes left
+/// over after it; see `legacy_transport::decode_exact`.
+async fn request_exact<I, O>(
+    conn: &Connection,
+    code: server::RequestCode,
+    input: I,
+) -> io::Result<O>
+where
+    I: Serialize,
+    O: DeserializeOwned,
+{
+    let (mut send, mut recv) = conn.open_bi().await?;
+    crate::legacy_transport::unary_exact(&mut send, &mut recv, u32::from(code), input).await
 }
 
 #[cfg(all(test, feature = "server"))]
@@ -676,6 +713,8 @@ mod tests {
                 reason: None,
                 events: 0,
                 sources: Vec::new(),
+                detection_models: Vec::new(),
+                excluded: Vec::new(),
             };
             let error = client_conn
                 .report_detector_status(&report)
@@ -717,10 +756,8 @@ mod tests {
     #[tokio::test]
     async fn get_allowlist() {
         run_test(|client_conn| async move {
-            let client_res = client_conn.get_allowlist().await;
-            assert!(client_res.is_ok());
-            let received_allowlist = client_res.unwrap();
-            assert_eq!(received_allowlist.hosts.len(), 1);
+            let received_allowlist = client_conn.get_allowlist().await.unwrap();
+            assert_eq!(received_allowlist, crate::test::network_list_items());
         })
         .await;
     }
@@ -728,12 +765,148 @@ mod tests {
     #[tokio::test]
     async fn get_blocklist() {
         run_test(|client_conn| async move {
-            let client_res = client_conn.get_blocklist().await;
-            assert!(client_res.is_ok());
-            let received_blocklist = client_res.unwrap();
-            assert_eq!(received_blocklist.hosts.len(), 1);
+            let received_blocklist = client_conn.get_blocklist().await.unwrap();
+            let mut expected = crate::test::network_list_items();
+            expected.reverse();
+            assert_eq!(received_blocklist, expected);
         })
         .await;
+    }
+
+    /// A `0.49.0` server's allowlist or blocklist reply, a
+    /// `HostNetworkGroup` with no explicit hosts but other entries, is
+    /// refused rather than read as an empty item list.
+    #[tokio::test]
+    async fn list_pull_rejects_legacy_reply() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        use crate::{
+            legacy_transport::frame,
+            types::{HostNetworkGroup, NetworkListItem},
+        };
+
+        let group = HostNetworkGroup {
+            hosts: Vec::new(),
+            networks: vec!["192.0.2.0/24".parse().unwrap()],
+            ip_ranges: vec![
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))
+                    ..=IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+            ],
+        };
+        let reply =
+            bincode::serde::encode_to_vec(Ok::<_, String>(group), bincode::config::standard())
+                .unwrap();
+        let (prefix, _) = bincode::serde::decode_from_slice::<
+            Result<Vec<NetworkListItem>, String>,
+            _,
+        >(&reply, bincode::config::standard())
+        .expect("a prefix decode reads the legacy reply");
+        assert_eq!(
+            prefix,
+            Ok(Vec::new()),
+            "a prefix decode reads an empty list"
+        );
+
+        let test_env = TEST_ENV.lock().await;
+        for pull_blocklist in [false, true] {
+            let (server_conn, client_conn) = test_env.setup().await;
+            let server_reply = reply.clone();
+            let handler_conn = server_conn.clone();
+            let server_handle = tokio::spawn(async move {
+                let (mut send, mut recv) = handler_conn.as_quinn().accept_bi().await.unwrap();
+                let mut request = Vec::new();
+                frame::recv_raw(&mut recv, &mut request).await.unwrap();
+                frame::send_raw(&mut send, &server_reply).await.unwrap();
+                send.finish().unwrap();
+                let _ = send.stopped().await;
+            });
+
+            let res = if pull_blocklist {
+                client_conn.get_blocklist().await
+            } else {
+                client_conn.get_allowlist().await
+            };
+            assert_eq!(
+                res.expect_err("the legacy reply is refused").kind(),
+                std::io::ErrorKind::InvalidData
+            );
+
+            server_handle.await.unwrap();
+            test_env.teardown(&server_conn);
+        }
+    }
+
+    /// A connection that advertised `0.49.0` refuses its allowlist and
+    /// blocklist pulls before sending them: a server reply in the `0.49.0`
+    /// shape holding one IPv4 host is also a complete item list, which
+    /// full-frame decoding cannot refuse.
+    #[tokio::test]
+    async fn list_pull_refuses_an_agent_advertising_0_49_0() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        use crate::types::{HostNetworkGroup, NetworkListItem};
+
+        let group = HostNetworkGroup {
+            hosts: vec![IpAddr::V4(Ipv4Addr::new(2, b'x', b'y', 0))],
+            networks: Vec::new(),
+            ip_ranges: Vec::new(),
+        };
+        let reply =
+            bincode::serde::encode_to_vec(Ok::<_, String>(group), bincode::config::standard())
+                .unwrap();
+        let misread: Result<Vec<NetworkListItem>, String> =
+            crate::legacy_transport::decode_exact(&reply).unwrap();
+        assert_eq!(
+            misread,
+            Ok(vec![NetworkListItem {
+                id: 0,
+                name: "xy".into(),
+                group: HostNetworkGroup::default(),
+            }]),
+            "the legacy reply decodes in full as a different list"
+        );
+
+        let test_env = TEST_ENV.lock().await;
+        let (server_conn, client_conn, _) =
+            test_env.setup_advertising("0.49.0", |_builder| {}).await;
+        for res in [
+            client_conn.get_allowlist().await,
+            client_conn.get_blocklist().await,
+        ] {
+            let error = res.expect_err("the pull is refused");
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            assert_eq!(
+                error.to_string(),
+                "protocol 0.49.0 is incompatible with >=0.50.0"
+            );
+        }
+
+        // Nothing was sent: the first request the server receives is the
+        // next one.
+        let handler_conn = server_conn.clone();
+        let server_handle = tokio::spawn(async move {
+            let (mut send, mut recv) = handler_conn.as_quinn().accept_bi().await.unwrap();
+            let mut request = Vec::new();
+            crate::legacy_transport::frame::recv_raw(&mut recv, &mut request)
+                .await
+                .unwrap();
+            let reply =
+                bincode::serde::encode_to_vec(Ok::<_, String>("cfg"), bincode::config::standard())
+                    .unwrap();
+            crate::legacy_transport::frame::send_raw(&mut send, &reply)
+                .await
+                .unwrap();
+            send.finish().unwrap();
+            let _ = send.stopped().await;
+            request
+        });
+        assert_eq!(client_conn.get_config().await.unwrap(), "cfg");
+        let request = server_handle.await.unwrap();
+        assert_eq!(
+            request.first_chunk::<4>().copied().map(u32::from_le_bytes),
+            Some(u32::from(crate::server::RequestCode::GetConfig))
+        );
+        test_env.teardown(&server_conn);
     }
 
     #[tokio::test]
@@ -947,17 +1120,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_event_labels() {
+    async fn insert_detection_events() {
         run_test(|client_conn| async move {
-            let data = vec![crate::types::EventMessage {
-                time: jiff::Timestamp::now(),
-                kind: crate::types::EventKind::ExtraThreat,
-                fields: vec![0x01, 0x02],
-            }];
-            let client_res = client_conn.insert_event_labels(1, 100, &data).await;
-            assert!(client_res.is_ok());
+            use crate::test::{DETECTION_EVENTS_MODEL_ID, DETECTION_EVENTS_ROUND};
+
+            // The handler accepts only this model ID, round and batch, whole
+            // and in order, including the event that fails `validate`.
+            let events = crate::test::detection_events();
+            assert!(
+                events[crate::test::INVALID_DETECTION_EVENT]
+                    .validate()
+                    .is_err()
+            );
+            client_conn
+                .insert_detection_events(DETECTION_EVENTS_MODEL_ID, DETECTION_EVENTS_ROUND, &events)
+                .await
+                .unwrap();
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn insert_detection_events_checks_every_argument() {
+        use crate::test::{DETECTION_EVENTS_MODEL_ID, DETECTION_EVENTS_ROUND};
+
+        // The handler refuses a request that changes any one argument, so a
+        // swapped, dropped, truncated or reordered argument cannot pass.
+        let events = crate::test::detection_events();
+        let mut truncated = events.clone();
+        truncated.pop();
+        let mut reordered = events.clone();
+        reordered.swap(0, 1);
+        let cases = [
+            (DETECTION_EVENTS_ROUND, DETECTION_EVENTS_MODEL_ID, events),
+            (
+                DETECTION_EVENTS_MODEL_ID,
+                DETECTION_EVENTS_ROUND,
+                Vec::new(),
+            ),
+            (DETECTION_EVENTS_MODEL_ID, DETECTION_EVENTS_ROUND, truncated),
+            (DETECTION_EVENTS_MODEL_ID, DETECTION_EVENTS_ROUND, reordered),
+        ];
+        for (model_id, round, events) in cases {
+            run_test(|client_conn| async move {
+                let error = client_conn
+                    .insert_detection_events(model_id, round, &events)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with("unexpected detection event request"),
+                    "{error}"
+                );
+            })
+            .await;
+        }
     }
 
     #[tokio::test]
