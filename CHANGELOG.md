@@ -5,6 +5,19 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.1](https://github.com/aicers/review-protocol/compare/0.27.0...0.27.1) - 2026-11-22
+
+### Added
+
+- *(types)* add raw event kind and body schema types ([#346](https://github.com/aicers/review-protocol/pull/346))
+- *(server)* add owned server request and event runners ([#334](https://github.com/aicers/review-protocol/pull/334))
+
+### Other
+
+- update shared instruction blocks to 0.6.4 ([#345](https://github.com/aicers/review-protocol/pull/345))
+- update shared instruction blocks to 0.6.3 ([#341](https://github.com/aicers/review-protocol/pull/341))
+- automate releases with release-plz ([#337](https://github.com/aicers/review-protocol/pull/337))
+
 ## [0.27.0] - 2026-11-18
 
 ### Added
