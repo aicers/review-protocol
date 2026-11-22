@@ -3,10 +3,16 @@
 //! Each struct copies, field for field, the ingest struct of the same kind
 //! in giganto-client (`giganto_client::ingest::{network, sysmon, netflow}`)
 //! at tag `0.29.2`.
+//!
+//! `Debug` is derived on every struct except [`Http`], [`Ftp`] and
+//! [`Radius`], whose credential fields are printed as `<redacted>`.
 
-use std::net::IpAddr;
+use std::{fmt, net::IpAddr};
 
 use serde::{Deserialize, Serialize};
+
+/// What a hand-written `Debug` prints in place of a credential field.
+const REDACTED: &str = "<redacted>";
 
 /// The `Conn` raw event body, copying giganto-client's `ingest::network::Conn`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,7 +93,7 @@ pub struct MalformedDns {
 }
 
 /// The `Http` raw event body, copying giganto-client's `ingest::network::Http`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Http {
     pub orig_addr: IpAddr,
     pub orig_port: u16,
@@ -120,6 +126,82 @@ pub struct Http {
     pub mime_types: Vec<String>,
     pub body: Vec<u8>,
     pub state: String,
+}
+
+/// `password` and `cookie` carry credentials captured from the
+/// session, so they are redacted rather than derived; every other
+/// field is printed as a derived `Debug` would print it.
+impl fmt::Debug for Http {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured so that a field added to the struct fails to
+        // compile here until it is printed or redacted.
+        let Self {
+            orig_addr,
+            orig_port,
+            resp_addr,
+            resp_port,
+            proto,
+            start_time,
+            duration,
+            orig_pkts,
+            resp_pkts,
+            orig_l2_bytes,
+            resp_l2_bytes,
+            method,
+            host,
+            uri,
+            referer,
+            version,
+            user_agent,
+            request_len,
+            response_len,
+            status_code,
+            status_msg,
+            username,
+            password: _,
+            cookie: _,
+            content_encoding,
+            content_type,
+            cache_control,
+            filenames,
+            mime_types,
+            body,
+            state,
+        } = self;
+        f.debug_struct("Http")
+            .field("orig_addr", orig_addr)
+            .field("orig_port", orig_port)
+            .field("resp_addr", resp_addr)
+            .field("resp_port", resp_port)
+            .field("proto", proto)
+            .field("start_time", start_time)
+            .field("duration", duration)
+            .field("orig_pkts", orig_pkts)
+            .field("resp_pkts", resp_pkts)
+            .field("orig_l2_bytes", orig_l2_bytes)
+            .field("resp_l2_bytes", resp_l2_bytes)
+            .field("method", method)
+            .field("host", host)
+            .field("uri", uri)
+            .field("referer", referer)
+            .field("version", version)
+            .field("user_agent", user_agent)
+            .field("request_len", request_len)
+            .field("response_len", response_len)
+            .field("status_code", status_code)
+            .field("status_msg", status_msg)
+            .field("username", username)
+            .field("password", &REDACTED)
+            .field("cookie", &REDACTED)
+            .field("content_encoding", content_encoding)
+            .field("content_type", content_type)
+            .field("cache_control", cache_control)
+            .field("filenames", filenames)
+            .field("mime_types", mime_types)
+            .field("body", body)
+            .field("state", state)
+            .finish()
+    }
 }
 
 /// The `Rdp` raw event body, copying giganto-client's `ingest::network::Rdp`.
@@ -270,7 +352,7 @@ pub struct DceRpcContext {
 }
 
 /// The `Ftp` raw event body, copying giganto-client's `ingest::network::Ftp`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ftp {
     pub orig_addr: IpAddr,
     pub orig_port: u16,
@@ -286,6 +368,48 @@ pub struct Ftp {
     pub user: String,
     pub password: String,
     pub commands: Vec<FtpCommand>,
+}
+
+/// `password` carries the credential captured from the session, so
+/// it is redacted rather than derived; every other
+/// field is printed as a derived `Debug` would print it.
+impl fmt::Debug for Ftp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured so that a field added to the struct fails to
+        // compile here until it is printed or redacted.
+        let Self {
+            orig_addr,
+            orig_port,
+            resp_addr,
+            resp_port,
+            proto,
+            start_time,
+            duration,
+            orig_pkts,
+            resp_pkts,
+            orig_l2_bytes,
+            resp_l2_bytes,
+            user,
+            password: _,
+            commands,
+        } = self;
+        f.debug_struct("Ftp")
+            .field("orig_addr", orig_addr)
+            .field("orig_port", orig_port)
+            .field("resp_addr", resp_addr)
+            .field("resp_port", resp_port)
+            .field("proto", proto)
+            .field("start_time", start_time)
+            .field("duration", duration)
+            .field("orig_pkts", orig_pkts)
+            .field("resp_pkts", resp_pkts)
+            .field("orig_l2_bytes", orig_l2_bytes)
+            .field("resp_l2_bytes", resp_l2_bytes)
+            .field("user", user)
+            .field("password", &REDACTED)
+            .field("commands", commands)
+            .finish()
+    }
 }
 
 /// A nested record of a raw event body, copying giganto-client's `ingest::network::FtpCommand`.
@@ -493,7 +617,7 @@ pub struct Dhcp {
 }
 
 /// The `Radius` raw event body, copying giganto-client's `ingest::network::Radius`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Radius {
     pub orig_addr: IpAddr,
     pub orig_port: u16,
@@ -520,6 +644,70 @@ pub struct Radius {
     pub nas_id: Vec<u8>,
     pub nas_port_type: u32,
     pub message: String,
+}
+
+/// `user_passwd` and `chap_passwd` carry credentials captured
+/// from the session, so they are redacted rather than derived; every other
+/// field is printed as a derived `Debug` would print it.
+impl fmt::Debug for Radius {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured so that a field added to the struct fails to
+        // compile here until it is printed or redacted.
+        let Self {
+            orig_addr,
+            orig_port,
+            resp_addr,
+            resp_port,
+            proto,
+            start_time,
+            duration,
+            orig_pkts,
+            resp_pkts,
+            orig_l2_bytes,
+            resp_l2_bytes,
+            id,
+            code,
+            resp_code,
+            auth,
+            resp_auth,
+            user_name,
+            user_passwd: _,
+            chap_passwd: _,
+            nas_ip,
+            nas_port,
+            state,
+            nas_id,
+            nas_port_type,
+            message,
+        } = self;
+        f.debug_struct("Radius")
+            .field("orig_addr", orig_addr)
+            .field("orig_port", orig_port)
+            .field("resp_addr", resp_addr)
+            .field("resp_port", resp_port)
+            .field("proto", proto)
+            .field("start_time", start_time)
+            .field("duration", duration)
+            .field("orig_pkts", orig_pkts)
+            .field("resp_pkts", resp_pkts)
+            .field("orig_l2_bytes", orig_l2_bytes)
+            .field("resp_l2_bytes", resp_l2_bytes)
+            .field("id", id)
+            .field("code", code)
+            .field("resp_code", resp_code)
+            .field("auth", auth)
+            .field("resp_auth", resp_auth)
+            .field("user_name", user_name)
+            .field("user_passwd", &REDACTED)
+            .field("chap_passwd", &REDACTED)
+            .field("nas_ip", nas_ip)
+            .field("nas_port", nas_port)
+            .field("state", state)
+            .field("nas_id", nas_id)
+            .field("nas_port_type", nas_port_type)
+            .field("message", message)
+            .finish()
+    }
 }
 
 /// The `Icmp` raw event body, copying giganto-client's `ingest::network::Icmp`.
@@ -807,7 +995,16 @@ pub struct Netflow9 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::RawEventKind;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use super::super::{RawEventBody, RawEventKind};
+    use super::*;
+
+    const HTTP_PASSWORD: &str = "http-password-secret";
+    const HTTP_COOKIE: &str = "session=http-cookie-secret";
+    const FTP_PASSWORD: &str = "ftp-password-secret";
+    const RADIUS_USER_PASSWD: &[u8] = b"radius-user-passwd-secret";
+    const RADIUS_CHAP_PASSWD: &[u8] = b"radius-chap-passwd-secret";
 
     /// The kinds and numbers the schema commits to.
     const TABLE: [(RawEventKind, u32); 36] = [
@@ -914,60 +1111,6 @@ mod tests {
             );
         }
     }
-}
-
-#[cfg(all(test, any(feature = "client", feature = "server")))]
-mod bincode_tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-    use serde::{Serialize, de::DeserializeOwned};
-
-    use super::super::{RawEventBody, RawEventKind};
-    use super::*;
-
-    fn encode<T: Serialize>(value: &T) -> Vec<u8> {
-        bincode::serde::encode_to_vec(value, bincode::config::standard())
-            .expect("serialization should succeed")
-    }
-
-    fn decode<T: DeserializeOwned>(bytes: &[u8]) -> T {
-        let (value, len): (T, usize) =
-            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-                .expect("deserialization should succeed");
-        assert_eq!(len, bytes.len());
-        value
-    }
-
-    fn all_kinds() -> Vec<RawEventKind> {
-        (0..=u32::from(u16::MAX))
-            .filter_map(|n| RawEventKind::try_from(n).ok())
-            .collect()
-    }
-
-    #[test]
-    fn kind_serializes_as_number_in_bincode() {
-        let kinds = all_kinds();
-        assert_eq!(kinds.len(), 36);
-        for kind in kinds {
-            let bytes = encode(&kind);
-            assert_eq!(bytes, encode(&u32::from(kind)), "{kind:?}");
-            assert_eq!(decode::<RawEventKind>(&bytes), kind);
-        }
-        assert_eq!(
-            encode(&RawEventKind::ProcessCreate),
-            encode(&31_u32),
-            "a kind must not encode as its declaration index"
-        );
-        assert!(
-            bincode::serde::decode_from_slice::<RawEventKind, _>(
-                &encode(&2_u32),
-                bincode::config::standard(),
-            )
-            .is_err(),
-            "2 is not a review-protocol kind"
-        );
-    }
-
     fn v4(last: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(192, 0, 2, last))
     }
@@ -985,7 +1128,7 @@ mod bincode_tests {
     }
 
     #[allow(clippy::too_many_lines)] // One synthetic body per kind.
-    fn bodies() -> Vec<RawEventBody> {
+    pub(super) fn bodies() -> Vec<RawEventBody> {
         vec![
             RawEventBody::Conn(Conn {
                 orig_addr: v4(1),
@@ -1052,8 +1195,8 @@ mod bincode_tests {
                 status_code: 302,
                 status_msg: s("Found"),
                 username: s("user"),
-                password: s("pass"),
-                cookie: s("a=b"),
+                password: s(HTTP_PASSWORD),
+                cookie: s(HTTP_COOKIE),
                 content_encoding: s("gzip"),
                 content_type: s("text/html"),
                 cache_control: s("no-cache"),
@@ -1213,7 +1356,7 @@ mod bincode_tests {
                 orig_l2_bytes: 45,
                 resp_l2_bytes: 46,
                 user: s("anonymous"),
-                password: s("guest"),
+                password: s(FTP_PASSWORD),
                 commands: vec![
                     FtpCommand {
                         command: s("RETR"),
@@ -1427,8 +1570,8 @@ mod bincode_tests {
                 auth: s("auth"),
                 resp_auth: s("resp-auth"),
                 user_name: vec![b'u'],
-                user_passwd: vec![b'p'],
-                chap_passwd: vec![b'c'],
+                user_passwd: RADIUS_USER_PASSWD.to_vec(),
+                chap_passwd: RADIUS_CHAP_PASSWD.to_vec(),
                 nas_ip: v4(55),
                 nas_port: 106,
                 state: vec![1],
@@ -1694,6 +1837,82 @@ mod bincode_tests {
                 contents: s("contents"),
             }),
         ]
+    }
+
+    #[test]
+    fn debug_redacts_credentials() {
+        let secrets = [
+            format!("{HTTP_PASSWORD:?}"),
+            format!("{HTTP_COOKIE:?}"),
+            format!("{FTP_PASSWORD:?}"),
+            format!("{:?}", RADIUS_USER_PASSWD.to_vec()),
+            format!("{:?}", RADIUS_CHAP_PASSWD.to_vec()),
+        ];
+        for body in bodies() {
+            let rendered = format!("{body:?}");
+            for secret in &secrets {
+                assert!(!rendered.contains(secret.as_str()), "{rendered}");
+            }
+            let (has_credentials, kept) = match &body {
+                RawEventBody::Http(_) => (true, r#"username: "user""#),
+                RawEventBody::Ftp(_) => (true, r#"user: "anonymous""#),
+                RawEventBody::Radius(_) => (true, "user_name: [117]"),
+                _ => (false, ""),
+            };
+            assert_eq!(rendered.contains(REDACTED), has_credentials, "{rendered}");
+            assert!(rendered.contains(kept), "{rendered}");
+        }
+    }
+}
+
+#[cfg(all(test, any(feature = "client", feature = "server")))]
+mod bincode_tests {
+    use serde::{Serialize, de::DeserializeOwned};
+
+    use super::super::{RawEventBody, RawEventKind};
+    use super::tests::bodies;
+
+    fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+        bincode::serde::encode_to_vec(value, bincode::config::standard())
+            .expect("serialization should succeed")
+    }
+
+    fn decode<T: DeserializeOwned>(bytes: &[u8]) -> T {
+        let (value, len): (T, usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .expect("deserialization should succeed");
+        assert_eq!(len, bytes.len());
+        value
+    }
+
+    fn all_kinds() -> Vec<RawEventKind> {
+        (0..=u32::from(u16::MAX))
+            .filter_map(|n| RawEventKind::try_from(n).ok())
+            .collect()
+    }
+
+    #[test]
+    fn kind_serializes_as_number_in_bincode() {
+        let kinds = all_kinds();
+        assert_eq!(kinds.len(), 36);
+        for kind in kinds {
+            let bytes = encode(&kind);
+            assert_eq!(bytes, encode(&u32::from(kind)), "{kind:?}");
+            assert_eq!(decode::<RawEventKind>(&bytes), kind);
+        }
+        assert_eq!(
+            encode(&RawEventKind::ProcessCreate),
+            encode(&31_u32),
+            "a kind must not encode as its declaration index"
+        );
+        assert!(
+            bincode::serde::decode_from_slice::<RawEventKind, _>(
+                &encode(&2_u32),
+                bincode::config::standard(),
+            )
+            .is_err(),
+            "2 is not a review-protocol kind"
+        );
     }
 
     /// Returns the kind a body belongs to. The match has no wildcard, so a
