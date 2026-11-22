@@ -5,8 +5,9 @@
 //! at tag `0.29.2`.
 //!
 //! `Debug` is derived on every struct except [`Http`], [`Ftp`], [`Ldap`],
-//! [`Radius`], [`ProcessCreate`] and [`FileCreateStreamHash`], whose
-//! fields that can carry credentials are printed as `<redacted>`.
+//! [`Dhcp`], [`Radius`], [`ProcessCreate`], [`RegistryValueSet`] and
+//! [`FileCreateStreamHash`], whose fields that can carry credentials are
+//! printed as `<redacted>`.
 
 use std::{fmt, net::IpAddr};
 
@@ -636,7 +637,7 @@ pub struct Bootp {
 }
 
 /// The `Dhcp` raw event body, copying giganto-client's `ingest::network::Dhcp`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dhcp {
     pub orig_addr: IpAddr,
     pub orig_port: u16,
@@ -668,6 +669,81 @@ pub struct Dhcp {
     pub client_id_type: u8,
     pub client_id: Vec<u8>,
     pub options: Vec<(u8, Vec<u8>)>,
+}
+
+/// `options` keeps the raw payload of every option the sensor did not
+/// decode, including the authentication option (90), whose payload can be
+/// a plaintext shared token, so it is redacted rather than derived; every
+/// other field is printed as a derived `Debug` would print it.
+impl fmt::Debug for Dhcp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured so that a field added to the struct fails to
+        // compile here until it is printed or redacted.
+        let Self {
+            orig_addr,
+            orig_port,
+            resp_addr,
+            resp_port,
+            proto,
+            start_time,
+            duration,
+            orig_pkts,
+            resp_pkts,
+            orig_l2_bytes,
+            resp_l2_bytes,
+            msg_type,
+            ciaddr,
+            yiaddr,
+            siaddr,
+            giaddr,
+            subnet_mask,
+            router,
+            domain_name_server,
+            req_ip_addr,
+            lease_time,
+            server_id,
+            param_req_list,
+            message,
+            renewal_time,
+            rebinding_time,
+            class_id,
+            client_id_type,
+            client_id,
+            options: _,
+        } = self;
+        f.debug_struct("Dhcp")
+            .field("orig_addr", orig_addr)
+            .field("orig_port", orig_port)
+            .field("resp_addr", resp_addr)
+            .field("resp_port", resp_port)
+            .field("proto", proto)
+            .field("start_time", start_time)
+            .field("duration", duration)
+            .field("orig_pkts", orig_pkts)
+            .field("resp_pkts", resp_pkts)
+            .field("orig_l2_bytes", orig_l2_bytes)
+            .field("resp_l2_bytes", resp_l2_bytes)
+            .field("msg_type", msg_type)
+            .field("ciaddr", ciaddr)
+            .field("yiaddr", yiaddr)
+            .field("siaddr", siaddr)
+            .field("giaddr", giaddr)
+            .field("subnet_mask", subnet_mask)
+            .field("router", router)
+            .field("domain_name_server", domain_name_server)
+            .field("req_ip_addr", req_ip_addr)
+            .field("lease_time", lease_time)
+            .field("server_id", server_id)
+            .field("param_req_list", param_req_list)
+            .field("message", message)
+            .field("renewal_time", renewal_time)
+            .field("rebinding_time", rebinding_time)
+            .field("class_id", class_id)
+            .field("client_id_type", client_id_type)
+            .field("client_id", client_id)
+            .field("options", &REDACTED)
+            .finish()
+    }
 }
 
 /// The `Radius` raw event body, copying giganto-client's `ingest::network::Radius`.
@@ -957,7 +1033,7 @@ pub struct FileCreate {
 }
 
 /// The `RegistryValueSet` raw event body, copying giganto-client's `ingest::sysmon::RegistryValueSet`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistryValueSet {
     pub agent_name: String,
     pub agent_id: String,
@@ -968,6 +1044,39 @@ pub struct RegistryValueSet {
     pub target_object: String,
     pub details: String,
     pub user: String,
+}
+
+/// `details` holds the data written to the registry value, such as the
+/// plaintext `DefaultPassword` used for automatic logon, so it is redacted
+/// rather than derived; every other field is printed as a derived `Debug`
+/// would print it.
+impl fmt::Debug for RegistryValueSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured so that a field added to the struct fails to
+        // compile here until it is printed or redacted.
+        let Self {
+            agent_name,
+            agent_id,
+            event_type,
+            process_guid,
+            process_id,
+            image,
+            target_object,
+            details: _,
+            user,
+        } = self;
+        f.debug_struct("RegistryValueSet")
+            .field("agent_name", agent_name)
+            .field("agent_id", agent_id)
+            .field("event_type", event_type)
+            .field("process_guid", process_guid)
+            .field("process_id", process_id)
+            .field("image", image)
+            .field("target_object", target_object)
+            .field("details", &REDACTED)
+            .field("user", user)
+            .finish()
+    }
 }
 
 /// The `RegistryKeyRename` raw event body, copying giganto-client's `ingest::sysmon::RegistryKeyValueRename`.
@@ -1162,6 +1271,8 @@ mod tests {
     const RADIUS_CHAP_PASSWD: &[u8] = b"radius-chap-passwd-secret";
     const PROCESS_COMMAND_LINE: &str = "az login --password process-command-line-secret";
     const PARENT_COMMAND_LINE: &str = "cmd.exe /c login --token parent-command-line-secret";
+    const DHCP_AUTH_TOKEN: &[u8] = b"dhcp-auth-token-secret";
+    const REGISTRY_DETAILS: &str = "registry-default-password-secret";
     const STREAM_CONTENTS: &str =
         "[ZoneTransfer]\r\nHostUrl=https://example.net/a.zip?sig=stream-contents-secret";
 
@@ -1709,7 +1820,11 @@ mod tests {
                 class_id: vec![9, 8],
                 client_id_type: 1,
                 client_id: vec![7, 6, 5],
-                options: vec![(53, vec![5]), (61, vec![1, 2, 3])],
+                options: vec![
+                    (53, vec![5]),
+                    (61, vec![1, 2, 3]),
+                    (90, DHCP_AUTH_TOKEN.to_vec()),
+                ],
             }),
             RawEventBody::Radius(Radius {
                 orig_addr: v4(53),
@@ -1879,8 +1994,10 @@ mod tests {
                 process_guid: s("guid"),
                 process_id: 1009,
                 image: s("C:\\g.exe"),
-                target_object: s("HKLM\\Key"),
-                details: s("DWORD 1"),
+                target_object: s(
+                    "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\DefaultPassword",
+                ),
+                details: s(REGISTRY_DETAILS),
                 user: s("user"),
             }),
             RawEventBody::RegistryKeyRename(RegistryKeyRename {
@@ -2008,6 +2125,8 @@ mod tests {
             format!("{:?}", HTTP_BODY.to_vec()),
             format!("{FTP_PASSWORD:?}"),
             format!("{LDAP_ARGUMENT:?}"),
+            format!("{:?}", DHCP_AUTH_TOKEN.to_vec()),
+            format!("{REGISTRY_DETAILS:?}"),
             format!("{:?}", RADIUS_USER_PASSWD.to_vec()),
             format!("{:?}", RADIUS_CHAP_PASSWD.to_vec()),
             format!("{PROCESS_COMMAND_LINE:?}"),
@@ -2023,8 +2142,10 @@ mod tests {
                 RawEventBody::Http(_) => (true, r#"username: "user""#),
                 RawEventBody::Ftp(_) => (true, r#"user: "anonymous""#),
                 RawEventBody::Ldap(_) => (true, r#"object: ["cn=admin-1", "cn=admin-2"]"#),
+                RawEventBody::Dhcp(_) => (true, "client_id: [7, 6, 5]"),
                 RawEventBody::Radius(_) => (true, "user_name: [117]"),
                 RawEventBody::ProcessCreate(_) => (true, r#"parent_image: "C:\\parent.exe""#),
+                RawEventBody::RegistryValueSet(_) => (true, r#"event_type: "SetValue""#),
                 RawEventBody::FileCreateStreamHash(_) => {
                     (true, r#"target_filename: "C:\\i.txt:Zone.Identifier""#)
                 }
