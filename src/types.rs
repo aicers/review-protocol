@@ -336,6 +336,29 @@ pub struct HostNetworkGroup {
 /// Every list surface delivers every item in the order supplied, without
 /// sorting, merging or deduplicating. A receiver of the allowlist attributes
 /// a skipped raw event to the first matching entry in received order.
+///
+/// Protocol `0.50.0` replaced the `0.49.0` allowlist and blocklist payload, a
+/// bare [`HostNetworkGroup`], with a list of these items, and bincode 2 does
+/// not describe its own layout. The list surfaces refuse a payload that leaves
+/// bytes over, which catches a `0.49.0` group with no explicit hosts, but some
+/// `0.49.0` groups are also complete, valid item lists: for some addresses, a
+/// group holding one IPv4 host decodes as one item with an invented id and
+/// name and an empty group, and the host is lost without an error.
+///
+/// No list operation checks the peer's protocol version, and the library's
+/// suggested floor, `MIN_PROTOCOL_VERSION_REQ`, still admits `0.49.0`. Keeping
+/// `0.49.0` peers away from these lists is the caller's responsibility:
+///
+/// - A manager admits only agents that advertise `0.50.0` or later, by passing
+///   a `>=0.50.0` requirement to its handshake, or by checking the agent's
+///   advertised `protocol_version` (the `AgentInfo` the handshake returns, or
+///   `session::HandshakeMetadata::Agent`) before it pushes a list or answers
+///   a pull.
+/// - An agent advertises the protocol version it speaks. A `0.49.0` manager
+///   that passes its own protocol version as the handshake's ceiling rejects
+///   an agent advertising `0.50.0`; an agent built on these types that
+///   advertises `0.49.0`, or a manager whose ceiling overstates what it
+///   speaks, has no such protection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkListItem {
     /// The entry's id.

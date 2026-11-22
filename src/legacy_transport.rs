@@ -28,7 +28,9 @@ pub(crate) async fn unary<I: serde::Serialize, O: serde::de::DeserializeOwned>(
 /// decoding above: a `0.49.0` peer's `HostNetworkGroup` with no explicit hosts
 /// starts with the same zero count as an empty `Vec<NetworkListItem>`, and
 /// prefix decoding would read it as an empty list and silently clear a
-/// populated one.
+/// populated one. Some other `0.49.0` groups are complete item lists and still
+/// decode; only the caller's version check excludes them (see
+/// `types::NetworkListItem`).
 #[cfg(feature = "client")]
 pub(crate) fn decode_exact<'de, T: serde::Deserialize<'de>>(
     bytes: &'de [u8],

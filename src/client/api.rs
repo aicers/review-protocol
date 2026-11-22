@@ -109,6 +109,10 @@ impl Connection {
     /// Fetches the allowlist entries from the server, in the order the server
     /// sent them.
     ///
+    /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
+    /// decode as a different item list. See [`NetworkListItem`] for the
+    /// caller's version check.
+    ///
     /// # Errors
     ///
     /// Returns an error if the request fails or the response is invalid.
@@ -120,6 +124,10 @@ impl Connection {
 
     /// Fetches the blocklist entries from the server, in the order the server
     /// sent them.
+    ///
+    /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
+    /// decode as a different item list. See [`NetworkListItem`] for the
+    /// caller's version check.
     ///
     /// # Errors
     ///

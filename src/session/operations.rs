@@ -1233,6 +1233,11 @@ impl super::AgentHandle {
         .await
     }
     /// Sends the `get_allowlist` domain operation.
+    ///
+    /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
+    /// decode as a different item list. See [`NetworkListItem`] for the
+    /// caller's version check; this operation does not check the version in
+    /// [`Self::metadata`].
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn get_allowlist(&self) -> Result<Vec<NetworkListItem>, SessionError> {
@@ -1246,6 +1251,11 @@ impl super::AgentHandle {
         .await
     }
     /// Sends the `get_blocklist` domain operation.
+    ///
+    /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
+    /// decode as a different item list. See [`NetworkListItem`] for the
+    /// caller's version check; this operation does not check the version in
+    /// [`Self::metadata`].
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn get_blocklist(&self) -> Result<Vec<NetworkListItem>, SessionError> {

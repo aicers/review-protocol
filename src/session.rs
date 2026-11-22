@@ -259,6 +259,11 @@
 //! The protocol is `0.50.0`, and the library's `>=0.49.0` suggested floor is
 //! unchanged. `0.50.0` replaces the detection event, allowlist, blocklist and
 //! detector status payloads, with no path that reads the earlier shapes.
+//! The floor still admits `0.49.0` peers, and no operation checks the peer's
+//! version, so a manager that exchanges those payloads selects a `>=0.50.0`
+//! requirement or checks `HandshakeMetadata` first. For the allowlist and
+//! blocklist this matters most: some `0.49.0` lists decode as valid `0.50.0`
+//! item lists with their hosts lost; see `types::NetworkListItem`.
 //! Callers may still advertise `0.48.0` or select an explicit `>=0.48.0` through
 //! `0.49.0` window. Protocol versions are independent of crate release versions.
 //!

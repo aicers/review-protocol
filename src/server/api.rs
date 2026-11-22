@@ -87,6 +87,10 @@ impl Connection {
     /// deduplicating; the agent attributes a skipped raw event to the first
     /// matching entry in that order.
     ///
+    /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
+    /// decode as a different item list. See [`NetworkListItem`] for the
+    /// caller's version check.
+    ///
     /// # Errors
     ///
     /// Returns an error if serialization failed or communication with the client failed.
@@ -99,6 +103,10 @@ impl Connection {
     ///
     /// Every item is sent in the order given, without sorting, merging or
     /// deduplicating.
+    ///
+    /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
+    /// decode as a different item list. See [`NetworkListItem`] for the
+    /// caller's version check.
     ///
     /// # Errors
     ///
