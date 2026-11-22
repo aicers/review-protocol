@@ -67,7 +67,13 @@ pub enum DetectionModel {
 /// log and skip one bad event without failing the rest.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DetectionEvent {
-    /// When the detection was made.
+    /// The detection's time.
+    ///
+    /// For a [`Target::RawEvent`] this must be the raw event's time, the
+    /// Giganto key timestamp, the same value as that target's `time`, even
+    /// when the detection is made later or from historical data;
+    /// [`validate`](Self::validate) rejects any other value (rule 7), and a
+    /// receiver skips the event.
     #[serde(with = "jiff::fmt::serde::timestamp::nanosecond::required")]
     pub time: jiff::Timestamp,
     /// The sensor the detection's raw events came from, if one.
@@ -95,7 +101,8 @@ pub enum Target {
     /// A single raw event, identified by its time together with the event's
     /// `raw_event_kind` and `sensor`.
     RawEvent {
-        /// The raw event's time, the Giganto key timestamp.
+        /// The raw event's time, the Giganto key timestamp. The header's
+        /// [`DetectionEvent::time`] must carry the same value.
         #[serde(with = "jiff::fmt::serde::timestamp::nanosecond::required")]
         time: jiff::Timestamp,
         /// The raw event itself.
@@ -398,7 +405,8 @@ impl DetectionEvent {
     /// 4. For [`Target::Subject`]: `window.start <= window.end`.
     /// 5. For [`Target::Subject`]: at most [`MAX_RELATED_IPS`] related IPs.
     /// 6. `score` is finite.
-    /// 7. For [`Target::RawEvent`]: `time` equals the raw event's time.
+    /// 7. For [`Target::RawEvent`]: `time` equals the raw event's time, the
+    ///    Giganto key timestamp in that target's `time`.
     ///
     /// It accepts [`PrimarySubject::Network`] and [`PrimarySubject::Cluster`]
     /// subjects: whether to take those depends on the connection and request,

@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 #[cfg(feature = "server")]
 use super::ServerRunError;
+#[cfg(feature = "client")]
+use super::exchange::{Decoding, unary_as};
 use super::{
     OutcomeCertainty, SessionError, Shared,
     decode::decode,
@@ -1234,11 +1236,12 @@ impl super::AgentHandle {
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn get_allowlist(&self) -> Result<Vec<NetworkListItem>, SessionError> {
-        unary(
+        unary_as(
             &self.0.connection,
             &self.0.options,
             u32::from(crate::server::RequestCode::GetAllowlist),
             (),
+            Decoding::Exact,
         )
         .await
     }
@@ -1246,11 +1249,12 @@ impl super::AgentHandle {
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn get_blocklist(&self) -> Result<Vec<NetworkListItem>, SessionError> {
-        unary(
+        unary_as(
             &self.0.connection,
             &self.0.options,
             u32::from(crate::server::RequestCode::GetBlocklist),
             (),
+            Decoding::Exact,
         )
         .await
     }

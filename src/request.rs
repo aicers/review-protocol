@@ -1149,19 +1149,46 @@ async fn decode_args<'de, T: serde::Deserialize<'de>>(
     body: &'de [u8],
     classify: Option<crate::ProtocolErrorKind>,
 ) -> Result<T, HandlerError> {
-    let e = match parse_args::<T>(body) {
-        Ok(args) => return Ok(args),
-        Err(e) => e,
-    };
+    match parse_args::<T>(body) {
+        Ok(args) => Ok(args),
+        Err(e) => Err(reject_args(send, code, e, classify).await),
+    }
+}
+
+/// Decodes the arguments of request `code` like [`decode_args`], but also
+/// rejects bytes left over after them.
+///
+/// The allowlist and blocklist pushes use this so that a `0.49.0` peer's
+/// `HostNetworkGroup` payload is refused rather than read as an empty item
+/// list; see `legacy_transport::decode_exact`.
+async fn decode_exact_args<'de, T: serde::Deserialize<'de>>(
+    send: &mut quinn::SendStream,
+    code: u32,
+    body: &'de [u8],
+) -> Result<T, HandlerError> {
+    match oinq::decode_exact::<T>(body) {
+        Ok(args) => Ok(args),
+        Err(e) => Err(reject_args(send, code, e, None).await),
+    }
+}
+
+/// Answers request `code` with an undecodable-arguments error frame and
+/// returns the decode error `e`, classified as `classify` when one is given.
+async fn reject_args(
+    send: &mut quinn::SendStream,
+    code: u32,
+    e: io::Error,
+    classify: Option<crate::ProtocolErrorKind>,
+) -> HandlerError {
     let e = match classify {
         Some(kind) => crate::protocol_error::DispatchError::from_io(kind, &e),
         None => e,
     };
-    // `body` borrows the dispatcher's buffer, so the frame gets its own.
+    // The request body borrows the dispatcher's buffer, so the frame gets its own.
     let mut buf = Vec::new();
     let _ =
         oinq::message::send_err(send, &mut buf, crate::wire::undecodable_args_message(code)).await;
-    Err(HandlerError::RecvError(e))
+    HandlerError::RecvError(e)
 }
 
 /// Handles only node-family requests to an agent.
@@ -1448,14 +1475,14 @@ pub async fn handle<H: Handler>(
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::Allowlist => {
-                let allowlist = decode_args::<Vec<NetworkListItem>>(send, code, body, None).await?;
+                let allowlist = decode_exact_args::<Vec<NetworkListItem>>(send, code, body).await?;
                 let result = handler.allowlist(allowlist).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::Blocklist => {
-                let blocklist = decode_args::<Vec<NetworkListItem>>(send, code, body, None).await?;
+                let blocklist = decode_exact_args::<Vec<NetworkListItem>>(send, code, body).await?;
                 let result = handler.blocklist(blocklist).await;
                 send_response(send, &mut buf, result)
                     .await
@@ -5028,6 +5055,57 @@ mod tests {
         assert_undecodable_answer::<InstallPreflight>(&mut client_recv, code).await;
 
         assert_decode_error(server_task.await.unwrap());
+    }
+
+    /// A `0.49.0` `HostNetworkGroup` with no explicit hosts but other
+    /// entries, pushed as the allowlist or the blocklist.
+    ///
+    /// Its leading zero host count is also an empty `Vec<NetworkListItem>`,
+    /// so the encoding is checked to be one a prefix decode would accept.
+    #[cfg(feature = "server")]
+    fn legacy_list_payload() -> Vec<u8> {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let group = crate::types::HostNetworkGroup {
+            hosts: Vec::new(),
+            networks: vec!["192.0.2.0/24".parse().unwrap()],
+            ip_ranges: vec![
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))
+                    ..=IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+            ],
+        };
+        let body = bincode::serde::encode_to_vec(&group, bincode::config::standard()).unwrap();
+        let prefix = super::parse_args::<Vec<crate::types::NetworkListItem>>(&body)
+            .expect("a prefix decode reads the legacy payload");
+        assert!(prefix.is_empty(), "a prefix decode reads an empty list");
+        body
+    }
+
+    /// An allowlist or blocklist push in the `0.49.0` `HostNetworkGroup`
+    /// shape is answered with the error frame instead of reaching the
+    /// handler as an empty list.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn handle_rejects_legacy_list_push() {
+        use crate::test::{TOKEN, channel};
+
+        let _lock = TOKEN.lock().await;
+        for request in [RequestCode::Allowlist, RequestCode::Blocklist] {
+            let channel = channel().await;
+            let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+            let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+
+            let server_task = tokio::spawn(async move {
+                let mut handler = NoopHandler;
+                super::handle(&mut handler, &mut server_send, &mut server_recv).await
+            });
+
+            let code = u32::from(request);
+            send_raw_request(&mut client_send, code, &legacy_list_payload()).await;
+            assert_undecodable_answer::<()>(&mut client_recv, code).await;
+
+            assert_decode_error(server_task.await.unwrap());
+        }
     }
 
     /// An undecodable `NodePower` through `handle_node` is answered

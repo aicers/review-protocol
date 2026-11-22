@@ -114,7 +114,7 @@ impl Connection {
     /// Returns an error if the request fails or the response is invalid.
     pub async fn get_allowlist(&self) -> io::Result<Vec<NetworkListItem>> {
         let res: Result<Vec<NetworkListItem>, String> =
-            request(self, server::RequestCode::GetAllowlist, ()).await?;
+            request_exact(self, server::RequestCode::GetAllowlist, ()).await?;
         res.map_err(io::Error::other)
     }
 
@@ -126,7 +126,7 @@ impl Connection {
     /// Returns an error if the request fails or the response is invalid.
     pub async fn get_blocklist(&self) -> io::Result<Vec<NetworkListItem>> {
         let res: Result<Vec<NetworkListItem>, String> =
-            request(self, server::RequestCode::GetBlocklist, ()).await?;
+            request_exact(self, server::RequestCode::GetBlocklist, ()).await?;
         res.map_err(io::Error::other)
     }
 
@@ -486,6 +486,21 @@ where
     unary_request(&mut send, &mut recv, u32::from(code), input).await
 }
 
+/// Sends a request like [`request`] and rejects a response with bytes left
+/// over after it; see `legacy_transport::decode_exact`.
+async fn request_exact<I, O>(
+    conn: &Connection,
+    code: server::RequestCode,
+    input: I,
+) -> io::Result<O>
+where
+    I: Serialize,
+    O: DeserializeOwned,
+{
+    let (mut send, mut recv) = conn.open_bi().await?;
+    crate::legacy_transport::unary_exact(&mut send, &mut recv, u32::from(code), input).await
+}
+
 #[cfg(all(test, feature = "server"))]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -740,6 +755,69 @@ mod tests {
             assert_eq!(received_blocklist, expected);
         })
         .await;
+    }
+
+    /// A `0.49.0` server's allowlist or blocklist reply, a
+    /// `HostNetworkGroup` with no explicit hosts but other entries, is
+    /// refused rather than read as an empty item list.
+    #[tokio::test]
+    async fn list_pull_rejects_legacy_reply() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        use crate::{
+            legacy_transport::frame,
+            types::{HostNetworkGroup, NetworkListItem},
+        };
+
+        let group = HostNetworkGroup {
+            hosts: Vec::new(),
+            networks: vec!["192.0.2.0/24".parse().unwrap()],
+            ip_ranges: vec![
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))
+                    ..=IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+            ],
+        };
+        let reply =
+            bincode::serde::encode_to_vec(Ok::<_, String>(group), bincode::config::standard())
+                .unwrap();
+        let (prefix, _) = bincode::serde::decode_from_slice::<
+            Result<Vec<NetworkListItem>, String>,
+            _,
+        >(&reply, bincode::config::standard())
+        .expect("a prefix decode reads the legacy reply");
+        assert_eq!(
+            prefix,
+            Ok(Vec::new()),
+            "a prefix decode reads an empty list"
+        );
+
+        let test_env = TEST_ENV.lock().await;
+        for pull_blocklist in [false, true] {
+            let (server_conn, client_conn) = test_env.setup().await;
+            let server_reply = reply.clone();
+            let handler_conn = server_conn.clone();
+            let server_handle = tokio::spawn(async move {
+                let (mut send, mut recv) = handler_conn.as_quinn().accept_bi().await.unwrap();
+                let mut request = Vec::new();
+                frame::recv_raw(&mut recv, &mut request).await.unwrap();
+                frame::send_raw(&mut send, &server_reply).await.unwrap();
+                send.finish().unwrap();
+                let _ = send.stopped().await;
+            });
+
+            let res = if pull_blocklist {
+                client_conn.get_blocklist().await
+            } else {
+                client_conn.get_allowlist().await
+            };
+            assert_eq!(
+                res.expect_err("the legacy reply is refused").kind(),
+                std::io::ErrorKind::InvalidData
+            );
+
+            server_handle.await.unwrap();
+            test_env.teardown(&server_conn);
+        }
     }
 
     #[tokio::test]

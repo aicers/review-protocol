@@ -1246,6 +1246,72 @@ async fn list_pulls_preserve_every_item_in_order() {
     );
 }
 
+/// A `0.49.0` manager's allowlist or blocklist reply, a `HostNetworkGroup`
+/// with no explicit hosts but other entries, is refused as malformed rather
+/// than read as an empty item list, which a prefix decode would do.
+#[tokio::test]
+async fn list_pulls_reject_legacy_host_network_group_reply() {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use oinq::frame::{FramedReader, FramedWriter};
+    use review_protocol::types::{HostNetworkGroup, NetworkListItem};
+
+    let group = HostNetworkGroup {
+        hosts: Vec::new(),
+        networks: vec!["192.0.2.0/24".parse().unwrap()],
+        ip_ranges: vec![
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))..=IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        ],
+    };
+    let reply =
+        bincode::serde::encode_to_vec(Ok::<_, String>(group), bincode::config::standard()).unwrap();
+    let (prefix, _) = bincode::serde::decode_from_slice::<Result<Vec<NetworkListItem>, String>, _>(
+        &reply,
+        bincode::config::standard(),
+    )
+    .unwrap();
+    assert_eq!(
+        prefix,
+        Ok(Vec::new()),
+        "a prefix decode reads an empty list"
+    );
+
+    let options = SessionOptions::legacy_compatible();
+    let (manager, node) = connections().await;
+    let info = claims();
+    let (server, agent) = tokio::join!(
+        ServerHandle::from_transport(manager.clone(), options.clone(), ">=0.48.0", "0.49.0"),
+        AgentHandle::from_transport(node, options, &info),
+    );
+    // Keep the manager session alive without accepting its streams.
+    let _server = server.unwrap();
+    let (agent, _) = agent.unwrap();
+    for pull_blocklist in [false, true] {
+        let ((), result) = tokio::join!(
+            async {
+                let (send, recv) = manager.accept_bi().await.unwrap();
+                let limit = FrameLimit::new(1024).unwrap();
+                let mut reader = FramedReader::new(recv, limit);
+                let mut writer = FramedWriter::new(send, limit);
+                reader.read().await.unwrap().unwrap();
+                writer.start_raw(&reply).unwrap();
+                writer.flush().await.unwrap();
+                let _ = writer.into_inner().finish();
+            },
+            async {
+                if pull_blocklist {
+                    agent.get_blocklist().await
+                } else {
+                    agent.get_allowlist().await
+                }
+            }
+        );
+        let error = result.unwrap_err();
+        assert!(matches!(error, SessionError::Malformed { .. }), "{error:?}");
+        assert_eq!(error.certainty(), Some(OutcomeCertainty::Unknown));
+    }
+}
+
 #[tokio::test]
 async fn time_sync_status_decodes_current_release_bytes() {
     use oinq::frame::{FramedReader, FramedWriter};
