@@ -5,6 +5,12 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0](https://github.com/aicers/review-protocol/compare/0.27.1...0.28.0) - 2026-11-22
+
+### Added
+
+- *(types)* [**breaking**] replace detection events with DetectionEvent and raise protocol to 0.50.0 ([#347](https://github.com/aicers/review-protocol/pull/347))
+
 ## [0.27.1](https://github.com/aicers/review-protocol/compare/0.27.0...0.27.1) - 2026-11-22
 
 ### Added
