@@ -67,6 +67,9 @@ thiserror = { version = "2", optional = true }
 tokio = { version = "1", features = ["sync"], optional = true }
 
 [dev-dependencies]
+# Checks `types::RawEventKind` against the tag `types::raw_event` copies.
+# giganto-client is `publish = false`, so it is a git dependency.
+giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "0.29.2" }
 quinn = { version = "0.11", default-features = false, features = [
   "log",
   "platform-verifier",
@@ -80,6 +83,7 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 # build it. Do not remove it.
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt"] }
 tokio-test = "0.4.4"
 
