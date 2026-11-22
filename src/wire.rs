@@ -98,7 +98,7 @@ mod tests {
             (crate::server::RequestCode::UpdateClusters, 10_u32),
             (crate::server::RequestCode::UpdateModel, 11_u32),
             (crate::server::RequestCode::UpdateOutliers, 12_u32),
-            (crate::server::RequestCode::InsertEventLabels, 13_u32),
+            (crate::server::RequestCode::InsertDetectionEvents, 13_u32),
             (crate::server::RequestCode::GetDataSourceList, 14_u32),
             (crate::server::RequestCode::GetLabelDbPatterns, 15_u32),
             (crate::server::RequestCode::InsertDataSource, 20_u32),

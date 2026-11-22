@@ -1,26 +1,28 @@
-//! Low-level event stream processing implementation.
+//! Low-level detection event stream processing implementation.
 
 use std::io;
 
 use quinn::RecvStream;
 
-use self::super::EventStreamHandler;
+use self::super::DetectionEventStreamHandler;
 use crate::legacy_transport as oinq;
 
-/// Processes a unidirectional event stream with the given handler
+/// Processes a unidirectional detection event stream with the given handler
 ///
-/// Reads `EventMessage` objects from the stream and calls handler methods
+/// Reads `DetectionEvent` objects from the stream and calls handler methods
 /// appropriately. Handles protocol framing, deserialization, and errors.
+/// Every decodable event is passed to the handler as is, without
+/// [`DetectionEvent::validate`](crate::types::DetectionEvent::validate).
 ///
 /// # Protocol Format
 /// - 2-byte header (version/reserved)
 /// - Sequence of length-prefixed messages:
 ///   - 4-byte big-endian length
-///   - Message payload (bincode-serialized `EventMessage`)
+///   - Message payload (bincode-serialized `DetectionEvent`)
 ///
 /// # Arguments
 /// * `recv` - The unidirectional receive stream
-/// * `handler` - Handler implementing `EventStreamHandler` trait
+/// * `handler` - Handler implementing `DetectionEventStreamHandler` trait
 ///
 /// # Returns
 /// * `Ok(())` - Stream processed successfully until EOF
@@ -34,9 +36,12 @@ use crate::legacy_transport as oinq;
 /// * A handler error occurs during error handling
 /// * A handler error occurs during stream end handling
 /// * A network error occurs while reading messages
-pub async fn process_event_stream<H>(mut recv: RecvStream, mut handler: H) -> io::Result<()>
+pub async fn process_detection_event_stream<H>(
+    mut recv: RecvStream,
+    mut handler: H,
+) -> io::Result<()>
 where
-    H: EventStreamHandler + Send,
+    H: DetectionEventStreamHandler + Send,
 {
     // Read 2-byte protocol header
     let mut header_buf = vec![0_u8; 2];
@@ -63,7 +68,7 @@ where
         // Deserialize and handle message
         match bincode::serde::borrow_decode_from_slice(&message_buf, codec) {
             Ok((msg, _len)) => {
-                handler.handle_event(msg).await?;
+                handler.handle_detection_event(msg).await?;
             }
             Err(e) => {
                 let error_msg = format!("decoding error: {e}");
@@ -88,11 +93,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::types::EventMessage;
+    use crate::types::DetectionEvent;
 
     // Mock handler for testing
     struct TestHandler {
-        events: Arc<Mutex<Vec<EventMessage>>>,
+        events: Arc<Mutex<Vec<DetectionEvent>>>,
         errors: Arc<Mutex<Vec<String>>>,
         should_fail_on_event: bool,
         stream_ended: Arc<Mutex<bool>>,
@@ -121,8 +126,8 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl EventStreamHandler for TestHandler {
-        async fn handle_event(&mut self, event: EventMessage) -> io::Result<()> {
+    impl DetectionEventStreamHandler for TestHandler {
+        async fn handle_detection_event(&mut self, event: DetectionEvent) -> io::Result<()> {
             if self.should_fail_on_event {
                 return Err(io::Error::other("test failure"));
             }

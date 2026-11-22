@@ -30,7 +30,7 @@ use crate::types::node::{
     NodeTimeSyncResponse, NodeVersionRequest, NodeVersionResponse,
 };
 use crate::types::{
-    CloneModelRequest, CustomerDataDeletionReport, DetectorStatusReport, HostNetworkGroup,
+    CloneModelRequest, CustomerDataDeletionReport, DetectorStatusReport, NetworkListItem,
     ReportedRunState, TrainModelRequest,
 };
 #[cfg(feature = "server")]
@@ -38,8 +38,8 @@ use crate::{
     auth::{AuthorizationContext, AuthorizerV2},
     server::{Handler, RequestCode as ServerCode},
     types::{
-        ColumnStatisticsUpdate, DataSource, DataSourceKey, EventMessage, OutlierInfo,
-        SamplingPolicy, TimeSeriesUpdate, UpdateClusterRequest, UserAgent,
+        ColumnStatisticsUpdate, DataSource, DataSourceKey, DetectionEvent, HostNetworkGroup,
+        OutlierInfo, SamplingPolicy, TimeSeriesUpdate, UpdateClusterRequest, UserAgent,
     },
 };
 
@@ -289,8 +289,8 @@ fn arguments<'a, T: Deserialize<'a>>(
 pub enum ServerStream {
     /// A stream containing zero or more sequential requests.
     Requests(ServerRequestStream),
-    /// An ordered event sequence.
-    Events(super::EventReceiver),
+    /// An ordered detection event sequence.
+    DetectionEvents(super::DetectionEventReceiver),
 }
 
 /// The unique server-side owner of incoming stream acceptance.
@@ -342,7 +342,10 @@ impl ServerIncoming {
             }
             result = self.shared.connection.accept_uni() => {
                 let recv = result.map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent))?;
-                Ok(ServerStream::Events(super::EventReceiver::new(recv, self.shared.options.events)))
+                Ok(ServerStream::DetectionEvents(super::DetectionEventReceiver::new(
+                    recv,
+                    self.shared.options.detection_events,
+                )))
             }
         }
     }
@@ -729,9 +732,9 @@ server_operations! {
             => |h, _peer, name| h.get_pretrained_model(&name).await,
         GetModelNames(()) -> Vec<String>
             => |h, _peer, ()| h.get_model_names().await,
-        GetAllowlist(()) -> HostNetworkGroup
+        GetAllowlist(()) -> Vec<NetworkListItem>
             => |h, peer, ()| h.get_allowlist(peer).await,
-        GetBlocklist(()) -> HostNetworkGroup
+        GetBlocklist(()) -> Vec<NetworkListItem>
             => |h, peer, ()| h.get_blocklist(peer).await,
         InsertModel(Vec<u8>) -> u32
             => |h, _peer, model| h.insert_model(&model).await,
@@ -755,8 +758,8 @@ server_operations! {
             => |h, _peer, (clusters, model_id)| h.update_clusters(&clusters, model_id).await,
         UpdateOutliers((Vec<OutlierInfo>, u32, i64)) -> ()
             => |h, _peer, (outliers, model_id, timestamp)| h.update_outliers(&outliers, model_id, timestamp).await,
-        InsertEventLabels((u32, u32, Vec<EventMessage>)) -> ()
-            => |h, _peer, (model_id, round, labels)| h.insert_event_labels(model_id, round, &labels).await,
+        InsertDetectionEvents((u32, u32, Vec<DetectionEvent>)) -> ()
+            => |h, _peer, (model_id, round, events)| h.insert_detection_events(model_id, round, &events).await,
         InsertDataSource(DataSource) -> u32
             => |h, _peer, source| h.insert_data_source(&source).await,
         RenewCertificate(()) -> (String, String)
@@ -1230,7 +1233,7 @@ impl super::AgentHandle {
     /// Sends the `get_allowlist` domain operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
-    pub async fn get_allowlist(&self) -> Result<HostNetworkGroup, SessionError> {
+    pub async fn get_allowlist(&self) -> Result<Vec<NetworkListItem>, SessionError> {
         unary(
             &self.0.connection,
             &self.0.options,
@@ -1242,7 +1245,7 @@ impl super::AgentHandle {
     /// Sends the `get_blocklist` domain operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
-    pub async fn get_blocklist(&self) -> Result<HostNetworkGroup, SessionError> {
+    pub async fn get_blocklist(&self) -> Result<Vec<NetworkListItem>, SessionError> {
         unary(
             &self.0.connection,
             &self.0.options,

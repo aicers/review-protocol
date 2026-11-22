@@ -63,8 +63,8 @@
 //! can be wrapped in `AuthorizerV2Adapter`. The request runner checks this policy
 //! before every invocation, including subsequent requests on the same stream.
 //! It passes the context's peer name to existing `server::Handler` methods that
-//! take a peer argument. The event runner takes a `server::EventStreamHandler`
-//! for a particular stream. Applications can supply peer-specific behavior in
+//! take a peer argument. The detection event runner takes a
+//! `server::DetectionEventStreamHandler` for a particular stream. Applications can supply peer-specific behavior in
 //! that handler.
 //!
 //! ```no_run
@@ -78,7 +78,7 @@
 //! # ) -> Result<(), Box<dyn std::error::Error>>
 //! # where
 //! #     H: review_protocol::server::Handler + Sync,
-//! #     E: review_protocol::server::EventStreamHandler + Send,
+//! #     E: review_protocol::server::DetectionEventStreamHandler + Send,
 //! # {
 //! use review_protocol::session::{ServerRequestOutcome, ServerStream};
 //!
@@ -90,7 +90,7 @@
 //!             request.into_stream().finish()?;
 //!         }
 //!     }
-//!     ServerStream::Events(stream) => stream.run(events).await?,
+//!     ServerStream::DetectionEvents(stream) => stream.run(events).await?,
 //! }
 //! # Ok(())
 //! # }
@@ -215,9 +215,9 @@
 //!
 //! Cancelling a *borrowed sub-operation* retains progress when its owner is kept:
 //! `ServerIncoming::accept`, `AgentIncoming::accept`, request stream `next`,
-//! `PackageReply::next_chunk`, `EventReceiver::next`, and
-//! `EventSender::flush` can resume. Prepare each event once with `start`, then resume
-//! `flush` after cancellation; do not replace a pending event. Dropping the entire
+//! `PackageReply::next_chunk`, `DetectionEventReceiver::next`, and
+//! `DetectionEventSender::flush` can resume. Prepare each event once with `start`, then
+//! resume `flush` after cancellation; do not replace a pending event. Dropping the entire
 //! owner aborts its streams. Application callbacks and authorization run outside the
 //! framing machinery and follow the application's cancellation and lifecycle policy.
 //!
@@ -256,10 +256,11 @@
 //! compatibility. Request codes and representative responses have independently
 //! captured release/current fixtures in `tests/fixtures`.
 //!
-//! Protocol `0.49.0` and the library's `>=0.49.0` suggested floor are unchanged.
+//! The protocol is `0.50.0`, and the library's `>=0.49.0` suggested floor is
+//! unchanged. `0.50.0` replaces the detection event, allowlist, blocklist and
+//! detector status payloads, with no path that reads the earlier shapes.
 //! Callers may still advertise `0.48.0` or select an explicit `>=0.48.0` through
 //! `0.49.0` window. Protocol versions are independent of crate release versions.
-//! No wire-version increment or synchronized deployment is required.
 //!
 //! Owned server runners preserve the legacy dispatcher's multi-request loop.
 //! Handler results, including a default `not supported` or a service-specific
@@ -289,9 +290,9 @@ mod events;
 
 mod exchange;
 #[cfg(feature = "server")]
-pub use events::EventReceiver;
+pub use events::DetectionEventReceiver;
 #[cfg(feature = "client")]
-pub use events::EventSender;
+pub use events::DetectionEventSender;
 mod decode;
 mod handshake;
 mod operations;
@@ -403,9 +404,9 @@ pub enum ServerRunError {
         /// The unrecognized numeric code.
         code: u32,
     },
-    /// An event callback returned an application error.
-    #[error("event handler failed: {0}")]
-    EventHandler(#[source] std::io::Error),
+    /// A detection event callback returned an application error.
+    #[error("detection event handler failed: {0}")]
+    DetectionEventHandler(#[source] std::io::Error),
 }
 
 #[cfg(feature = "server")]
@@ -418,7 +419,7 @@ impl ServerRunError {
             Self::AuthorizationDenied { .. } | Self::UnknownRequestCode { .. } => {
                 Some(OutcomeCertainty::Rejected)
             }
-            Self::MissingAuthorization | Self::EventHandler(_) => None,
+            Self::MissingAuthorization | Self::DetectionEventHandler(_) => None,
         }
     }
 }
@@ -497,8 +498,8 @@ pub struct SessionOptions {
     pub handshake: FrameLimit,
     /// Unary request and response budget (including the request code).
     pub unary: FrameLimit,
-    /// Event frame budget.
-    pub events: FrameLimit,
+    /// Detection event frame budget.
+    pub detection_events: FrameLimit,
     /// Package chunk budget.
     pub package_chunks: FrameLimit,
     /// Optional deadline for a complete outbound operation, including stream opening.
@@ -517,7 +518,7 @@ impl SessionOptions {
         Self {
             handshake: limit,
             unary: limit,
-            events: limit,
+            detection_events: limit,
             package_chunks: limit,
             operation_timeout: None,
         }

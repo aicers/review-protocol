@@ -674,7 +674,7 @@ pub(crate) fn from_server_request_code(code: ServerRequestCode) -> Option<Servic
         ServerRequestCode::GetPretrainedModel => Some(SERVER_MODEL_GET_PRETRAINED),
         ServerRequestCode::GetIndicator => Some(SERVER_INDICATOR_GET),
         ServerRequestCode::GetMaxEventIdNum => Some(SERVER_EVENT_GET_MAX_ID_NUM),
-        ServerRequestCode::InsertEventLabels => Some(SERVER_EVENT_INSERT_LABELS),
+        ServerRequestCode::InsertDetectionEvents => Some(SERVER_EVENT_INSERT_LABELS),
         ServerRequestCode::InsertColumnStatistics => Some(SERVER_STATISTICS_INSERT_COLUMN),
         ServerRequestCode::InsertTimeSeries => Some(SERVER_STATISTICS_INSERT_TIME_SERIES),
         ServerRequestCode::RemoveOutliers => Some(SERVER_OUTLIER_REMOVE),
@@ -1083,7 +1083,7 @@ mod tests {
             ServerRequestCode::UpdateClusters,
             ServerRequestCode::UpdateModel,
             ServerRequestCode::UpdateOutliers,
-            ServerRequestCode::InsertEventLabels,
+            ServerRequestCode::InsertDetectionEvents,
             ServerRequestCode::GetDataSourceList,
             ServerRequestCode::GetLabelDbPatterns,
             ServerRequestCode::InsertDataSource,
@@ -1141,6 +1141,18 @@ mod tests {
             from_server_request_code(ServerRequestCode::ReportCustomerDataDeletion),
             Some(SERVER_CUSTOMER_DATA_DELETION_REPORT)
         );
+    }
+
+    /// Request 13 keeps its service ID through the rename to
+    /// `InsertDetectionEvents`: service IDs are stable routing and
+    /// authorization keys.
+    #[test]
+    fn insert_detection_events_keeps_its_service_id() {
+        let code = ServerRequestCode::from(13_u32);
+        assert_eq!(code, ServerRequestCode::InsertDetectionEvents);
+        let service = from_server_request_code(code).expect("request 13 has a service ID");
+        assert_eq!(service, SERVER_EVENT_INSERT_LABELS);
+        assert_eq!(service.to_string(), "server.event.insert_labels");
     }
 
     /// All service identifiers returned by [`all()`] should have

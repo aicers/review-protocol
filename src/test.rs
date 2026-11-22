@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 #[cfg(all(feature = "client", feature = "server"))]
 use crate::types::{
     DataSource, DataSourceKey, DataType, EventCategory, HostNetworkGroup, LabelDb, LabelDbKind,
-    LabelDbRule, SamplingKind, SamplingPolicy,
+    LabelDbRule, NetworkListItem, SamplingKind, SamplingPolicy,
 };
 
 #[allow(dead_code)]
@@ -294,12 +294,15 @@ pub(crate) const REJECTED_DETECTOR_ID: i32 = -1;
 /// Returns the detector status reports `TestServerHandler` accepts.
 ///
 /// Between them they carry every `DetectorState`, `RoundOutcome` and
-/// `SourceState`, and both `None` and `Some` for every optional field.
+/// `SourceState`, both `None` and `Some` for every optional field, and both
+/// empty and non-empty `detection_models` and `excluded`.
 #[cfg(feature = "server")]
 #[allow(dead_code)] // used by tests only, like `TestServerHandler`
+#[allow(clippy::too_many_lines)] // One literal report per covered shape.
 pub(crate) fn detector_status_reports() -> Vec<crate::types::DetectorStatusReport> {
     use crate::types::{
-        DetectorState, DetectorStatusReport, RoundOutcome, SourceState, SourceStatus,
+        DetectionModel, DetectionModelStatus, DetectorState, DetectorStatusReport, ExcludedCount,
+        RoundOutcome, SourceState, SourceStatus,
     };
 
     vec![
@@ -322,6 +325,35 @@ pub(crate) fn detector_status_reports() -> Vec<crate::types::DetectorStatusRepor
                     reason: None,
                 },
             ],
+            detection_models: vec![
+                DetectionModelStatus {
+                    detection_model: DetectionModel::PortScan,
+                    skipped: None,
+                    truncated: 0,
+                },
+                DetectionModelStatus {
+                    detection_model: DetectionModel::TorExitNode,
+                    skipped: Some("no Tor exit node list".to_string()),
+                    truncated: 0,
+                },
+                DetectionModelStatus {
+                    detection_model: DetectionModel::UnusualDestinationPattern,
+                    skipped: None,
+                    truncated: 1_000,
+                },
+            ],
+            excluded: vec![
+                ExcludedCount {
+                    entry: (1 << 53) + 3,
+                    day: jiff::civil::date(2026, 3, 14),
+                    count: 17,
+                },
+                ExcludedCount {
+                    entry: 7,
+                    day: jiff::civil::date(2026, 3, 15),
+                    count: u64::MAX,
+                },
+            ],
         },
         DetectorStatusReport {
             detector_id: 2,
@@ -335,6 +367,12 @@ pub(crate) fn detector_status_reports() -> Vec<crate::types::DetectorStatusRepor
                 state: SourceState::Failed,
                 reason: Some("connection refused".to_string()),
             }],
+            detection_models: vec![DetectionModelStatus {
+                detection_model: DetectionModel::WatchlistMatch,
+                skipped: Some("source failed".to_string()),
+                truncated: 0,
+            }],
+            excluded: Vec::new(),
         },
         DetectorStatusReport {
             detector_id: 3,
@@ -344,6 +382,8 @@ pub(crate) fn detector_status_reports() -> Vec<crate::types::DetectorStatusRepor
             reason: None,
             events: 0,
             sources: Vec::new(),
+            detection_models: Vec::new(),
+            excluded: Vec::new(),
         },
         DetectorStatusReport {
             detector_id: i32::MAX,
@@ -357,6 +397,399 @@ pub(crate) fn detector_status_reports() -> Vec<crate::types::DetectorStatusRepor
                 state: SourceState::Served,
                 reason: None,
             }],
+            detection_models: Vec::new(),
+            excluded: vec![ExcludedCount {
+                entry: 0,
+                day: jiff::civil::date(1970, 1, 1),
+                count: 1,
+            }],
+        },
+    ]
+}
+
+/// The index in [`detection_events`] of the event that fails
+/// [`DetectionEvent::validate`](crate::types::DetectionEvent::validate).
+pub const INVALID_DETECTION_EVENT: usize = 9;
+
+/// Returns a batch of synthetic detection events.
+///
+/// Between them they carry every `Detail` variant, both `Target` kinds and
+/// every `PrimarySubject`. Every event is valid except the one at
+/// [`INVALID_DETECTION_EVENT`], which carries a detail of another model and
+/// sits between valid events.
+#[allow(clippy::too_many_lines)] // One synthetic event per detection model.
+#[must_use]
+pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
+    use std::net::Ipv4Addr;
+
+    use crate::types::{
+        CryptocurrencyMiningPoolDetail, Detail, DetectionEvent, DetectionModel, EndpointRole,
+        EventCategory, ExternalDdosDetail, FtpBruteForceDetail, LdapBruteForceDetail,
+        MultiHostPortScanDetail, PortScanDetail, PrimarySubject, RawEventBody, RawEventKind,
+        RdpBruteForceDetail, RelatedIp, RepeatedHttpSessionsDetail, Target, ThreatRole, TimeWindow,
+        UnusualDestinationPatternDetail, WatchlistMatchDetail, raw_event,
+    };
+
+    const BASE: i128 = 1_773_586_804_120_000_000;
+
+    let at = |offset: i128| {
+        jiff::Timestamp::from_nanosecond(BASE + offset).expect("the test timestamps are in range")
+    };
+    let conn = RawEventBody::Conn(raw_event::Conn {
+        orig_addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+        orig_port: 46378,
+        resp_addr: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
+        resp_port: 443,
+        proto: 6,
+        conn_state: "SF".to_string(),
+        start_time: 1_773_586_804_000_000_000,
+        duration: 1_234_567,
+        service: "tls".to_string(),
+        orig_bytes: 77,
+        resp_bytes: 295,
+        orig_pkts: 3,
+        resp_pkts: 4,
+        orig_l2_bytes: 200,
+        resp_l2_bytes: 400,
+    });
+    let ftp_conn = || {
+        let RawEventBody::Conn(mut body) = conn.clone() else {
+            unreachable!("`conn` is a `Conn` body");
+        };
+        body.resp_port = 21;
+        RawEventBody::Conn(body)
+    };
+    let related = |count: u8| {
+        (1..=count)
+            .map(|i| RelatedIp {
+                ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, i)),
+                role: if i % 2 == 0 {
+                    EndpointRole::Source
+                } else {
+                    EndpointRole::Destination
+                },
+            })
+            .collect::<Vec<_>>()
+    };
+    let window = |start: i128, end: i128| TimeWindow {
+        start: at(start),
+        end: at(end),
+    };
+    let host = |last: u8, role| PrimarySubject::Host {
+        ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, last)),
+        role,
+    };
+    let raw_event = |offset: i128,
+                     detection_model: DetectionModel,
+                     category: Option<EventCategory>,
+                     body: RawEventBody,
+                     score: f64,
+                     detail: Detail| DetectionEvent {
+        time: at(offset),
+        sensor: Some("sensor-1".to_string()),
+        detection_model,
+        raw_event_kind: RawEventKind::Conn,
+        category,
+        target: Target::RawEvent {
+            time: at(offset),
+            body,
+        },
+        score,
+        detail,
+    };
+    let subject = |offset: i128,
+                   sensor: Option<&str>,
+                   detection_model: DetectionModel,
+                   category: Option<EventCategory>,
+                   primary: PrimarySubject,
+                   related_ips: Vec<RelatedIp>,
+                   window: TimeWindow,
+                   score: f64,
+                   detail: Detail| DetectionEvent {
+        time: at(offset),
+        sensor: sensor.map(str::to_string),
+        detection_model,
+        raw_event_kind: RawEventKind::Conn,
+        category,
+        target: Target::Subject {
+            primary,
+            related_ips,
+            window,
+        },
+        score,
+        detail,
+    };
+
+    vec![
+        subject(
+            0,
+            Some("sensor-1"),
+            DetectionModel::WatchlistMatch,
+            None,
+            host(10, ThreatRole::Target),
+            related(3),
+            window(-5_000, 0),
+            1.0,
+            Detail::WatchlistMatch(WatchlistMatchDetail {
+                entry_id: (1 << 53) + 1,
+                matched_side: EndpointRole::Destination,
+                raw_event_count: 7,
+                truncated_related_ips: 0,
+                closed_early: true,
+            }),
+        ),
+        raw_event(
+            1,
+            DetectionModel::CryptocurrencyMiningPool,
+            Some(EventCategory::Impact),
+            conn.clone(),
+            0.9,
+            Detail::CryptocurrencyMiningPool(CryptocurrencyMiningPoolDetail {
+                coins: vec!["xmr".to_string(), "eth".to_string()],
+            }),
+        ),
+        raw_event(
+            2,
+            DetectionModel::LockyRansomware,
+            Some(EventCategory::Impact),
+            conn.clone(),
+            0.8,
+            Detail::LockyRansomware,
+        ),
+        raw_event(
+            3,
+            DetectionModel::SuspiciousTlsTraffic,
+            None,
+            conn.clone(),
+            0.7,
+            Detail::SuspiciousTlsTraffic,
+        ),
+        subject(
+            4,
+            None,
+            DetectionModel::PortScan,
+            Some(EventCategory::Reconnaissance),
+            host(11, ThreatRole::Actor),
+            related(1),
+            window(-10, 4),
+            12.5,
+            Detail::PortScan(PortScanDetail {
+                resp_ports: vec![22, 80, 443, 8080],
+                proto: 6,
+            }),
+        ),
+        subject(
+            5,
+            None,
+            DetectionModel::MultiHostPortScan,
+            Some(EventCategory::Reconnaissance),
+            host(12, ThreatRole::Actor),
+            related(64),
+            window(5, 5),
+            40.0,
+            Detail::MultiHostPortScan(MultiHostPortScanDetail {
+                resp_port: 445,
+                proto: 6,
+                truncated_related_ips: 36,
+            }),
+        ),
+        subject(
+            6,
+            None,
+            DetectionModel::ExternalDdos,
+            Some(EventCategory::Impact),
+            host(13, ThreatRole::Target),
+            related(4),
+            window(-1_000_000, 6),
+            99.0,
+            Detail::ExternalDdos(ExternalDdosDetail {
+                proto: 17,
+                truncated_related_ips: 0,
+            }),
+        ),
+        subject(
+            7,
+            None,
+            DetectionModel::RdpBruteForce,
+            Some(EventCategory::CredentialAccess),
+            PrimarySubject::Cluster {
+                clustering_model: 3,
+                cluster_id: 41,
+            },
+            related(2),
+            window(0, 7),
+            5.0,
+            Detail::RdpBruteForce(RdpBruteForceDetail {
+                proto: 6,
+                truncated_related_ips: 1,
+            }),
+        ),
+        raw_event(
+            8,
+            DetectionModel::FtpBruteForce,
+            Some(EventCategory::CredentialAccess),
+            ftp_conn(),
+            0.6,
+            Detail::FtpBruteForce(FtpBruteForceDetail {
+                resp_port: 21,
+                proto: 6,
+                user_list: vec!["user-a".to_string(), "user-b".to_string()],
+                is_internal: true,
+            }),
+        ),
+        // Decodable, but fails `validate`: the detail is another model's.
+        raw_event(
+            9,
+            DetectionModel::FtpPlainText,
+            Some(EventCategory::CredentialAccess),
+            ftp_conn(),
+            0.5,
+            Detail::LockyRansomware,
+        ),
+        subject(
+            10,
+            Some("sensor-2"),
+            DetectionModel::LdapBruteForce,
+            Some(EventCategory::CredentialAccess),
+            PrimarySubject::Sensor,
+            Vec::new(),
+            window(0, 10),
+            3.0,
+            Detail::LdapBruteForce(LdapBruteForceDetail {
+                resp_port: 389,
+                proto: 6,
+                user_pw_list: vec![("user-a".to_string(), "synthetic-1".to_string())],
+            }),
+        ),
+        raw_event(
+            11,
+            DetectionModel::RepeatedHttpSessions,
+            Some(EventCategory::CommandAndControl),
+            conn.clone(),
+            0.4,
+            Detail::RepeatedHttpSessions(RepeatedHttpSessionsDetail {
+                orig_port: 46378,
+                resp_port: 443,
+                proto: 6,
+            }),
+        ),
+        raw_event(
+            12,
+            DetectionModel::FtpPlainText,
+            Some(EventCategory::CredentialAccess),
+            ftp_conn(),
+            0.3,
+            Detail::FtpPlainText,
+        ),
+        raw_event(
+            13,
+            DetectionModel::LdapPlainText,
+            Some(EventCategory::CredentialAccess),
+            conn.clone(),
+            0.2,
+            Detail::LdapPlainText,
+        ),
+        raw_event(
+            14,
+            DetectionModel::NonBrowser,
+            Some(EventCategory::CommandAndControl),
+            conn.clone(),
+            -0.1,
+            Detail::NonBrowser,
+        ),
+        subject(
+            15,
+            None,
+            DetectionModel::TorExitNode,
+            Some(EventCategory::CommandAndControl),
+            PrimarySubject::Network {
+                customer: 2,
+                name: "office".to_string(),
+                role: ThreatRole::Actor,
+            },
+            related(2),
+            window(0, 15),
+            0.0,
+            Detail::TorExitNode,
+        ),
+        raw_event(
+            16,
+            DetectionModel::DomainGenerationAlgorithm,
+            Some(EventCategory::CommandAndControl),
+            conn.clone(),
+            0.95,
+            Detail::DomainGenerationAlgorithm,
+        ),
+        raw_event(
+            17,
+            DetectionModel::DnsCovertChannel,
+            Some(EventCategory::Exfiltration),
+            conn,
+            0.85,
+            Detail::DnsCovertChannel,
+        ),
+        subject(
+            18,
+            None,
+            DetectionModel::UnusualDestinationPattern,
+            None,
+            host(14, ThreatRole::Actor),
+            related(5),
+            window(-60_000_000_000, 18),
+            4.2,
+            Detail::UnusualDestinationPattern(UnusualDestinationPatternDetail {
+                count: 40,
+                expected_mean: 2.5,
+                std_deviation: 1.25,
+                z_score: 30.0,
+                truncated_related_ips: 2,
+            }),
+        ),
+    ]
+}
+
+/// Returns synthetic allowlist or blocklist items, listed out of id order.
+///
+/// One id is above 2^53, and items with distinct ids have groups that
+/// overlap or are equal.
+#[must_use]
+pub fn network_list_items() -> Vec<crate::types::NetworkListItem> {
+    use std::net::Ipv4Addr;
+
+    use crate::types::{HostNetworkGroup, NetworkListItem};
+
+    let net = |s: &str| s.parse().expect("the test network is valid");
+    let shared = HostNetworkGroup {
+        hosts: vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))],
+        networks: vec![net("198.51.100.0/24")],
+        ip_ranges: vec![
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))..=IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20)),
+        ],
+    };
+    vec![
+        NetworkListItem {
+            id: (1 << 53) + 3,
+            name: "above 2^53".to_string(),
+            group: shared.clone(),
+        },
+        NetworkListItem {
+            id: 7,
+            name: "equal group".to_string(),
+            group: shared,
+        },
+        NetworkListItem {
+            id: 2,
+            name: "overlapping".to_string(),
+            group: HostNetworkGroup {
+                hosts: vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
+                networks: vec![net("198.51.100.128/25"), net("2001:db8::/32")],
+                ip_ranges: Vec::new(),
+            },
+        },
+        NetworkListItem {
+            id: u64::MAX,
+            name: "empty".to_string(),
+            group: HostNetworkGroup::default(),
         },
     ]
 }
@@ -443,28 +876,22 @@ impl crate::server::Handler for TestServerHandler {
         Ok("test-config".to_string())
     }
 
-    async fn get_allowlist(&self, peer: &str) -> Result<HostNetworkGroup, String> {
-        use std::net::{IpAddr, Ipv6Addr};
+    // Returns `network_list_items()`.
+    async fn get_allowlist(&self, peer: &str) -> Result<Vec<NetworkListItem>, String> {
         if peer != "test-peer" {
             return Err(format!("unexpected peer: {peer}"));
         }
-        Ok(HostNetworkGroup {
-            hosts: vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
-            networks: vec![],
-            ip_ranges: vec![],
-        })
+        Ok(network_list_items())
     }
 
-    async fn get_blocklist(&self, peer: &str) -> Result<HostNetworkGroup, String> {
-        use std::net::{IpAddr, Ipv4Addr};
+    // Returns `network_list_items()` in reverse order.
+    async fn get_blocklist(&self, peer: &str) -> Result<Vec<NetworkListItem>, String> {
         if peer != "test-peer" {
             return Err(format!("unexpected peer: {peer}"));
         }
-        Ok(HostNetworkGroup {
-            hosts: vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))],
-            networks: vec![],
-            ip_ranges: vec![],
-        })
+        let mut items = network_list_items();
+        items.reverse();
+        Ok(items)
     }
 
     async fn get_indicator(&self, name: &str) -> Result<HashSet<Vec<String>>, String> {
@@ -591,13 +1018,19 @@ impl crate::server::Handler for TestServerHandler {
         Ok(())
     }
 
-    async fn insert_event_labels(
+    // Accepts an empty batch or exactly `detection_events()`, in order, and
+    // rejects anything else.
+    async fn insert_detection_events(
         &self,
         _model_id: u32,
         _round: u32,
-        _event_labels: &[crate::types::EventMessage],
+        events: &[crate::types::DetectionEvent],
     ) -> Result<(), String> {
-        Ok(())
+        if events.is_empty() || events == detection_events().as_slice() {
+            Ok(())
+        } else {
+            Err(format!("unexpected detection events: {events:?}"))
+        }
     }
 
     async fn insert_data_source(

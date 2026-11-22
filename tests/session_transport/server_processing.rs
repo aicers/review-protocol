@@ -7,16 +7,17 @@ use std::{
 
 use review_protocol::{
     auth::{AuthorizationContext, AuthorizationError, AuthorizerV2, PeerContext},
-    server::{EventStreamHandler, Handler},
+    server::{DetectionEventStreamHandler, Handler},
     service_id::{self, ServiceId},
     session::{
         Connection, FrameLimit, OutcomeCertainty, ServerRequestOutcome, ServerRunError,
         SessionError, SessionOptions,
     },
     types::{
-        ColumnStatisticsUpdate, CustomerDataDeletionReport, DataSource, DataSourceKey,
-        DetectorStatusReport, EventMessage, HostNetworkGroup, LabelDb, OutlierInfo,
-        ReportedRunState, SamplingPolicy, TimeSeriesUpdate, UpdateClusterRequest, UserAgent,
+        ColumnStatisticsUpdate, CustomerDataDeletionReport, DataSource, DataSourceKey, Detail,
+        DetectionEvent, DetectionModel, DetectorStatusReport, HostNetworkGroup, LabelDb,
+        NetworkListItem, OutlierInfo, PrimarySubject, RawEventKind, ReportedRunState,
+        SamplingPolicy, Target, TimeSeriesUpdate, TimeWindow, UpdateClusterRequest, UserAgent,
     },
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,6 +39,31 @@ const TRUNCATED_EVENT: &[u8] = include_bytes!("../fixtures/current/server-trunca
 
 const GET_CONFIG: &[u8] = &[0, 0, 0, 4, 36, 0, 0, 0];
 const GET_LABEL_DB_PATTERNS: u32 = 15;
+
+/// Returns the detection event a fixture frame carries: a `LockyRansomware`
+/// detection about cluster `cluster_id` of clustering model 0, at time 0.
+fn fixture_event(cluster_id: u32, score: f64) -> DetectionEvent {
+    DetectionEvent {
+        time: jiff::Timestamp::UNIX_EPOCH,
+        sensor: None,
+        detection_model: DetectionModel::LockyRansomware,
+        raw_event_kind: RawEventKind::Conn,
+        category: None,
+        target: Target::Subject {
+            primary: PrimarySubject::Cluster {
+                clustering_model: 0,
+                cluster_id,
+            },
+            related_ips: Vec::new(),
+            window: TimeWindow {
+                start: jiff::Timestamp::UNIX_EPOCH,
+                end: jiff::Timestamp::UNIX_EPOCH,
+            },
+        },
+        score,
+        detail: Detail::LockyRansomware,
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Observation {
@@ -188,14 +214,14 @@ impl Handler for FixtureHandler {
         self.unsupported(service_id::SERVER_OUTLIER_UPDATE)
     }
 
-    async fn insert_event_labels(
+    async fn insert_detection_events(
         &self,
         model_id: u32,
         round: u32,
-        labels: &[EventMessage],
+        events: &[DetectionEvent],
     ) -> Result<(), String> {
         assert_eq!((model_id, round), (1, 2));
-        assert_eq!(labels[0].fields, [1]);
+        assert_eq!(events, [fixture_event(1, 1.0)]);
         self.unsupported(service_id::SERVER_EVENT_INSERT_LABELS)
     }
 
@@ -226,12 +252,12 @@ impl Handler for FixtureHandler {
         self.unsupported(service_id::SERVER_LIST_INTERNAL_NETWORK)
     }
 
-    async fn get_allowlist(&self, peer: &str) -> Result<HostNetworkGroup, String> {
+    async fn get_allowlist(&self, peer: &str) -> Result<Vec<NetworkListItem>, String> {
         assert_eq!(peer, "verified-peer");
         self.unsupported(service_id::SERVER_LIST_ALLOWLIST)
     }
 
-    async fn get_blocklist(&self, peer: &str) -> Result<HostNetworkGroup, String> {
+    async fn get_blocklist(&self, peer: &str) -> Result<Vec<NetworkListItem>, String> {
         assert_eq!(peer, "verified-peer");
         self.unsupported(service_id::SERVER_LIST_BLOCKLIST)
     }
@@ -310,6 +336,7 @@ impl Handler for FixtureHandler {
         report: &DetectorStatusReport,
     ) -> Result<(), String> {
         assert_eq!((peer, report.detector_id), ("verified-peer", 3));
+        assert!(report.detection_models.is_empty() && report.excluded.is_empty());
         self.unsupported(service_id::SERVER_DETECTOR_REPORT_STATUS)
     }
 }
@@ -335,9 +362,9 @@ impl EventLog {
 }
 
 #[async_trait::async_trait]
-impl EventStreamHandler for EventLog {
-    async fn handle_event(&mut self, message: EventMessage) -> io::Result<()> {
-        self.record("event", format!("{:?}", message.fields))
+impl DetectionEventStreamHandler for EventLog {
+    async fn handle_detection_event(&mut self, message: DetectionEvent) -> io::Result<()> {
+        self.record("event", format!("{message:?}"))
     }
 
     async fn on_error(&mut self, error: &str) -> io::Result<()> {
@@ -353,7 +380,7 @@ impl EventStreamHandler for EventLog {
 mod legacy {
     use review_protocol::{
         auth::AuthorizerV2Adapter,
-        server::{handle_authorized_with_context, process_event_stream},
+        server::{handle_authorized_with_context, process_detection_event_stream},
         test::TEST_ENV,
     };
 
@@ -396,7 +423,7 @@ mod legacy {
         let mut send = client.open_uni().await.unwrap();
         send.write_all(bytes).await.unwrap();
         send.finish().unwrap();
-        process_event_stream(server.accept_uni().await.unwrap(), handler).await
+        process_detection_event_stream(server.accept_uni().await.unwrap(), handler).await
     }
 
     #[tokio::test]
@@ -482,12 +509,15 @@ fn delegated_requests(code: u8) -> Vec<u8> {
 fn check_events(log: &EventLog) {
     let entries = log.entries.lock().unwrap();
     assert_eq!(entries.len(), 4);
-    assert_eq!(entries[0], "[1]");
+    assert_eq!(entries[0], format!("{:?}", fixture_event(1, 1.0)));
     assert_eq!(
         entries[1],
         "decoding error: InvalidIntegerType { expected: I128, found: Reserved }"
     );
-    assert_eq!(&entries[2..], ["[2, 3]", "end"]);
+    assert_eq!(
+        &entries[2..],
+        [format!("{:?}", fixture_event(2, 2.0)), "end".to_string()]
+    );
 }
 
 async fn open_requests(node: &Connection, bytes: &[u8]) -> (oinq::SendStream, oinq::RecvStream) {
@@ -999,7 +1029,7 @@ async fn event_runner_distinguishes_clean_end_truncation_and_callback_failures()
         };
         assert!(
             matches!(event_stream(&mut incoming).await.run(log.clone()).await,
-            Err(ServerRunError::EventHandler(error)) if error.to_string() == format!("{callback} failed"))
+            Err(ServerRunError::DetectionEventHandler(error)) if error.to_string() == format!("{callback} failed"))
         );
         assert_eq!(log.entries.lock().unwrap().len(), count);
     }
@@ -1023,14 +1053,14 @@ async fn processing_enforces_explicit_frame_limits() {
     for limit in [
         options.handshake,
         options.unary,
-        options.events,
+        options.detection_events,
         options.package_chunks,
     ] {
         assert_eq!(limit.get(), u32::MAX as usize);
     }
     assert!(options.operation_timeout.is_none());
     options.unary = FrameLimit::new(32).unwrap();
-    options.events = FrameLimit::new(4).unwrap();
+    options.detection_events = FrameLimit::new(4).unwrap();
     let (incoming, _, _, node) = raw_sessions(options).await;
     let policy = Arc::new(Policy::default());
     let handler = Arc::new(FixtureHandler::default());
@@ -1144,4 +1174,75 @@ async fn label_lookup_uses_the_borrowed_argument_budget() {
             assert!(!handler.0.load(Ordering::Relaxed));
         }
     }
+}
+
+/// Request 13 with every detection event of the batch, one of which fails
+/// `validate` between valid ones, reaches `insert_detection_events` whole and
+/// in order through the owned runner, which answers success. The request is
+/// authorized as `server.event.insert_labels`.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn runner_delivers_every_detection_event_unvalidated() {
+    use review_protocol::test::{INVALID_DETECTION_EVENT, detection_events};
+
+    type Received = (u32, u32, Vec<DetectionEvent>);
+
+    #[derive(Default)]
+    struct Collect(Mutex<Vec<Received>>);
+
+    #[async_trait::async_trait]
+    impl Handler for Collect {
+        async fn insert_detection_events(
+            &self,
+            model_id: u32,
+            round: u32,
+            events: &[DetectionEvent],
+        ) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((model_id, round, events.to_vec()));
+            Ok(())
+        }
+    }
+
+    let events = detection_events();
+    assert!(events[INVALID_DETECTION_EVENT].validate().is_err());
+    // Independent legacy request layout: big-endian length, little-endian
+    // code 13, bincode 2 standard arguments.
+    let arguments =
+        bincode::serde::encode_to_vec((7_u32, 8_u32, &events), bincode::config::standard())
+            .unwrap();
+    let mut request = u32::try_from(4 + arguments.len())
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
+    request.extend(13_u32.to_le_bytes());
+    request.extend(arguments);
+
+    let (incoming, _, _, node) = raw_sessions(SessionOptions::legacy_compatible()).await;
+    let policy = Policy::default();
+    let trace = policy.trace.clone();
+    let mut incoming = incoming.with_authorization(context(), Arc::new(policy));
+    let handler = Arc::new(Collect::default());
+    let (mut send, mut recv) = open_requests(&node, &request).await;
+    send.finish().unwrap();
+    assert!(matches!(
+        request_stream(&mut incoming)
+            .await
+            .run(handler.clone())
+            .await,
+        Ok(ServerRequestOutcome::Finished)
+    ));
+    let mut responses = Vec::new();
+    recv.read_to_end(&mut responses).await.unwrap();
+    // One frame holding `Ok(())`.
+    assert_eq!(responses, [0, 0, 0, 1, 0]);
+    assert_eq!(*handler.0.lock().unwrap(), [(7, 8, events)]);
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [Observation::Authorization(
+            service_id::SERVER_EVENT_INSERT_LABELS
+        )]
+    );
 }

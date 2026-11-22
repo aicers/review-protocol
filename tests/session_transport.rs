@@ -9,9 +9,9 @@ use review_protocol::{
     AgentInfo,
     session::{
         AgentHandle, AgentIncoming, AgentRequest, ApplicationCode, CloseReason, Connection,
-        Endpoint, EventReceiver, FrameLimit, OutcomeCertainty, ServerHandle, ServerIncoming,
-        ServerRequest, ServerRequestStream, ServerStream, SessionError, SessionOptions,
-        TransportOptions,
+        DetectionEventReceiver, Endpoint, FrameLimit, OutcomeCertainty, ServerHandle,
+        ServerIncoming, ServerRequest, ServerRequestStream, ServerStream, SessionError,
+        SessionOptions, TransportOptions,
     },
     types::{
         ManifestFormatRange, Status,
@@ -20,6 +20,37 @@ use review_protocol::{
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Returns a minimal synthetic detection event, told apart by `score`.
+fn detection_event(score: f64) -> review_protocol::types::DetectionEvent {
+    use review_protocol::types::{
+        Detail, DetectionEvent, DetectionModel, PortScanDetail, PrimarySubject, RawEventKind,
+        Target, TimeWindow,
+    };
+    DetectionEvent {
+        time: jiff::Timestamp::UNIX_EPOCH,
+        sensor: None,
+        detection_model: DetectionModel::PortScan,
+        raw_event_kind: RawEventKind::Conn,
+        category: None,
+        target: Target::Subject {
+            primary: PrimarySubject::Cluster {
+                clustering_model: 0,
+                cluster_id: 1,
+            },
+            related_ips: Vec::new(),
+            window: TimeWindow {
+                start: jiff::Timestamp::UNIX_EPOCH,
+                end: jiff::Timestamp::UNIX_EPOCH,
+            },
+        },
+        score,
+        detail: Detail::PortScan(PortScanDetail {
+            resp_ports: vec![22],
+            proto: 6,
+        }),
+    }
+}
 
 fn claims() -> AgentInfo {
     AgentInfo {
@@ -119,8 +150,8 @@ async fn request_stream(incoming: &mut ServerIncoming) -> ServerRequestStream {
     stream
 }
 
-async fn event_stream(incoming: &mut ServerIncoming) -> EventReceiver {
-    let ServerStream::Events(stream) = incoming.accept().await.unwrap() else {
+async fn event_stream(incoming: &mut ServerIncoming) -> DetectionEventReceiver {
+    let ServerStream::DetectionEvents(stream) = incoming.accept().await.unwrap() else {
         panic!("expected an event stream");
     };
     stream
@@ -543,16 +574,11 @@ async fn transport_failure_before_open_is_not_sent() {
 
 #[tokio::test]
 async fn event_stream_round_trip_and_resumption() {
-    use review_protocol::types::{EventKind, EventMessage};
     let (server, mut incoming, agent, _) = sessions(SessionOptions::legacy_compatible()).await;
-    let event = EventMessage {
-        time: jiff::Timestamp::UNIX_EPOCH,
-        kind: EventKind::HttpThreat,
-        fields: vec![1, 2, 3],
-    };
+    let event = detection_event(1.0);
     let ((), received) = tokio::join!(
         async {
-            let mut sender = agent.open_event_stream().await.unwrap();
+            let mut sender = agent.open_detection_event_stream().await.unwrap();
             sender.start(&event).unwrap();
             sender.flush().await.unwrap();
             sender.finish().await.unwrap();
@@ -564,15 +590,13 @@ async fn event_stream_round_trip_and_resumption() {
             event
         }
     );
-    assert_eq!(received.fields, event.fields);
-    assert!(matches!(received.kind, EventKind::HttpThreat));
+    assert_eq!(received, event);
     // Handles retain the connection after the event owners finish.
     assert_eq!(server.id(), server.clone().id());
 }
 
 #[tokio::test]
 async fn retained_event_header_and_payload_resume_after_cancellation() {
-    use review_protocol::types::{EventKind, EventMessage};
     let (manager, node) = connections().await;
     let info = claims();
     let (manager_session, _node_session) = tokio::join!(
@@ -593,11 +617,7 @@ async fn retained_event_header_and_payload_resume_after_cancellation() {
         tokio::pin!(future);
         assert!(tokio_test::task::spawn(future.as_mut()).poll().is_pending());
     }
-    let event = EventMessage {
-        time: jiff::Timestamp::UNIX_EPOCH,
-        kind: EventKind::HttpThreat,
-        fields: vec![4, 5, 6],
-    };
+    let event = detection_event(2.0);
     let payload = bincode::serde::encode_to_vec(&event, bincode::config::standard()).unwrap();
     send.write_all(&[0]).await.unwrap();
     send.write_all(&u32::try_from(payload.len()).unwrap().to_be_bytes())
@@ -611,7 +631,7 @@ async fn retained_event_header_and_payload_resume_after_cancellation() {
     }
     send.write_all(&payload[1..]).await.unwrap();
     send.finish().unwrap();
-    assert_eq!(sequence.next().await.unwrap().unwrap().fields, event.fields);
+    assert_eq!(sequence.next().await.unwrap().unwrap(), event);
     assert!(sequence.next().await.unwrap().is_none());
 }
 
@@ -919,7 +939,7 @@ async fn stalled_request_and_event_headers_do_not_block_other_streams() {
         for _ in 0..2 {
             match incoming.accept().await.unwrap() {
                 ServerStream::Requests(stream) => requests = Some(stream),
-                ServerStream::Events(stream) => events = Some(stream),
+                ServerStream::DetectionEvents(stream) => events = Some(stream),
             }
         }
         (requests.unwrap(), events.unwrap())
@@ -983,7 +1003,7 @@ async fn engine_commands_preserve_arguments_and_remote_rejection() {
     let train = TrainModelRequest {
         run_id: 300,
         model: "model".into(),
-        definition: "event_kind = \"http\"".into(),
+        definition: "raw_event_kind = \"http\"".into(),
     };
     let clone = CloneModelRequest {
         run_id: 301,
@@ -1044,7 +1064,10 @@ async fn engine_commands_preserve_arguments_and_remote_rejection() {
 
 #[tokio::test]
 async fn engine_reports_preserve_arguments_and_remote_rejection() {
-    use review_protocol::types::{DetectorState, DetectorStatusReport, ReportedRunState};
+    use review_protocol::types::{
+        DetectionModel, DetectionModelStatus, DetectorState, DetectorStatusReport, ExcludedCount,
+        ReportedRunState,
+    };
     let (_, mut incoming, engine, _) = sessions(SessionOptions::legacy_compatible()).await;
     let report = DetectorStatusReport {
         detector_id: -3,
@@ -1054,6 +1077,23 @@ async fn engine_reports_preserve_arguments_and_remote_rejection() {
         reason: Some("disabled".into()),
         events: 0,
         sources: Vec::new(),
+        detection_models: vec![
+            DetectionModelStatus {
+                detection_model: DetectionModel::TorExitNode,
+                skipped: Some("no Tor exit node list".into()),
+                truncated: 0,
+            },
+            DetectionModelStatus {
+                detection_model: DetectionModel::PortScan,
+                skipped: None,
+                truncated: 12,
+            },
+        ],
+        excluded: vec![ExcludedCount {
+            entry: (1 << 53) + 1,
+            day: jiff::civil::date(2026, 3, 15),
+            count: 4,
+        }],
     };
     let ((), ()) = tokio::join!(
         async {
@@ -1106,6 +1146,101 @@ async fn engine_reports_preserve_arguments_and_remote_rejection() {
             };
             assert_eq!(request, report);
             reply.respond(Err("unknown detector".into())).await.unwrap();
+            stream.finish().unwrap();
+        }
+    );
+}
+
+/// Every detection event of the batch, with one that fails `validate` among
+/// valid ones, crosses the session-layer stream as sent and in order, both
+/// through `next` and through the owned runner.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn detection_event_stream_delivers_every_event_unvalidated() {
+    use std::sync::Mutex;
+
+    use review_protocol::{
+        server::DetectionEventStreamHandler,
+        test::{INVALID_DETECTION_EVENT, detection_events},
+        types::DetectionEvent,
+    };
+
+    #[derive(Clone, Default)]
+    struct Collect(Arc<Mutex<Vec<DetectionEvent>>>);
+
+    #[async_trait::async_trait]
+    impl DetectionEventStreamHandler for Collect {
+        async fn handle_detection_event(&mut self, event: DetectionEvent) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(event);
+            Ok(())
+        }
+
+        async fn on_error(&mut self, error: &str) -> std::io::Result<()> {
+            panic!("unexpected stream error: {error}");
+        }
+    }
+
+    let events = detection_events();
+    assert!(events[INVALID_DETECTION_EVENT].validate().is_err());
+    let (_, mut incoming, agent, _) = sessions(SessionOptions::legacy_compatible()).await;
+
+    let send = || async {
+        let mut sender = agent.open_detection_event_stream().await.unwrap();
+        for event in &events {
+            sender.start(event).unwrap();
+            sender.flush().await.unwrap();
+        }
+        sender.finish().await.unwrap();
+    };
+
+    let ((), received) = tokio::join!(send(), async {
+        let mut sequence = event_stream(&mut incoming).await;
+        let mut received = Vec::new();
+        while let Some(event) = sequence.next().await.unwrap() {
+            received.push(event);
+        }
+        received
+    });
+    assert_eq!(received, events);
+
+    let collect = Collect::default();
+    let ((), result) = tokio::join!(send(), async {
+        event_stream(&mut incoming).await.run(collect.clone()).await
+    });
+    result.unwrap();
+    assert_eq!(*collect.0.lock().unwrap(), events);
+}
+
+/// The allowlist and blocklist pulls carry every item, in the order the
+/// manager supplied, with ids above 2^53 and overlapping groups intact.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn list_pulls_preserve_every_item_in_order() {
+    use review_protocol::test::network_list_items;
+
+    let items = network_list_items();
+    let mut reversed = items.clone();
+    reversed.reverse();
+    let (_, mut incoming, agent, _) = sessions(SessionOptions::legacy_compatible()).await;
+    let ((), ()) = tokio::join!(
+        async {
+            assert_eq!(agent.get_allowlist().await.unwrap(), items);
+            assert_eq!(agent.get_blocklist().await.unwrap(), reversed);
+        },
+        async {
+            let mut stream = request_stream(&mut incoming).await;
+            let ServerRequest::GetAllowlist { reply, .. } = stream.next().await.unwrap().unwrap()
+            else {
+                panic!("wrong request")
+            };
+            reply.respond(Ok(items.clone())).await.unwrap();
+            stream.finish().unwrap();
+            let mut stream = request_stream(&mut incoming).await;
+            let ServerRequest::GetBlocklist { reply, .. } = stream.next().await.unwrap().unwrap()
+            else {
+                panic!("wrong request")
+            };
+            reply.respond(Ok(reversed.clone())).await.unwrap();
             stream.finish().unwrap();
         }
     );
@@ -1254,13 +1389,8 @@ async fn manager_answers_unserved_codes_like_the_legacy_dispatcher() {
 
 #[tokio::test]
 async fn undecodable_event_leaves_the_stream_aligned() {
-    use review_protocol::types::{EventKind, EventMessage};
     let (mut incoming, _, _, node) = raw_sessions(SessionOptions::legacy_compatible()).await;
-    let event = EventMessage {
-        time: jiff::Timestamp::UNIX_EPOCH,
-        kind: EventKind::HttpThreat,
-        fields: vec![7, 8, 9],
-    };
+    let event = detection_event(3.0);
     let payload = bincode::serde::encode_to_vec(&event, bincode::config::standard()).unwrap();
     let mut send = node.open_uni().await.unwrap();
     send.write_all(&[0, 0]).await.unwrap();
@@ -1277,7 +1407,7 @@ async fn undecodable_event_leaves_the_stream_aligned() {
         sequence.next().await,
         Err(SessionError::Malformed { .. })
     ));
-    assert_eq!(sequence.next().await.unwrap().unwrap().fields, event.fields);
+    assert_eq!(sequence.next().await.unwrap().unwrap(), event);
     assert!(sequence.next().await.unwrap().is_none());
 }
 

@@ -10,8 +10,8 @@ use super::Connection;
 use crate::{
     server,
     types::{
-        DataSource, DataSourceKey, DetectorStatusReport, HostNetworkGroup, ReportedRunState,
-        SamplingPolicy, UserAgent,
+        DataSource, DataSourceKey, DetectorStatusReport, HostNetworkGroup, NetworkListItem,
+        ReportedRunState, SamplingPolicy, UserAgent,
     },
     unary_request,
 };
@@ -106,24 +106,26 @@ impl Connection {
         res.map_err(io::Error::other)
     }
 
-    /// Fetches the list of allowed networks from the server.
+    /// Fetches the allowlist entries from the server, in the order the server
+    /// sent them.
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails or the response is invalid.
-    pub async fn get_allowlist(&self) -> io::Result<HostNetworkGroup> {
-        let res: Result<HostNetworkGroup, String> =
+    pub async fn get_allowlist(&self) -> io::Result<Vec<NetworkListItem>> {
+        let res: Result<Vec<NetworkListItem>, String> =
             request(self, server::RequestCode::GetAllowlist, ()).await?;
         res.map_err(io::Error::other)
     }
 
-    /// Fetches the list of blocked networks from the server.
+    /// Fetches the blocklist entries from the server, in the order the server
+    /// sent them.
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails or the response is invalid.
-    pub async fn get_blocklist(&self) -> io::Result<HostNetworkGroup> {
-        let res: Result<HostNetworkGroup, String> =
+    pub async fn get_blocklist(&self) -> io::Result<Vec<NetworkListItem>> {
+        let res: Result<Vec<NetworkListItem>, String> =
             request(self, server::RequestCode::GetBlocklist, ()).await?;
         res.map_err(io::Error::other)
     }
@@ -375,21 +377,25 @@ impl Connection {
         res.map_err(io::Error::other)
     }
 
-    /// Inserts event labels into the server.
+    /// Sends the detection events `model_id` produced in `round` to the
+    /// server.
+    ///
+    /// The events are sent as given; this does not call
+    /// [`DetectionEvent::validate`](crate::types::DetectionEvent::validate).
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails or the response is invalid.
-    pub async fn insert_event_labels(
+    pub async fn insert_detection_events(
         &self,
         model_id: u32,
         round: u32,
-        event_labels: &[crate::types::EventMessage],
+        events: &[crate::types::DetectionEvent],
     ) -> io::Result<()> {
         let res: Result<(), String> = request(
             self,
-            server::RequestCode::InsertEventLabels,
-            &(model_id, round, event_labels),
+            server::RequestCode::InsertDetectionEvents,
+            &(model_id, round, events),
         )
         .await?;
         res.map_err(io::Error::other)
@@ -676,6 +682,8 @@ mod tests {
                 reason: None,
                 events: 0,
                 sources: Vec::new(),
+                detection_models: Vec::new(),
+                excluded: Vec::new(),
             };
             let error = client_conn
                 .report_detector_status(&report)
@@ -717,10 +725,8 @@ mod tests {
     #[tokio::test]
     async fn get_allowlist() {
         run_test(|client_conn| async move {
-            let client_res = client_conn.get_allowlist().await;
-            assert!(client_res.is_ok());
-            let received_allowlist = client_res.unwrap();
-            assert_eq!(received_allowlist.hosts.len(), 1);
+            let received_allowlist = client_conn.get_allowlist().await.unwrap();
+            assert_eq!(received_allowlist, crate::test::network_list_items());
         })
         .await;
     }
@@ -728,10 +734,10 @@ mod tests {
     #[tokio::test]
     async fn get_blocklist() {
         run_test(|client_conn| async move {
-            let client_res = client_conn.get_blocklist().await;
-            assert!(client_res.is_ok());
-            let received_blocklist = client_res.unwrap();
-            assert_eq!(received_blocklist.hosts.len(), 1);
+            let received_blocklist = client_conn.get_blocklist().await.unwrap();
+            let mut expected = crate::test::network_list_items();
+            expected.reverse();
+            assert_eq!(received_blocklist, expected);
         })
         .await;
     }
@@ -947,15 +953,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_event_labels() {
+    async fn insert_detection_events() {
         run_test(|client_conn| async move {
-            let data = vec![crate::types::EventMessage {
-                time: jiff::Timestamp::now(),
-                kind: crate::types::EventKind::ExtraThreat,
-                fields: vec![0x01, 0x02],
-            }];
-            let client_res = client_conn.insert_event_labels(1, 100, &data).await;
-            assert!(client_res.is_ok());
+            // The handler accepts only this batch, whole and in order,
+            // including the event that fails `validate`.
+            let events = crate::test::detection_events();
+            assert!(
+                events[crate::test::INVALID_DETECTION_EVENT]
+                    .validate()
+                    .is_err()
+            );
+            client_conn
+                .insert_detection_events(1, 100, &events)
+                .await
+                .unwrap();
         })
         .await;
     }

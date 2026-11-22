@@ -50,8 +50,8 @@ use crate::legacy_transport as oinq;
 use crate::{
     client::RequestCode,
     types::{
-        CloneModelRequest, CustomerDataDeletionRequest, HostNetworkGroup, Process, ResourceUsage,
-        SamplingPolicy, TrafficFilterRule, TrainModelRequest,
+        CloneModelRequest, CustomerDataDeletionRequest, HostNetworkGroup, NetworkListItem, Process,
+        ResourceUsage, SamplingPolicy, TrafficFilterRule, TrainModelRequest,
         node::{
             InstallPreflight, NodeEnrollRequest, NodeEnrollResponse, NodeHostnameRequest,
             NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
@@ -669,11 +669,13 @@ pub trait Handler: Send {
         return Err("not supported".to_string());
     }
 
-    async fn allowlist(&mut self, _list: HostNetworkGroup) -> Result<(), String> {
+    /// Handles agent request 15, the allowlist entries in the order sent.
+    async fn allowlist(&mut self, _list: Vec<NetworkListItem>) -> Result<(), String> {
         return Err("not supported".to_string());
     }
 
-    async fn blocklist(&mut self, _list: HostNetworkGroup) -> Result<(), String> {
+    /// Handles agent request 16, the blocklist entries in the order sent.
+    async fn blocklist(&mut self, _list: Vec<NetworkListItem>) -> Result<(), String> {
         return Err("not supported".to_string());
     }
 
@@ -1446,14 +1448,14 @@ pub async fn handle<H: Handler>(
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::Allowlist => {
-                let allowlist = decode_args::<HostNetworkGroup>(send, code, body, None).await?;
+                let allowlist = decode_args::<Vec<NetworkListItem>>(send, code, body, None).await?;
                 let result = handler.allowlist(allowlist).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
             RequestCode::Blocklist => {
-                let blocklist = decode_args::<HostNetworkGroup>(send, code, body, None).await?;
+                let blocklist = decode_args::<Vec<NetworkListItem>>(send, code, body, None).await?;
                 let result = handler.blocklist(blocklist).await;
                 send_response(send, &mut buf, result)
                     .await
@@ -1805,7 +1807,7 @@ mod tests {
         let train = crate::types::TrainModelRequest {
             run_id: 7,
             model: "http-baseline".to_string(),
-            definition: "event_kind = \"http\"".to_string(),
+            definition: "raw_event_kind = \"http\"".to_string(),
         };
         let clone = crate::types::CloneModelRequest {
             run_id: 8,
