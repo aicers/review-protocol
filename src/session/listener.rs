@@ -32,8 +32,25 @@ pub struct ProtocolWindow {
 impl ProtocolWindow {
     /// Validates the requirement and advertised version before accepting peers.
     ///
+    /// For example, `ProtocolWindow::new(">=0.48.0", "0.49.0")` accepts agents
+    /// that satisfy `>=0.48.0` and are at most `0.49.0`, and sends `0.49.0` in
+    /// the handshake success reply.
+    ///
     /// # Errors
     /// Returns [`SessionError::Malformed`] for invalid semver input.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "server")]
+    /// # fn example() -> Result<(), review_protocol::session::SessionError> {
+    /// use review_protocol::session::ProtocolWindow;
+    ///
+    /// let window = ProtocolWindow::new(">=0.48.0", "0.49.0")?;
+    /// assert_eq!(window.advertised_version(), "0.49.0");
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(requirement: &str, advertised: &str) -> Result<Self, SessionError> {
         Ok(Self {
             requirement: VersionReq::parse(requirement).map_err(SessionError::malformed)?,
@@ -123,6 +140,44 @@ pub struct ServerListenerOptions {
 /// enabled. Applications acquire their own pending-work permits and supervise
 /// each accepted handshake independently. The listener spawns no application
 /// tasks. Accepted sessions retain the transport resources after listener drop.
+///
+/// # Examples
+///
+/// ```no_run
+/// # #[cfg(feature = "server")]
+/// # async fn example(
+/// #     tls: std::sync::Arc<rustls::ServerConfig>,
+/// #     context: review_protocol::auth::AuthorizationContext,
+/// #     policy: std::sync::Arc<dyn review_protocol::auth::AuthorizerV2>,
+/// # ) -> Result<(), review_protocol::session::SessionError> {
+/// use std::{net::SocketAddr, sync::Arc, time::Duration};
+///
+/// use review_protocol::session::{
+///     ProtocolWindow, ServerListener, ServerListenerOptions, ServerTransportOptions,
+///     SessionOptions,
+/// };
+///
+/// let options = ServerListenerOptions {
+///     transport: ServerTransportOptions::default(),
+///     session: SessionOptions::legacy_compatible(),
+///     protocol: ProtocolWindow::new(">=0.48.0", "0.49.0")?,
+///     handshake_timeout: Duration::from_secs(5),
+/// };
+/// let listener = ServerListener::bind("[::1]:0".parse::<SocketAddr>().unwrap(), tls, options)?;
+/// let _addr = listener.local_addr()?;
+///
+/// // Acquire an application-owned permit before accept, then supervise each
+/// // pending handshake independently.
+/// if let Some(pending) = listener.accept().await? {
+///     let unadmitted = pending.handshake().await?;
+///     let (_handle, _incoming) = unadmitted.admit(context, policy);
+/// }
+///
+/// listener.shutdown();
+/// listener.wait_idle().await;
+/// # Ok(())
+/// # }
+/// ```
 pub struct ServerListener {
     endpoint: Endpoint,
     options: Arc<ServerListenerOptions>,

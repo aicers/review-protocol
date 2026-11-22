@@ -27,7 +27,7 @@ impl super::ServerHandle {
         let operation = async {
             let (agent, mut exchange) = server_handshake(&connection, &options, &window).await?;
             exchange.finish()?;
-            Ok(agent)
+            Ok::<_, SessionError>(agent)
         };
         let agent = if let Some(timeout) = options.operation_timeout {
             tokio::time::timeout(timeout, operation)
