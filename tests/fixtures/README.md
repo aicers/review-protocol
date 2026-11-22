@@ -41,3 +41,80 @@ bincode integer bytes (`300_u32` is `fb 2c 01`, not a fixed-width body).
 A tail ending before an entire optional field is valid; a present `Some` marker
 without its value is malformed. Tests distinguish those cases and compare the
 legacy and guarded decoders against these same fixtures.
+
+## Server processing in 0.27.0
+
+The `current/server-*.bin` fixtures were captured against the released
+0.27.0 source at `4b35f3e` before the typed server runners were added. They
+include framing. Requests were composed from literal little-endian codes and
+bincode 2.0.1 standard serde argument declarations. The legacy
+`handle_authorized_with_context` emitted the captured response bytes over
+loopback. Event bytes were composed from the legacy two-byte header and
+`EventMessage` codec, then checked through `process_event_stream`.
+
+| Code | Request | Legacy handler | Successful result |
+| ---- | ------- | -------------- | ----------------- |
+| 0 | GetDataSource | `get_data_source` | Optional data source |
+| 1 | GetIndicator | `get_indicator` | Set of indicator rows |
+| 2 | GetMaxEventIdNum | Caller handoff | Caller-defined |
+| 3 | GetModel | `get_model` | Model bytes |
+| 4 | GetModelNames | `get_model_names` | Model names |
+| 5 | InsertColumnStatistics | `insert_column_statistics` | Unit |
+| 6 | InsertModel | `insert_model` | Model ID |
+| 7 | InsertTimeSeries | `insert_time_series` | Unit |
+| 8 | RemoveModel | `remove_model` | Unit |
+| 9 | RemoveOutliers | Caller handoff | Caller-defined |
+| 10 | UpdateClusters | `update_clusters` | Unit |
+| 11 | UpdateModel | `update_model` | Model ID |
+| 12 | UpdateOutliers | `update_outliers` | Unit |
+| 13 | InsertEventLabels | `insert_event_labels` | Unit |
+| 14 | GetDataSourceList | Caller handoff | Caller-defined |
+| 15 | GetLabelDbPatterns | `get_labeldb_patterns` | Optional databases |
+| 20 | InsertDataSource | `insert_data_source` | Data source ID |
+| 23 | RenewCertificate | `renew_certificate` | Certificate and key strings |
+| 24 | GetTrustedDomainList | `get_trusted_domain_list` | Domain strings |
+| 25 | GetOutliers | `get_outliers` | Names and lists of IDs |
+| 26 | GetTorExitNodeList | `get_tor_exit_node_list` | Node strings |
+| 31 | GetInternalNetworkList | `get_internal_network_list` | Network group |
+| 32 | GetAllowlist | `get_allowlist` | Host network group |
+| 33 | GetBlocklist | `get_blocklist` | Host network group |
+| 34 | GetPretrainedModel | `get_pretrained_model` | Model bytes |
+| 35 | GetTrustedUserAgentList | `get_trusted_user_agent_list` | User agents |
+| 36 | GetConfig | `get_config` | Configuration string |
+| 37 | UpdateHostOpenedPorts | `update_host_ports` | Unit |
+| 38 | UpdateHostOsAgents | `update_host_user_agents` | Unit |
+| 39 | GetSamplingPolicyList | `get_sampling_policy_list` | Sampling policies |
+| 40 | ReportCustomerDataDeletion | `report_customer_data_deletion` | Unit |
+| 41 | UploadRunModel | `upload_run_model` | Unit |
+| 42 | ReportRun | `report_run` | Unit |
+| 43 | ReportActiveRuns | `report_active_runs` | Unit |
+| 44 | ReportDetectorStatus | `report_detector_status` | Unit |
+| Other | Unknown | None | None |
+
+The request and response streams exercise all 32 built-in operations,
+including default `not supported` responses, a handler refusal, and success
+responses of several shapes. Certificate renewal includes ignored argument
+bytes. After every handler result the dispatcher reads the next frame. Clean
+EOF completes the stream. The fixture driver queues FIN after the legacy
+dispatcher returns; the typed runner owns that step.
+
+The denial fixture sends a second request on the same stream and pins the
+`authorization denied` response followed by termination. The denial is
+`PermissionDenied` with classification `Forbidden` in
+the legacy API. A truly unknown numeric
+code sends `unknown request code` and returns `InvalidData` with
+classification `NotSupported`.
+Each terminal fixture contains another request to verify dispatch stops.
+The delegated fixture pins the call-site handoff with an opaque body and a
+subsequent request. Complete malformed arguments return a local error with
+no response. The legacy dispatcher classifies the argument errors for
+`GetModel` and `GetOutliers` as `InvalidArgs`. Other parse errors retain their
+original I/O error.
+
+The event fixture has two ordered events, a complete undecodable frame in
+between, and nonzero reserved header bytes. The truncated event fixture
+shows the legacy helper invoking `on_stream_end` after a partial payload.
+The truncated request fixture shows the legacy dispatcher returning clean
+completion after a partial payload. Typed framing reports truncation as an
+error to prevent incomplete messages from being counted as complete streams.
+A truncated two-byte event header remains an unexpected EOF.

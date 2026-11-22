@@ -244,6 +244,11 @@ pub trait EventStreamHandler {
     }
 }
 
+#[cfg(feature = "server")]
+pub(crate) const AUTHORIZATION_DENIED: &str = "authorization denied";
+#[cfg(feature = "server")]
+pub(crate) const UNKNOWN_REQUEST_CODE: &str = "unknown request code";
+
 /// Numeric representation of the message types that a server should handle.
 #[cfg(any(feature = "client", feature = "server"))]
 #[derive(Clone, Copy, Debug, Eq, FromPrimitive, IntoPrimitive, PartialEq)]

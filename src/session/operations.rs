@@ -1,12 +1,19 @@
 //! Typed protocol adapters sharing bounded exchange machinery.
+#[cfg(feature = "server")]
+use std::{
+    collections::{HashMap, HashSet},
+    net::IpAddr,
+};
 use std::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
     sync::Arc,
 };
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+#[cfg(feature = "server")]
+use super::ServerRunError;
 use super::{
     OutcomeCertainty, SessionError, Shared,
     decode::decode,
@@ -25,6 +32,15 @@ use crate::types::node::{
 use crate::types::{
     CloneModelRequest, CustomerDataDeletionReport, DetectorStatusReport, HostNetworkGroup,
     ReportedRunState, TrainModelRequest,
+};
+#[cfg(feature = "server")]
+use crate::{
+    auth::{AuthorizationContext, AuthorizerV2},
+    server::{Handler, RequestCode as ServerCode},
+    types::{
+        ColumnStatisticsUpdate, DataSource, DataSourceKey, EventMessage, OutlierInfo,
+        SamplingPolicy, TimeSeriesUpdate, UpdateClusterRequest, UserAgent,
+    },
 };
 
 /// A single-use typed response capability borrowing its request stream.
@@ -86,8 +102,8 @@ impl Drop for ExchangeLease<'_> {
 impl ExchangeLease<'_> {
     /// Decodes the arguments of request `code` and recycles its frame.
     ///
-    /// Arguments that cannot be decoded are answered with the legacy dispatcher's
-    /// error text before the stream ends at this frame boundary, so a peer reads
+    /// Low-level streams answer undecodable arguments with a rejection
+    /// before the stream ends at this frame boundary, so a peer reads
     /// a remote rejection naming the code rather than a reset. The returned error
     /// is the decoding or limit error; a failure to send the answer cannot replace
     /// it. Cancelling the answer aborts the stream, which was ending anyway.
@@ -113,6 +129,27 @@ impl ExchangeLease<'_> {
             let _ = self.finish();
         }
         Err(error)
+    }
+
+    #[cfg(feature = "server")]
+    async fn server_arguments<T: DeserializeOwned>(
+        &mut self,
+        code: u32,
+        frame: oinq::frame::Frame,
+        limit: usize,
+        report_bad_arguments: bool,
+    ) -> Result<T, SessionError> {
+        if report_bad_arguments {
+            return self.arguments(code, frame, limit).await;
+        }
+
+        // The legacy server dispatcher returns argument errors without a response.
+        let result = arguments(&frame, limit);
+        self.recycle(frame)?;
+        if result.is_err() {
+            self.complete();
+        }
+        result
     }
 }
 
@@ -151,26 +188,10 @@ impl RequestOwner {
         unserved: fn(u32) -> String,
     ) -> Result<Option<(u32, oinq::frame::Frame)>, SessionError> {
         loop {
-            if self.answering {
-                self.exchange.flush().await?;
-                self.answering = false;
-            }
-            if self.ended {
-                return Ok(None);
-            }
-            let Some(frame) = self.exchange.next_frame().await? else {
-                self.ended = true;
-                self.exchange.complete();
+            self.flush_unserved().await?;
+            let Some((code, frame)) = self.read_request().await? else {
                 return Ok(None);
             };
-            let Some(code) = frame.as_bytes().get(..4) else {
-                self.exchange.cancel();
-                return Err(malformed("request code is truncated"));
-            };
-            let code = u32::from_le_bytes(
-                code.try_into()
-                    .expect("the request code slice has four bytes"),
-            );
             if serves(code) {
                 return Ok(Some((code, frame)));
             }
@@ -179,35 +200,44 @@ impl RequestOwner {
             self.answering = true;
         }
     }
+
+    async fn flush_unserved(&mut self) -> Result<(), SessionError> {
+        if self.answering {
+            self.exchange.flush().await?;
+            self.answering = false;
+        }
+        Ok(())
+    }
+
+    async fn read_request(&mut self) -> Result<Option<(u32, oinq::frame::Frame)>, SessionError> {
+        if self.ended {
+            return Ok(None);
+        }
+        let Some(frame) = self.exchange.next_frame().await? else {
+            self.ended = true;
+            self.exchange.complete();
+            return Ok(None);
+        };
+        let Some(code) = frame.as_bytes().first_chunk::<4>() else {
+            self.exchange.cancel();
+            return Err(malformed("request code is truncated"));
+        };
+        Ok(Some((u32::from_le_bytes(*code), frame)))
+    }
 }
 
-/// Whether [`ServerRequestStream::next`] dispatches request `code`.
+/// Whether a code is handed back to the caller by the legacy dispatcher.
 #[cfg(feature = "server")]
-fn server_serves(code: u32) -> bool {
-    use crate::server::RequestCode as C;
+fn server_delegates(code: ServerCode) -> bool {
     matches!(
-        C::from(code),
-        C::GetConfig
-            | C::GetModel
-            | C::GetPretrainedModel
-            | C::GetModelNames
-            | C::GetAllowlist
-            | C::GetBlocklist
-            | C::InsertModel
-            | C::UpdateModel
-            | C::RemoveModel
-            | C::ReportCustomerDataDeletion
-            | C::UploadRunModel
-            | C::ReportRun
-            | C::ReportActiveRuns
-            | C::ReportDetectorStatus
+        code,
+        ServerCode::GetMaxEventIdNum | ServerCode::RemoveOutliers | ServerCode::GetDataSourceList
     )
 }
 
-/// The legacy manager dispatcher's answer to a code it does not serve.
 #[cfg(feature = "server")]
 fn server_unserved(_code: u32) -> String {
-    "unknown request code".to_string()
+    crate::server::UNKNOWN_REQUEST_CODE.to_owned()
 }
 
 /// Whether [`AgentRequestStream::next`] dispatches request `code`.
@@ -240,8 +270,8 @@ fn agent_unserved(code: u32) -> String {
     format!("unknown request code: {code}")
 }
 
-fn arguments<T: DeserializeOwned>(
-    frame: &oinq::frame::Frame,
+fn arguments<'a, T: Deserialize<'a>>(
+    frame: &'a oinq::frame::Frame,
     limit: usize,
 ) -> Result<T, SessionError> {
     let bytes = frame
@@ -265,11 +295,34 @@ pub enum ServerStream {
 
 /// The unique server-side owner of incoming stream acceptance.
 #[cfg(feature = "server")]
-pub struct ServerIncoming(pub(super) Arc<Shared>);
+pub struct ServerIncoming {
+    shared: Arc<Shared>,
+    authorization: Option<Arc<ServerAuthorization>>,
+}
 #[cfg(feature = "server")]
 impl ServerIncoming {
     pub(super) fn new(shared: Arc<Shared>) -> Self {
-        Self(shared)
+        Self {
+            shared,
+            authorization: None,
+        }
+    }
+
+    /// Binds the application's authenticated context and policy for subsequently
+    /// accepted request streams.
+    ///
+    /// The transport handshake supplies peer claims. The application interprets
+    /// verified credentials and constructs the authorization context. Event
+    /// streams have their own application handler. This binding adds no wire
+    /// messages.
+    #[must_use]
+    pub fn with_authorization(
+        mut self,
+        context: AuthorizationContext,
+        policy: Arc<dyn AuthorizerV2>,
+    ) -> Self {
+        self.authorization = Some(Arc::new(ServerAuthorization { context, policy }));
+        self
     }
 
     /// Accepts the next request or event stream without reading its contents.
@@ -280,300 +333,451 @@ impl ServerIncoming {
     /// Returns a classified transport error when the connection closes.
     pub async fn accept(&mut self) -> Result<ServerStream, SessionError> {
         tokio::select! {
-            result = self.0.connection.accept_bi() => {
+            result = self.shared.connection.accept_bi() => {
                 let (send, recv) = result.map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent))?;
-                Ok(ServerStream::Requests(ServerRequestStream(RequestOwner::new(send, recv, self.0.options.clone()))))
+                Ok(ServerStream::Requests(ServerRequestStream {
+                    owner: RequestOwner::new(send, recv, self.shared.options.clone()),
+                    authorization: self.authorization.clone(),
+                }))
             }
-            result = self.0.connection.accept_uni() => {
+            result = self.shared.connection.accept_uni() => {
                 let recv = result.map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent))?;
-                Ok(ServerStream::Events(super::EventReceiver::new(recv, self.0.options.events)))
+                Ok(ServerStream::Events(super::EventReceiver::new(recv, self.shared.options.events)))
             }
         }
     }
 }
 
+#[cfg(feature = "server")]
+struct ServerAuthorization {
+    context: AuthorizationContext,
+    policy: Arc<dyn AuthorizerV2>,
+}
+
 /// A manager-side request stream that preserves multiple invocations.
 ///
 /// Each response borrows this owner until completed. Cancelling `next` retains
-/// partial framing; dropping the stream or an unfinished response aborts it.
+/// partial framing. Dropping the stream or an unfinished response aborts it.
 #[cfg(feature = "server")]
-pub struct ServerRequestStream(RequestOwner);
+pub struct ServerRequestStream {
+    owner: RequestOwner,
+    authorization: Option<Arc<ServerAuthorization>>,
+}
+
 #[cfg(feature = "server")]
 impl ServerRequestStream {
     /// Finishes the stream at a request boundary, without waiting for processing acknowledgment.
+    ///
     /// # Errors
     /// Returns a classified transport error if FIN cannot be queued.
     pub fn finish(mut self) -> Result<(), SessionError> {
-        self.0.exchange.finish()
+        self.owner.exchange.finish()
     }
 
-    /// Reads the next invocation, returning `None` only at a clean frame boundary EOF.
+    /// Reads the next built-in invocation, returning `None` only at a clean frame boundary EOF.
     ///
-    /// Authorize every returned request. Respond before reading another request.
+    /// This low-level method leaves authorization to the caller. Respond before
+    /// reading another request. Unserved codes get an error response and reading
+    /// continues. Use [`Self::run`] for the authorized legacy dispatcher, including
+    /// its caller handoff and terminal unknown-code behavior.
+    ///
     /// # Errors
     /// Returns classified transport, malformed request, or limit errors and aborts the stream.
-    #[allow(clippy::too_many_lines)]
     pub async fn next(&mut self) -> Result<Option<ServerRequest<'_>>, SessionError> {
-        let Some((code, frame)) = self.0.next(server_serves, server_unserved).await? else {
+        let Some((code, frame)) = self.owner.next(server_serves, server_unserved).await? else {
             return Ok(None);
         };
-        let limit = self.0.options.unary.get();
-        let mut exchange = ExchangeLease(Some(&mut self.0.exchange));
-        let request = match code {
-            code if code == u32::from(crate::server::RequestCode::GetConfig) => {
-                let request: () = exchange.arguments(code, frame, limit).await?;
-                ServerRequest::GetConfig {
-                    request,
-                    reply: Reply {
-                        exchange,
-                        response: PhantomData::<String>,
-                    },
-                }
+        self.decode_low_level_request(code, frame, true)
+            .await
+            .map(Some)
+    }
+
+    /// Processes requests sequentially using the authorization bound to this stream
+    /// by [`ServerIncoming::with_authorization`].
+    ///
+    /// The policy runs before parsing and invoking every recognized request,
+    /// including requests delegated to the application. The application supplies
+    /// the identity in the authorization context. Handler error strings are
+    /// sent unchanged and the stream continues. At clean EOF the response
+    /// direction is finished. A delegated request returns ownership to the caller.
+    ///
+    /// This future owns the stream and holds a shared handler reference. Poll it
+    /// or spawn and join it under application supervision. Dropping the future
+    /// resets/stops the stream and cancels any in-progress handler future.
+    /// Effects a handler already performed may remain.
+    ///
+    /// # Errors
+    /// Returns [`ServerRunError::MissingAuthorization`] for an unbound stream and
+    /// classified errors for denials, unknown codes, malformed input, limits, or
+    /// transport failure. A denial or unknown code ends dispatch and attempts
+    /// to send one error response. The local rejection is returned even if
+    /// sending the response fails. Malformed arguments finish the stream
+    /// without a response, matching the legacy server dispatcher.
+    pub async fn run<H: Handler + Sync + ?Sized>(
+        mut self,
+        handler: Arc<H>,
+    ) -> Result<ServerRequestOutcome, ServerRunError> {
+        let authorization = self
+            .authorization
+            .clone()
+            .ok_or(ServerRunError::MissingAuthorization)?;
+        // A caller can hand off a low-level read that suspended while answering
+        // an unserved code. Finish that response before reading the next request.
+        self.owner.flush_unserved().await?;
+        while let Some((code, frame)) = self.owner.read_request().await? {
+            let request_code = ServerCode::from(code);
+            let Some(service) = crate::service_id::from_server_request_code(request_code) else {
+                self.reject(crate::server::UNKNOWN_REQUEST_CODE).await;
+                return Err(ServerRunError::UnknownRequestCode { code });
+            };
+            if let Err(source) = authorization
+                .policy
+                .authorize_with_context(&authorization.context, &service)
+            {
+                self.reject(crate::server::AUTHORIZATION_DENIED).await;
+                return Err(ServerRunError::AuthorizationDenied { service, source });
             }
-            code if code == u32::from(crate::server::RequestCode::GetModel) => {
-                let request: String = exchange.arguments(code, frame, limit).await?;
-                ServerRequest::GetModel {
-                    request,
-                    reply: Reply {
-                        exchange,
-                        response: PhantomData::<Vec<u8>>,
-                    },
-                }
+            if server_delegates(request_code) {
+                let mut body = frame.into_bytes();
+                body.drain(..4);
+                return Ok(ServerRequestOutcome::Unhandled(UnhandledServerRequest {
+                    code,
+                    body,
+                    stream: Box::new(self),
+                }));
             }
-            code if code == u32::from(crate::server::RequestCode::GetPretrainedModel) => {
-                let request: String = exchange.arguments(code, frame, limit).await?;
-                ServerRequest::GetPretrainedModel {
-                    request,
-                    reply: Reply {
-                        exchange,
-                        response: PhantomData::<Vec<u8>>,
-                    },
+            self.dispatch_runner_request(
+                code,
+                frame,
+                &*handler,
+                authorization.context.peer_identity().name(),
+            )
+            .await?;
+        }
+        Ok(ServerRequestOutcome::Finished)
+    }
+
+    async fn dispatch_label_lookup<H: Handler + Sync + ?Sized>(
+        &mut self,
+        frame: oinq::frame::Frame,
+        handler: &H,
+    ) -> Result<(), SessionError> {
+        let limit = self.owner.options.unary.get();
+        let mut exchange = ExchangeLease(Some(&mut self.owner.exchange));
+        // Keep the frame alive through the handler call so the argument vector
+        // can borrow the names directly from the guarded decoder.
+        let response = {
+            let names = match arguments::<Vec<(&str, &str)>>(&frame, limit) {
+                Ok(names) => names,
+                Err(error) => {
+                    exchange.recycle(frame)?;
+                    exchange.complete();
+                    return Err(error);
                 }
-            }
-            code if code == u32::from(crate::server::RequestCode::GetModelNames) => {
-                let request: () = exchange.arguments(code, frame, limit).await?;
-                ServerRequest::GetModelNames {
-                    request,
-                    reply: Reply {
-                        exchange,
-                        response: PhantomData::<Vec<String>>,
-                    },
-                }
-            }
-            code if code == u32::from(crate::server::RequestCode::GetAllowlist) => {
-                let request: () = exchange.arguments(code, frame, limit).await?;
-                ServerRequest::GetAllowlist {
-                    request,
-                    reply: Reply {
-                        exchange,
-                        response: PhantomData::<HostNetworkGroup>,
-                    },
-                }
-            }
-            code if code == u32::from(crate::server::RequestCode::GetBlocklist) => {
-                let request: () = exchange.arguments(code, frame, limit).await?;
-                ServerRequest::GetBlocklist {
-                    request,
-                    reply: Reply {
-                        exchange,
-                        response: PhantomData::<HostNetworkGroup>,
-                    },
-                }
-            }
-            code if code == u32::from(crate::server::RequestCode::InsertModel) => {
-                let request: Vec<u8> = exchange.arguments(code, frame, limit).await?;
-                ServerRequest::InsertModel {
-                    request,
-                    reply: Reply {
-                        exchange,
-                        response: PhantomData::<u32>,
-                    },
-                }
-            }
-            code if code == u32::from(crate::server::RequestCode::UpdateModel) => {
-                let request: Vec<u8> = exchange.arguments(code, frame, limit).await?;
-                ServerRequest::UpdateModel {
-                    request,
-                    reply: Reply {
-                        exchange,
-                        response: PhantomData::<u32>,
-                    },
-                }
-            }
-            code if code == u32::from(crate::server::RequestCode::RemoveModel) => {
-                let request: String = exchange.arguments(code, frame, limit).await?;
-                ServerRequest::RemoveModel {
-                    request,
-                    reply: Reply {
-                        exchange,
-                        response: PhantomData::<()>,
-                    },
-                }
-            }
-            code if code == u32::from(crate::server::RequestCode::ReportCustomerDataDeletion) => {
-                let request: CustomerDataDeletionReport =
-                    exchange.arguments(code, frame, limit).await?;
-                ServerRequest::ReportCustomerDataDeletion {
-                    request,
-                    reply: Reply {
-                        exchange,
-                        response: PhantomData::<()>,
-                    },
-                }
-            }
-            code if code == u32::from(crate::server::RequestCode::UploadRunModel) => {
-                let request: (u32, Vec<u8>) = exchange.arguments(code, frame, limit).await?;
-                ServerRequest::UploadRunModel {
-                    request,
-                    reply: Reply {
-                        exchange,
-                        response: PhantomData::<()>,
-                    },
-                }
-            }
-            code if code == u32::from(crate::server::RequestCode::ReportRun) => {
-                let request: (u32, ReportedRunState, Option<String>) =
-                    exchange.arguments(code, frame, limit).await?;
-                ServerRequest::ReportRun {
-                    request,
-                    reply: Reply {
-                        exchange,
-                        response: PhantomData::<()>,
-                    },
-                }
-            }
-            code if code == u32::from(crate::server::RequestCode::ReportActiveRuns) => {
-                let request: Vec<u32> = exchange.arguments(code, frame, limit).await?;
-                ServerRequest::ReportActiveRuns {
-                    request,
-                    reply: Reply {
-                        exchange,
-                        response: PhantomData::<()>,
-                    },
-                }
-            }
-            code if code == u32::from(crate::server::RequestCode::ReportDetectorStatus) => {
-                let request: DetectorStatusReport = exchange.arguments(code, frame, limit).await?;
-                ServerRequest::ReportDetectorStatus {
-                    request,
-                    reply: Reply {
-                        exchange,
-                        response: PhantomData::<()>,
-                    },
-                }
-            }
-            // `*_serves` admits only the codes matched above.
-            _ => return Err(malformed("unknown request code")),
+            };
+            exchange.certainty = OutcomeCertainty::Unknown;
+            handler.get_labeldb_patterns(&names).await
         };
-        Ok(Some(request))
+        exchange.recycle(frame)?;
+        Reply {
+            exchange,
+            response: PhantomData,
+        }
+        .respond(response)
+        .await
+    }
+
+    async fn reject(mut self, message: &str) {
+        let exchange = &mut self.owner.exchange;
+        // The request was already rejected locally. Failure to notify the peer
+        // must not replace that decision, and dropping the exchange aborts it.
+        if exchange.start(Err::<(), _>(message)).is_ok() && exchange.flush().await.is_ok() {
+            exchange.complete();
+        }
     }
 }
 
-/// A typed manager-side invocation borrowing its stream until responded to.
+/// How an owned server request runner completed.
 #[cfg(feature = "server")]
-pub enum ServerRequest<'a> {
-    /// The `UploadRunModel` engine operation.
-    UploadRunModel {
-        /// The peer-supplied arguments.
-        request: (u32, Vec<u8>),
-        /// The response capability borrowing this request stream.
-        reply: Reply<'a, ()>,
-    },
+pub enum ServerRequestOutcome {
+    /// The peer ended its requests at a frame boundary.
+    Finished,
+    /// The authorized request has a registered code but no built-in handler.
+    Unhandled(UnhandledServerRequest),
+}
 
-    /// The `ReportRun` engine operation.
-    ReportRun {
-        /// The peer-supplied arguments.
-        request: (u32, ReportedRunState, Option<String>),
-        /// The response capability borrowing this request stream.
-        reply: Reply<'a, ()>,
-    },
+/// An authorized legacy request delegated to the application with its stream.
+///
+/// Codes 2, 9, and 14 were historically returned to callers of
+/// [`crate::server::handle_authorized_with_context`]. The body excludes the
+/// request code and frame length. Dropping the handoff aborts its stream.
+#[cfg(feature = "server")]
+pub struct UnhandledServerRequest {
+    code: u32,
+    body: Vec<u8>,
+    stream: Box<ServerRequestStream>,
+}
 
-    /// The `ReportActiveRuns` engine operation.
-    ReportActiveRuns {
-        /// The peer-supplied arguments.
-        request: Vec<u32>,
-        /// The response capability borrowing this request stream.
-        reply: Reply<'a, ()>,
-    },
+#[cfg(feature = "server")]
+impl UnhandledServerRequest {
+    /// Returns the legacy request code.
+    #[must_use]
+    pub fn code(&self) -> u32 {
+        self.code
+    }
 
-    /// The `ReportDetectorStatus` engine operation.
-    ReportDetectorStatus {
-        /// The peer-supplied arguments.
-        request: DetectorStatusReport,
-        /// The response capability borrowing this request stream.
-        reply: Reply<'a, ()>,
-    },
+    /// Returns the opaque request body. Applications decoding it should enforce
+    /// their own allocation limits.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
 
-    /// The `get_config` operation.
-    GetConfig {
-        /// The peer-supplied arguments.
-        request: (),
-        /// The response capability borrowing this request stream.
-        reply: Reply<'a, String>,
-    },
-    /// The `get_model` operation.
-    GetModel {
-        /// The peer-supplied arguments.
-        request: String,
-        /// The response capability borrowing this request stream.
-        reply: Reply<'a, Vec<u8>>,
-    },
-    /// The `get_pretrained_model` operation.
-    GetPretrainedModel {
-        /// The peer-supplied arguments.
-        request: String,
-        /// The response capability borrowing this request stream.
-        reply: Reply<'a, Vec<u8>>,
-    },
-    /// The `get_model_names` operation.
-    GetModelNames {
-        /// The peer-supplied arguments.
-        request: (),
-        /// The response capability borrowing this request stream.
-        reply: Reply<'a, Vec<String>>,
-    },
-    /// The `get_allowlist` operation.
-    GetAllowlist {
-        /// The peer-supplied arguments.
-        request: (),
-        /// The response capability borrowing this request stream.
-        reply: Reply<'a, HostNetworkGroup>,
-    },
-    /// The `get_blocklist` operation.
-    GetBlocklist {
-        /// The peer-supplied arguments.
-        request: (),
-        /// The response capability borrowing this request stream.
-        reply: Reply<'a, HostNetworkGroup>,
-    },
-    /// The `insert_model` operation.
-    InsertModel {
-        /// The peer-supplied arguments.
-        request: Vec<u8>,
-        /// The response capability borrowing this request stream.
-        reply: Reply<'a, u32>,
-    },
-    /// The `update_model` operation.
-    UpdateModel {
-        /// The peer-supplied arguments.
-        request: Vec<u8>,
-        /// The response capability borrowing this request stream.
-        reply: Reply<'a, u32>,
-    },
-    /// The `remove_model` operation.
-    RemoveModel {
-        /// The peer-supplied arguments.
-        request: String,
-        /// The response capability borrowing this request stream.
-        reply: Reply<'a, ()>,
-    },
-    /// The `report_customer_data_deletion` operation.
-    ReportCustomerDataDeletion {
-        /// The peer-supplied arguments.
-        request: CustomerDataDeletionReport,
-        /// The response capability borrowing this request stream.
-        reply: Reply<'a, ()>,
-    },
+    /// Returns the stream at the next request boundary without sending a response.
+    /// The bound authorization still applies when the stream is run again.
+    #[must_use]
+    pub fn into_stream(self) -> ServerRequestStream {
+        *self.stream
+    }
+
+    /// Sends the application response and returns the stream at the next request boundary.
+    ///
+    /// # Errors
+    /// Returns classified encoding, limit, or transport errors. Dropping this
+    /// future before it completes aborts the stream.
+    pub async fn respond<T: Serialize>(
+        self,
+        response: Result<T, String>,
+    ) -> Result<ServerRequestStream, SessionError> {
+        let mut stream = self.into_stream();
+        stream.owner.exchange.certainty = OutcomeCertainty::Unknown;
+        stream.owner.exchange.start(response)?;
+        stream.owner.exchange.flush().await?;
+        Ok(stream)
+    }
+}
+
+/// The owned, wire-compatible form of [`DataSourceKey`].
+#[cfg(feature = "server")]
+#[derive(Debug, serde::Deserialize, Serialize)]
+enum OwnedDataSourceKey {
+    /// Look up a data source by ID.
+    Id(u32),
+    /// Look up a data source by name.
+    Name(String),
+}
+
+#[cfg(feature = "server")]
+impl OwnedDataSourceKey {
+    fn as_key(&self) -> DataSourceKey<'_> {
+        match self {
+            Self::Id(id) => DataSourceKey::Id(*id),
+            Self::Name(name) => DataSourceKey::Name(name),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+macro_rules! server_operations {
+    (
+        low_level {
+            $(
+                $low:ident($low_arguments:ty) -> $low_response:ty
+                => |$low_handler:ident, $low_peer:ident, $low_request:pat_param| $low_invoke:expr
+            ),+ $(,)?
+        }
+        runner_only {
+            $(
+                $runner:ident($runner_arguments:ty) -> $runner_response:ty
+                => |$runner_handler:ident, $runner_peer:ident, $runner_request:pat_param| $runner_invoke:expr
+            ),+ $(,)?
+        }
+    ) => {
+        /// A typed manager-side invocation borrowing its stream until responded to.
+        pub enum ServerRequest<'a> {
+            $(
+                #[doc = concat!("The `", stringify!($low), "` operation.")]
+                $low {
+                    /// The peer-supplied arguments.
+                    request: $low_arguments,
+                    /// The response capability borrowing this request stream.
+                    reply: Reply<'a, $low_response>,
+                },
+            )+
+        }
+
+        enum RunnerRequest<'a> {
+            LowLevel(ServerRequest<'a>),
+            $(
+                $runner {
+                    request: $runner_arguments,
+                    reply: Reply<'a, $runner_response>,
+                },
+            )+
+        }
+
+        fn server_serves(code: u32) -> bool {
+            matches!(ServerCode::from(code), $(ServerCode::$low)|+)
+        }
+
+        impl ServerRequestStream {
+            async fn decode_low_level_request(
+                &mut self,
+                code: u32,
+                frame: oinq::frame::Frame,
+                report_bad_arguments: bool,
+            ) -> Result<ServerRequest<'_>, SessionError> {
+                let limit = self.owner.options.unary.get();
+                let mut exchange = ExchangeLease(Some(&mut self.owner.exchange));
+                match ServerCode::from(code) {
+                    $(
+                        ServerCode::$low => {
+                            let request = exchange
+                                .server_arguments(code, frame, limit, report_bad_arguments)
+                                .await?;
+                            Ok(ServerRequest::$low {
+                                request,
+                                reply: Reply { exchange, response: PhantomData },
+                            })
+                        }
+                    )+
+                    _ => Err(malformed("request code is not served by the low-level stream")),
+                }
+            }
+
+            async fn dispatch_runner_request<H: Handler + Sync + ?Sized>(
+                &mut self,
+                code: u32,
+                frame: oinq::frame::Frame,
+                handler: &H,
+                peer: &str,
+            ) -> Result<(), SessionError> {
+                let limit = self.owner.options.unary.get();
+                let request = match ServerCode::from(code) {
+                    $(ServerCode::$low)|+ => RunnerRequest::LowLevel(
+                        self.decode_low_level_request(code, frame, false).await?,
+                    ),
+                    ServerCode::GetLabelDbPatterns => {
+                        return self.dispatch_label_lookup(frame, handler).await;
+                    }
+                    $(
+                        ServerCode::$runner => {
+                            let mut exchange = ExchangeLease(Some(&mut self.owner.exchange));
+                            let request = exchange.server_arguments(code, frame, limit, false).await?;
+                            RunnerRequest::$runner {
+                                request,
+                                reply: Reply { exchange, response: PhantomData },
+                            }
+                        }
+                    )+
+                    ServerCode::GetMaxEventIdNum | ServerCode::RemoveOutliers
+                    | ServerCode::GetDataSourceList | ServerCode::Unknown => {
+                        return Err(malformed("request code has no built-in handler"));
+                    }
+                };
+                request.dispatch(handler, peer).await
+            }
+        }
+
+        impl RunnerRequest<'_> {
+            async fn dispatch<H: Handler + Sync + ?Sized>(
+                self,
+                handler: &H,
+                peer: &str,
+            ) -> Result<(), SessionError> {
+                match self {
+                    Self::LowLevel(request) => match request {
+                        $(
+                            ServerRequest::$low { request: $low_request, mut reply } => {
+                                let $low_handler = handler;
+                                let $low_peer = peer;
+                                reply.exchange.certainty = OutcomeCertainty::Unknown;
+                                reply.respond($low_invoke).await
+                            }
+                        )+
+                    },
+                    $(
+                        Self::$runner { request: $runner_request, mut reply } => {
+                            let $runner_handler = handler;
+                            let $runner_peer = peer;
+                            reply.exchange.certainty = OutcomeCertainty::Unknown;
+                            reply.respond($runner_invoke).await
+                        }
+                    )+
+                }
+            }
+        }
+    };
+}
+
+#[cfg(feature = "server")]
+server_operations! {
+    low_level {
+        UploadRunModel((u32, Vec<u8>)) -> ()
+            => |h, peer, (run_id, model)| h.upload_run_model(peer, run_id, &model).await,
+        ReportRun((u32, ReportedRunState, Option<String>)) -> ()
+            => |h, peer, (run_id, state, reason)| h.report_run(peer, run_id, state, reason.as_deref()).await,
+        ReportActiveRuns(Vec<u32>) -> ()
+            => |h, peer, run_ids| h.report_active_runs(peer, &run_ids).await,
+        ReportDetectorStatus(DetectorStatusReport) -> ()
+            => |h, peer, report| h.report_detector_status(peer, &report).await,
+        GetConfig(()) -> String
+            => |h, peer, ()| h.get_config(peer).await,
+        GetModel(String) -> Vec<u8>
+            => |h, _peer, name| h.get_model(&name).await,
+        GetPretrainedModel(String) -> Vec<u8>
+            => |h, _peer, name| h.get_pretrained_model(&name).await,
+        GetModelNames(()) -> Vec<String>
+            => |h, _peer, ()| h.get_model_names().await,
+        GetAllowlist(()) -> HostNetworkGroup
+            => |h, peer, ()| h.get_allowlist(peer).await,
+        GetBlocklist(()) -> HostNetworkGroup
+            => |h, peer, ()| h.get_blocklist(peer).await,
+        InsertModel(Vec<u8>) -> u32
+            => |h, _peer, model| h.insert_model(&model).await,
+        UpdateModel(Vec<u8>) -> u32
+            => |h, _peer, model| h.update_model(&model).await,
+        RemoveModel(String) -> ()
+            => |h, _peer, name| h.remove_model(&name).await,
+        ReportCustomerDataDeletion(CustomerDataDeletionReport) -> ()
+            => |h, _peer, report| h.report_customer_data_deletion(&report).await,
+    }
+    runner_only {
+        GetDataSource(OwnedDataSourceKey) -> Option<DataSource>
+            => |h, _peer, key| h.get_data_source(&key.as_key()).await,
+        GetIndicator(String) -> HashSet<Vec<String>>
+            => |h, _peer, name| h.get_indicator(&name).await,
+        InsertColumnStatistics((Vec<ColumnStatisticsUpdate>, u32, i64)) -> ()
+            => |h, _peer, (statistics, model_id, batch_ts)| h.insert_column_statistics(&statistics, model_id, batch_ts).await,
+        InsertTimeSeries((Vec<TimeSeriesUpdate>, u32, i64)) -> ()
+            => |h, _peer, (series, model_id, batch_ts)| h.insert_time_series(&series, model_id, batch_ts).await,
+        UpdateClusters((Vec<UpdateClusterRequest>, u32)) -> ()
+            => |h, _peer, (clusters, model_id)| h.update_clusters(&clusters, model_id).await,
+        UpdateOutliers((Vec<OutlierInfo>, u32, i64)) -> ()
+            => |h, _peer, (outliers, model_id, timestamp)| h.update_outliers(&outliers, model_id, timestamp).await,
+        InsertEventLabels((u32, u32, Vec<EventMessage>)) -> ()
+            => |h, _peer, (model_id, round, labels)| h.insert_event_labels(model_id, round, &labels).await,
+        InsertDataSource(DataSource) -> u32
+            => |h, _peer, source| h.insert_data_source(&source).await,
+        RenewCertificate(()) -> (String, String)
+            => |h, peer, ()| h.renew_certificate(peer).await,
+        GetTrustedDomainList(()) -> Vec<String>
+            => |h, _peer, ()| h.get_trusted_domain_list().await,
+        GetOutliers((u32, i64)) -> Vec<(String, Vec<i64>)>
+            => |h, _peer, (model_id, timestamp)| h.get_outliers(model_id, timestamp).await,
+        GetTorExitNodeList(()) -> Vec<String>
+            => |h, _peer, ()| h.get_tor_exit_node_list().await,
+        GetInternalNetworkList(()) -> HostNetworkGroup
+            => |h, peer, ()| h.get_internal_network_list(peer).await,
+        GetTrustedUserAgentList(()) -> Vec<String>
+            => |h, _peer, ()| h.get_trusted_user_agent_list().await,
+        UpdateHostOpenedPorts(HashMap<IpAddr, HashMap<(u16, u8), u32>>) -> ()
+            => |h, peer, hosts| h.update_host_ports(peer, &hosts).await,
+        UpdateHostOsAgents(Vec<(IpAddr, Vec<UserAgent>, Vec<String>)>) -> ()
+            => |h, peer, hosts| h.update_host_user_agents(peer, &hosts).await,
+        GetSamplingPolicyList(()) -> Vec<SamplingPolicy>
+            => |h, peer, ()| h.get_sampling_policy_list(peer).await,
+    }
 }
 
 /// The unique agent-side owner of incoming command stream acceptance.

@@ -9,6 +9,8 @@ use tokio::io::AsyncReadExt;
 #[cfg(feature = "client")]
 use tokio::io::AsyncWriteExt;
 
+#[cfg(feature = "server")]
+use super::ServerRunError;
 use super::{OutcomeCertainty, SessionError};
 
 fn abort_code() -> ApplicationCode {
@@ -36,6 +38,43 @@ impl EventReceiver {
             limit,
         }
     }
+    /// Processes this event stream with the existing server event handler.
+    ///
+    /// Both header bytes are reserved and ignored. Events and decode-error
+    /// callbacks run in stream order. A complete frame with malformed event
+    /// data is reported through `on_error` before reading the next frame. A
+    /// clean frame-boundary EOF calls `on_stream_end` exactly once.
+    ///
+    /// This future owns the stream and the handler. The application supervises
+    /// it and chooses concurrency across streams. Dropping it stops the stream
+    /// and cancels any active callback. Effects already performed may remain.
+    /// To suspend and resume reads with the receiver retained, use [`Self::next`].
+    ///
+    /// # Errors
+    /// Returns classified framing, truncation, transport, or budget failures,
+    /// or [`ServerRunError::EventHandler`] if a callback returns an I/O error.
+    pub async fn run<H>(mut self, mut handler: H) -> Result<(), ServerRunError>
+    where
+        H: crate::server::EventStreamHandler + Send,
+    {
+        loop {
+            match self.read_next().await? {
+                Ok(Some(event)) => handler.handle_event(event).await,
+                Ok(None) => {
+                    return handler
+                        .on_stream_end()
+                        .await
+                        .map_err(ServerRunError::EventHandler);
+                }
+                Err(SessionError::Malformed { source, .. }) => {
+                    handler.on_error(&format!("decoding error: {source}")).await
+                }
+                Err(error) => return Err(error.into()),
+            }
+            .map_err(ServerRunError::EventHandler)?;
+        }
+    }
+
     /// Reads the next bounded event, retaining partial progress when cancelled.
     ///
     /// An event frame that was read completely but cannot be decoded, for example
