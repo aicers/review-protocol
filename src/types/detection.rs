@@ -962,6 +962,54 @@ mod tests {
     }
 
     #[test]
+    fn validate_matches_every_raw_event_body_to_its_kind() {
+        let mut covered = Vec::new();
+        for body in raw_event::tests::bodies() {
+            // The body's serde variant name is an oracle independent of
+            // `raw_event_body_kind`: it must name the same kind.
+            // Read from the text: some bodies hold integers that
+            // `serde_json::Value` cannot represent.
+            let json = serde_json::to_string(&body).expect("serializes");
+            let name = json
+                .strip_prefix("{\"")
+                .and_then(|rest| rest.split_once("\":"))
+                .map(|(name, _)| name.to_string())
+                .expect("a body serializes as an externally tagged variant");
+            let kind = raw_event_body_kind(&body);
+            assert_eq!(format!("{kind:?}"), name);
+            covered.push(u32::from(kind));
+
+            let mut event = raw_event_target();
+            event.raw_event_kind = kind;
+            event.target = Target::RawEvent {
+                time: event.time,
+                body: body.clone(),
+            };
+            assert_eq!(event.validate(), Ok(()), "{name}");
+
+            let other = if kind == RawEventKind::Conn {
+                RawEventKind::Dns
+            } else {
+                RawEventKind::Conn
+            };
+            event.raw_event_kind = other;
+            assert_eq!(
+                event.validate(),
+                Err(DetectionEventError::RawEventBodyMismatch {
+                    raw_event_kind: other,
+                    body: kind,
+                }),
+                "{name}"
+            );
+        }
+        let total = covered.len();
+        covered.sort_unstable();
+        covered.dedup();
+        assert_eq!(covered.len(), total, "one body per kind");
+        assert_eq!(covered.len(), 36, "every raw event kind");
+    }
+
+    #[test]
     fn validate_rejects_sensor_subject_without_sensor() {
         let error = assert_rule(&subject(PrimarySubject::Sensor), 3);
         assert_eq!(error, DetectionEventError::SensorSubjectWithoutSensor);

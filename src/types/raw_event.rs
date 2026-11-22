@@ -1254,7 +1254,7 @@ pub struct Netflow9 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use super::super::{RawEventBody, RawEventKind};
@@ -1398,7 +1398,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_lines)] // One synthetic body per kind.
-    pub(super) fn bodies() -> Vec<RawEventBody> {
+    pub(in crate::types) fn bodies() -> Vec<RawEventBody> {
         vec![
             RawEventBody::Conn(Conn {
                 orig_addr: v4(1),

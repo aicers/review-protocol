@@ -466,6 +466,58 @@ mod tests {
         );
     }
 
+    /// A byte buffer whose visitor accepts only an owned `Vec<u8>`, as a
+    /// `serde_bytes::ByteBuf`-style type does.
+    #[derive(Debug, PartialEq)]
+    struct OwnedBytes(Vec<u8>);
+    impl<'de> serde::Deserialize<'de> for OwnedBytes {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_byte_buf(OwnedOnly)
+        }
+    }
+
+    struct OwnedOnly;
+    impl Visitor<'_> for OwnedOnly {
+        type Value = OwnedBytes;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("an owned byte buffer")
+        }
+        fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<OwnedBytes, E> {
+            Ok(OwnedBytes(value))
+        }
+    }
+
+    #[test]
+    fn byte_buf_is_charged_and_reaches_owned_visitor() {
+        let payload = vec![0xab_u8; 64];
+        let bytes =
+            bincode::serde::encode_to_vec(serde_bytes_like(&payload), bincode::config::standard())
+                .unwrap();
+        assert!(matches!(
+            decode::<OwnedBytes>(&bytes, &Budget::new(32)),
+            Err(super::super::SessionError::LimitExceeded { .. })
+        ));
+        assert_eq!(
+            decode::<OwnedBytes>(&bytes, &Budget::new(1024)).unwrap().0,
+            OwnedBytes(payload)
+        );
+
+        // The guard reports what the wrapped visitor expects.
+        let expected: &dyn de::Expected = &Own(OwnedOnly);
+        assert_eq!(expected.to_string(), "an owned byte buffer");
+    }
+
+    /// Serializes `value` as serde bytes, the encoding a byte buffer reads.
+    fn serde_bytes_like(value: &[u8]) -> impl serde::Serialize + '_ {
+        struct Bytes<'a>(&'a [u8]);
+        impl serde::Serialize for Bytes<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_bytes(self.0)
+            }
+        }
+        Bytes(value)
+    }
+
     #[test]
     fn custom_decode_error_is_not_inferred_from_its_text() {
         #[derive(Debug)]
