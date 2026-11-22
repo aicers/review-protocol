@@ -955,8 +955,10 @@ mod tests {
     #[tokio::test]
     async fn insert_detection_events() {
         run_test(|client_conn| async move {
-            // The handler accepts only this batch, whole and in order,
-            // including the event that fails `validate`.
+            use crate::test::{DETECTION_EVENTS_MODEL_ID, DETECTION_EVENTS_ROUND};
+
+            // The handler accepts only this model ID, round and batch, whole
+            // and in order, including the event that fails `validate`.
             let events = crate::test::detection_events();
             assert!(
                 events[crate::test::INVALID_DETECTION_EVENT]
@@ -964,11 +966,50 @@ mod tests {
                     .is_err()
             );
             client_conn
-                .insert_detection_events(1, 100, &events)
+                .insert_detection_events(DETECTION_EVENTS_MODEL_ID, DETECTION_EVENTS_ROUND, &events)
                 .await
                 .unwrap();
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn insert_detection_events_checks_every_argument() {
+        use crate::test::{DETECTION_EVENTS_MODEL_ID, DETECTION_EVENTS_ROUND};
+
+        // The handler refuses a request that changes any one argument, so a
+        // swapped, dropped, truncated or reordered argument cannot pass.
+        let events = crate::test::detection_events();
+        let mut truncated = events.clone();
+        truncated.pop();
+        let mut reordered = events.clone();
+        reordered.swap(0, 1);
+        let cases = [
+            (DETECTION_EVENTS_ROUND, DETECTION_EVENTS_MODEL_ID, events),
+            (
+                DETECTION_EVENTS_MODEL_ID,
+                DETECTION_EVENTS_ROUND,
+                Vec::new(),
+            ),
+            (DETECTION_EVENTS_MODEL_ID, DETECTION_EVENTS_ROUND, truncated),
+            (DETECTION_EVENTS_MODEL_ID, DETECTION_EVENTS_ROUND, reordered),
+        ];
+        for (model_id, round, events) in cases {
+            run_test(|client_conn| async move {
+                let error = client_conn
+                    .insert_detection_events(model_id, round, &events)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with("unexpected detection event request"),
+                    "{error}"
+                );
+            })
+            .await;
+        }
     }
 
     #[tokio::test]

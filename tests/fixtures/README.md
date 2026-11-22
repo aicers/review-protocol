@@ -54,6 +54,8 @@ release's event codec, then checked through the legacy event stream helper.
 Protocol 0.50.0 re-composed the frames whose payload types it replaced; see
 below.
 
+<!-- The rows naming changed argument types cannot wrap. -->
+<!-- markdownlint-disable MD013 -->
 | Code | Request | Legacy handler | Successful result |
 | ---- | ------- | -------------- | ----------------- |
 | 0 | GetDataSource | `get_data_source` | Optional data source |
@@ -69,7 +71,7 @@ below.
 | 10 | UpdateClusters | `update_clusters` | Unit |
 | 11 | UpdateModel | `update_model` | Model ID |
 | 12 | UpdateOutliers | `update_outliers` | Unit |
-| 13 | InsertDetectionEvents | `insert_detection_events` | Unit |
+| 13 | InsertDetectionEvents, arguments model ID, round and a `DetectionEvent` batch | `insert_detection_events` | Unit |
 | 14 | GetDataSourceList | Caller handoff | Caller-defined |
 | 15 | GetLabelDbPatterns | `get_labeldb_patterns` | Optional databases |
 | 20 | InsertDataSource | `insert_data_source` | Data source ID |
@@ -90,8 +92,10 @@ below.
 | 41 | UploadRunModel | `upload_run_model` | Unit |
 | 42 | ReportRun | `report_run` | Unit |
 | 43 | ReportActiveRuns | `report_active_runs` | Unit |
-| 44 | ReportDetectorStatus | `report_detector_status` | Unit |
+| 44 | ReportDetectorStatus, argument a `DetectorStatusReport` with `detection_models` and `excluded` | `report_detector_status` | Unit |
 | Other | Unknown | None | None |
+
+<!-- markdownlint-enable MD013 -->
 
 The request and response streams exercise all 32 built-in operations,
 including default `not supported` responses, a handler refusal, and success

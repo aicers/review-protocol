@@ -14,6 +14,9 @@ use super::{EventCategory, RawEventBody, RawEventKind};
 /// `truncated_related_ips`.
 pub const MAX_RELATED_IPS: usize = 64;
 
+/// What `Debug` prints in place of a captured credential.
+const REDACTED: &str = "<redacted>";
+
 /// The detection model that produced a [`DetectionEvent`].
 ///
 /// A model is serialized as its number in every format, never as its name or
@@ -302,7 +305,9 @@ pub struct FtpBruteForceDetail {
 }
 
 /// The detail of a [`DetectionModel::LdapBruteForce`] detection.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// `Debug` prints every password in `user_pw_list` as `<redacted>`.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct LdapBruteForceDetail {
     /// The responder port.
     pub resp_port: u16,
@@ -310,6 +315,49 @@ pub struct LdapBruteForceDetail {
     pub proto: u8,
     /// The user and password pairs tried.
     pub user_pw_list: Vec<(String, String)>,
+}
+
+/// The passwords in `user_pw_list` were captured from the session, so they
+/// are redacted rather than derived; the user names and every other field
+/// are printed as a derived `Debug` would print them.
+impl fmt::Debug for LdapBruteForceDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        /// A `(user, password)` pair printed with its password redacted.
+        struct RedactedPair<'a>(&'a str);
+
+        impl fmt::Debug for RedactedPair<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_tuple("")
+                    .field(&self.0)
+                    .field(&format_args!("{REDACTED}"))
+                    .finish()
+            }
+        }
+
+        /// `user_pw_list` printed with every password redacted.
+        struct RedactedList<'a>(&'a [(String, String)]);
+
+        impl fmt::Debug for RedactedList<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_list()
+                    .entries(self.0.iter().map(|(user, _)| RedactedPair(user)))
+                    .finish()
+            }
+        }
+
+        // Destructured so that a field added to the struct fails to compile
+        // here until it is printed or redacted.
+        let Self {
+            resp_port,
+            proto,
+            user_pw_list,
+        } = self;
+        f.debug_struct("LdapBruteForceDetail")
+            .field("resp_port", resp_port)
+            .field("proto", proto)
+            .field("user_pw_list", &RedactedList(user_pw_list))
+            .finish()
+    }
 }
 
 /// The detail of a [`DetectionModel::RepeatedHttpSessions`] detection.
@@ -603,6 +651,9 @@ mod tests {
 
     /// 2026-03-15T15:00:04.12Z.
     pub(super) const NANOS: i128 = 1_773_586_804_120_000_000;
+    /// A valid timestamp's nanoseconds that do not fit in an `i64`, so that
+    /// its encoding tells an `i128` field from an `i64` one.
+    pub(super) const WIDE_NANOS: i128 = 200_000_000_000_000_000_000;
 
     pub(super) fn at(nanos: i128) -> jiff::Timestamp {
         jiff::Timestamp::from_nanosecond(nanos).expect("the test timestamp is in range")
@@ -1013,6 +1064,80 @@ mod tests {
     }
 
     #[test]
+    fn time_fields_encode_beyond_i64_as_exact_json_integer() {
+        assert!(i64::try_from(WIDE_NANOS).is_err());
+        assert!(i64::try_from(-WIDE_NANOS).is_err());
+
+        let mut raw = raw_event_target();
+        raw.time = at(WIDE_NANOS);
+        raw.target = Target::RawEvent {
+            time: at(-WIDE_NANOS),
+            body: conn(),
+        };
+        let json = serde_json::to_string(&raw).expect("serializes");
+        assert!(
+            json.starts_with(r#"{"time":200000000000000000000,"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""RawEvent":{"time":-200000000000000000000,"body":"#),
+            "{json}"
+        );
+        let decoded: DetectionEvent = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(decoded, raw);
+
+        let mut subject = subject(host());
+        *window_of(&mut subject) = TimeWindow {
+            start: at(-WIDE_NANOS),
+            end: at(WIDE_NANOS),
+        };
+        let json = serde_json::to_string(&subject).expect("serializes");
+        assert!(
+            json.contains(
+                r#""window":{"start":-200000000000000000000,"end":200000000000000000000}"#
+            ),
+            "{json}"
+        );
+        let decoded: DetectionEvent = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(decoded, subject);
+    }
+
+    #[test]
+    fn ldap_brute_force_debug_redacts_passwords() {
+        const PASSWORD: &str = "synthetic-password";
+        let detail = LdapBruteForceDetail {
+            resp_port: 389,
+            proto: 6,
+            user_pw_list: vec![
+                ("user-a".to_string(), PASSWORD.to_string()),
+                ("user-b".to_string(), PASSWORD.to_string()),
+            ],
+        };
+        let mut event = subject(host());
+        event.detection_model = DetectionModel::LdapBruteForce;
+        event.detail = Detail::LdapBruteForce(detail.clone());
+
+        for rendered in [format!("{event:?}"), format!("{event:#?}")] {
+            assert!(!rendered.contains(PASSWORD), "{rendered}");
+        }
+        assert_eq!(
+            format!("{detail:?}"),
+            r#"LdapBruteForceDetail { resp_port: 389, proto: 6, user_pw_list: [("user-a", <redacted>), ("user-b", <redacted>)] }"#
+        );
+        let rendered = format!("{event:?}");
+        assert!(
+            rendered.contains(r#"user_pw_list: [("user-a", <redacted>), ("user-b", <redacted>)]"#),
+            "{rendered}"
+        );
+
+        // Redaction is `Debug` only: the password is still on the wire.
+        let json = serde_json::to_string(&event).expect("serializes");
+        assert!(json.contains(PASSWORD), "{json}");
+        let decoded: DetectionEvent = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
     fn every_detail_round_trips_through_json() {
         for detail in details() {
             let json = serde_json::to_string(&detail).expect("serializes");
@@ -1034,12 +1159,19 @@ mod bincode_tests {
 
     use serde::{Serialize, de::DeserializeOwned};
 
-    use super::tests::{NANOS, TABLE, at, conn, details};
+    use super::tests::{NANOS, TABLE, WIDE_NANOS, at, conn, details};
     use super::*;
 
     /// The crate's bincode 2 encoding of [`NANOS`] as an `i128`: the
     /// zigzagged value in a `u64` varint.
     const NANOS_BYTES: [u8; 9] = [0xfd, 0x00, 0x2c, 0xc9, 0x5b, 0x9a, 0x17, 0x3a, 0x31];
+
+    /// The crate's bincode 2 encoding of [`WIDE_NANOS`] as an `i128`: the
+    /// zigzagged value in a `u128` varint, which no `i64` encodes to.
+    const WIDE_NANOS_BYTES: [u8; 17] = [
+        0xfe, 0x00, 0x00, 0x40, 0x8c, 0xb5, 0x78, 0x1d, 0xaf, 0x15, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ];
 
     fn encode<T: Serialize + ?Sized>(value: &T) -> Vec<u8> {
         bincode::serde::encode_to_vec(value, bincode::config::standard())
@@ -1074,6 +1206,7 @@ mod bincode_tests {
     #[test]
     fn nanos_bytes_are_the_i128_encoding() {
         assert_eq!(encode(&NANOS), NANOS_BYTES);
+        assert_eq!(encode(&WIDE_NANOS), WIDE_NANOS_BYTES);
     }
 
     fn header(event: &DetectionEvent) -> Vec<u8> {
@@ -1086,78 +1219,96 @@ mod bincode_tests {
 
     #[test]
     fn raw_event_times_encode_as_nanosecond_i128() {
-        let raw_time = NANOS - 7;
-        let event = DetectionEvent {
-            time: at(NANOS),
-            sensor: Some("sensor-1".to_string()),
-            detection_model: DetectionModel::NonBrowser,
-            raw_event_kind: RawEventKind::Conn,
-            category: None,
-            target: Target::RawEvent {
-                time: at(raw_time),
-                body: conn(),
-            },
-            score: 1.5,
-            detail: Detail::NonBrowser,
-        };
+        // Each case pins the header time to its expected bytes; the
+        // wide one needs an `i128` for both times.
+        for (time, time_bytes, raw_time) in [
+            (NANOS, NANOS_BYTES.as_slice(), NANOS - 7),
+            (WIDE_NANOS, WIDE_NANOS_BYTES.as_slice(), -WIDE_NANOS),
+        ] {
+            let event = DetectionEvent {
+                time: at(time),
+                sensor: Some("sensor-1".to_string()),
+                detection_model: DetectionModel::NonBrowser,
+                raw_event_kind: RawEventKind::Conn,
+                category: None,
+                target: Target::RawEvent {
+                    time: at(raw_time),
+                    body: conn(),
+                },
+                score: 1.5,
+                detail: Detail::NonBrowser,
+            };
 
-        let mut target = encode(&0_u32);
-        target.extend(encode(&raw_time));
-        target.extend(encode(&conn()));
-        assert_eq!(encode(&event.target), target);
+            let mut target = encode(&0_u32);
+            target.extend(encode(&raw_time));
+            target.extend(encode(&conn()));
+            assert_eq!(encode(&event.target), target);
 
-        let mut expected = NANOS_BYTES.to_vec();
-        expected.extend(header(&event));
-        expected.extend(target);
-        expected.extend(encode(&1.5_f64));
-        expected.extend(encode(&event.detail));
-        assert_eq!(encode(&event), expected);
-        assert_eq!(decode::<DetectionEvent>(&expected), event);
+            let mut expected = time_bytes.to_vec();
+            expected.extend(header(&event));
+            expected.extend(target);
+            expected.extend(encode(&1.5_f64));
+            expected.extend(encode(&event.detail));
+            assert_eq!(encode(&event), expected);
+            assert_eq!(decode::<DetectionEvent>(&expected), event);
+        }
     }
 
     #[test]
     fn subject_window_times_encode_as_nanosecond_i128() {
-        let window = TimeWindow {
-            start: at(NANOS),
-            end: at(NANOS + 1),
-        };
-        let mut expected_window = NANOS_BYTES.to_vec();
-        expected_window.extend(encode(&(NANOS + 1)));
-        assert_eq!(encode(&window), expected_window);
-        assert_eq!(decode::<TimeWindow>(&expected_window), window);
+        // Each case pins the window start to its expected bytes; the wide
+        // one needs an `i128` for every time.
+        for (start, start_bytes, end, time) in [
+            (NANOS, NANOS_BYTES.as_slice(), NANOS + 1, -NANOS),
+            (
+                WIDE_NANOS,
+                WIDE_NANOS_BYTES.as_slice(),
+                WIDE_NANOS + 1,
+                -WIDE_NANOS,
+            ),
+        ] {
+            let window = TimeWindow {
+                start: at(start),
+                end: at(end),
+            };
+            let mut expected_window = start_bytes.to_vec();
+            expected_window.extend(encode(&end));
+            assert_eq!(encode(&window), expected_window);
+            assert_eq!(decode::<TimeWindow>(&expected_window), window);
 
-        let primary = PrimarySubject::Sensor;
-        let event = DetectionEvent {
-            time: at(-NANOS),
-            sensor: Some("sensor-1".to_string()),
-            detection_model: DetectionModel::TorExitNode,
-            raw_event_kind: RawEventKind::Tls,
-            category: Some(EventCategory::CommandAndControl),
-            target: Target::Subject {
-                primary: primary.clone(),
-                related_ips: vec![RelatedIp {
-                    ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
-                    role: EndpointRole::Source,
-                }],
-                window: window.clone(),
-            },
-            score: 0.0,
-            detail: Detail::TorExitNode,
-        };
-        let Target::Subject { related_ips, .. } = &event.target else {
-            unreachable!("the event has a subject target");
-        };
+            let primary = PrimarySubject::Sensor;
+            let event = DetectionEvent {
+                time: at(time),
+                sensor: Some("sensor-1".to_string()),
+                detection_model: DetectionModel::TorExitNode,
+                raw_event_kind: RawEventKind::Tls,
+                category: Some(EventCategory::CommandAndControl),
+                target: Target::Subject {
+                    primary: primary.clone(),
+                    related_ips: vec![RelatedIp {
+                        ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+                        role: EndpointRole::Source,
+                    }],
+                    window: window.clone(),
+                },
+                score: 0.0,
+                detail: Detail::TorExitNode,
+            };
+            let Target::Subject { related_ips, .. } = &event.target else {
+                unreachable!("the event has a subject target");
+            };
 
-        let mut expected = encode(&-NANOS);
-        expected.extend(header(&event));
-        expected.extend(encode(&1_u32));
-        expected.extend(encode(&primary));
-        expected.extend(encode(related_ips));
-        expected.extend(expected_window);
-        expected.extend(encode(&0.0_f64));
-        expected.extend(encode(&event.detail));
-        assert_eq!(encode(&event), expected);
-        assert_eq!(decode::<DetectionEvent>(&expected), event);
+            let mut expected = encode(&time);
+            expected.extend(header(&event));
+            expected.extend(encode(&1_u32));
+            expected.extend(encode(&primary));
+            expected.extend(encode(related_ips));
+            expected.extend(expected_window);
+            expected.extend(encode(&0.0_f64));
+            expected.extend(encode(&event.detail));
+            assert_eq!(encode(&event), expected);
+            assert_eq!(decode::<DetectionEvent>(&expected), event);
+        }
     }
 
     #[test]

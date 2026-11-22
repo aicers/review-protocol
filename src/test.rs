@@ -253,6 +253,16 @@ pub static TEST_ENV: LazyLock<Mutex<TestEnvironment>> =
 #[allow(dead_code)] // used by tests only, like `TestServerHandler`
 pub(crate) const RUN_ID: u32 = 7;
 
+/// The model ID `TestServerHandler` requires with [`detection_events`].
+#[cfg(all(feature = "client", feature = "server"))]
+#[allow(dead_code)] // used by tests only, like `TestServerHandler`
+pub(crate) const DETECTION_EVENTS_MODEL_ID: u32 = 1;
+
+/// The round `TestServerHandler` requires with [`detection_events`].
+#[cfg(all(feature = "client", feature = "server"))]
+#[allow(dead_code)] // used by tests only, like `TestServerHandler`
+pub(crate) const DETECTION_EVENTS_ROUND: u32 = 100;
+
 /// The run `TestServerHandler` rejects with "report rejected".
 #[cfg(all(feature = "client", feature = "server"))]
 #[allow(dead_code)] // used by tests only, like `TestServerHandler`
@@ -1018,18 +1028,25 @@ impl crate::server::Handler for TestServerHandler {
         Ok(())
     }
 
-    // Accepts an empty batch or exactly `detection_events()`, in order, and
-    // rejects anything else.
+    // Accepts only `DETECTION_EVENTS_MODEL_ID`, `DETECTION_EVENTS_ROUND`
+    // and exactly `detection_events()`, in order, and rejects anything else,
+    // so a dropped, reordered or swapped argument fails the caller.
     async fn insert_detection_events(
         &self,
-        _model_id: u32,
-        _round: u32,
+        model_id: u32,
+        round: u32,
         events: &[crate::types::DetectionEvent],
     ) -> Result<(), String> {
-        if events.is_empty() || events == detection_events().as_slice() {
+        if model_id == DETECTION_EVENTS_MODEL_ID
+            && round == DETECTION_EVENTS_ROUND
+            && events == detection_events().as_slice()
+        {
             Ok(())
         } else {
-            Err(format!("unexpected detection events: {events:?}"))
+            Err(format!(
+                "unexpected detection event request: model {model_id}, round {round}, \
+                 events {events:?}"
+            ))
         }
     }
 
