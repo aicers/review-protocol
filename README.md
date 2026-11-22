@@ -30,6 +30,44 @@ access, and bounded framing over oinq 0.14.0. Constructors require explicit
 `SessionOptions`; `legacy_compatible()` selects the existing `u32` wire bound,
 and applications can configure separate limits for each message family.
 
+### Server listener and admission
+
+With the `server` feature, `session::ServerListener::bind` binds a local
+address, and `from_socket` adopts a prebound UDP socket. `local_addr` reports
+the assigned address. Supply a rustls server configuration, transport
+options, explicit frame limits, and a `ProtocolWindow`. For example,
+`ProtocolWindow::new(">=0.48.0", "0.49.0")` accepts agents within that range
+and sends `0.49.0` in the handshake success reply.
+
+Acquire an application-owned permit before calling `accept`. Each cancel-safe
+accept returns a separate `PendingSession` so the application can supervise
+handshakes concurrently. The configured handshake deadline covers TLS and
+the protocol exchange, measured from acceptance. Drop a pending owner or
+cancel its handshake to abandon the attempt.
+
+After a successful protocol exchange, `UnadmittedSession` exposes the TLS
+peer certificate chain, agent claims, and a cloneable control handle. The
+application interprets certificates and decides whether to admit the agent.
+`admit` consumes the owner and binds the supplied authorization context and
+policy to `ServerIncoming`. It sends no wire message. The resulting
+`ServerHandle` exposes typed outbound operations. Close the control with a
+reason to refuse admission immediately, or drop the unadmitted owner to
+abort its connection. Control clones can await closure independently.
+
+`reload_tls` applies the supplied verification, crypto-provider, and
+client-certificate policy to future connections on the same socket. Existing
+connections retain their negotiated configuration, and transport options
+continue to apply to new connections.
+
+`shutdown` wakes listener accepts and makes them return `None`. Accepted
+sessions remain usable and keep their transport resources after listener
+drop. For per-session shutdown, `drain` ends stream acceptance while existing
+stream owners finish. `ServerIncoming::accept_next` is cancel-safe and
+returns `None` after drain or orderly closure. The existing `accept` returns
+a stream or a typed error. The application joins its stream tasks, closes
+the connections, and can then await `wait_idle`. Use listener or session
+`abort` for immediate closure and cancel supervised work separately.
+
 ## Unidirectional Detection Event Stream API
 
 The crate provides a high-level API for handling unidirectional detection event

@@ -28,6 +28,7 @@ server = [
   "bincode",
   "oinq",
   "quinn",
+  "rustls",
   "semver",
   "thiserror",
   "tokio",

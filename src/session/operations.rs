@@ -12,8 +12,6 @@ use std::{
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-#[cfg(feature = "server")]
-use super::ServerRunError;
 #[cfg(feature = "client")]
 use super::exchange::{Decoding, unary_as};
 use super::{
@@ -21,6 +19,8 @@ use super::{
     decode::decode,
     exchange::{Exchange, unary},
 };
+#[cfg(feature = "server")]
+use super::{ServerRunError, ServerSessionClose, ServerSessionControl, listener::unsent};
 #[cfg(feature = "client")]
 use crate::types::node::NodePowerResponse;
 use crate::types::node::{
@@ -321,18 +321,34 @@ pub enum ServerStream {
 }
 
 /// The unique server-side owner of incoming stream acceptance.
+///
+/// Dropping it ends acceptance and leaves any accepted streams and other
+/// handles alive. The application supervises and joins its stream tasks.
 #[cfg(feature = "server")]
 pub struct ServerIncoming {
     shared: Arc<Shared>,
+    control: ServerSessionControl,
     authorization: Option<Arc<ServerAuthorization>>,
 }
 #[cfg(feature = "server")]
 impl ServerIncoming {
     pub(super) fn new(shared: Arc<Shared>) -> Self {
+        let control = ServerSessionControl::new(shared.connection.clone());
+        Self::with_control(shared, control)
+    }
+
+    pub(super) fn with_control(shared: Arc<Shared>, control: ServerSessionControl) -> Self {
         Self {
             shared,
+            control,
             authorization: None,
         }
+    }
+
+    /// Returns a cloneable handle for draining, closing, or monitoring this session.
+    #[must_use]
+    pub fn control(&self) -> ServerSessionControl {
+        self.control.clone()
     }
 
     /// Binds the application's authenticated context and policy for subsequently
@@ -357,8 +373,46 @@ impl ServerIncoming {
     /// Cancellation consumes no stream. Both directions are polled concurrently;
     /// applications supervise the returned owners independently.
     /// # Errors
-    /// Returns a classified transport error when the connection closes.
+    /// Returns a classified transport error when acceptance is drained or the
+    /// connection closes. Use [`Self::accept_next`] for clean exhaustion.
     pub async fn accept(&mut self) -> Result<ServerStream, SessionError> {
+        self.accept_until_drained().await?.ok_or_else(|| {
+            unsent(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "incoming stream acceptance drained",
+            ))
+        })
+    }
+
+    /// Accepts the next stream or returns `None` on clean exhaustion.
+    ///
+    /// Drain, local closure, or peer closure with application code zero ends
+    /// acceptance. An accept that wins a race with drain can still return
+    /// its stream. Cancellation consumes no stream.
+    ///
+    /// # Errors
+    /// Returns a typed transport failure for abnormal connection closure.
+    pub async fn accept_next(&mut self) -> Result<Option<ServerStream>, SessionError> {
+        tokio::select! {
+            biased;
+            () = self.control.drained() => Ok(None),
+            closed = self.control.closed() => exhausted(closed),
+            stream = self.accept_stream() => match stream {
+                Ok(stream) => Ok(Some(stream)),
+                Err(_) => exhausted(self.control.closed().await),
+            },
+        }
+    }
+
+    async fn accept_until_drained(&mut self) -> Result<Option<ServerStream>, SessionError> {
+        tokio::select! {
+            biased;
+            () = self.control.drained() => Ok(None),
+            stream = self.accept_stream() => stream.map(Some),
+        }
+    }
+
+    async fn accept_stream(&self) -> Result<ServerStream, SessionError> {
         tokio::select! {
             result = self.shared.connection.accept_bi() => {
                 let (send, recv) = result.map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent))?;
@@ -377,6 +431,23 @@ impl ServerIncoming {
             }
         }
     }
+}
+
+#[cfg(feature = "server")]
+fn exhausted(closed: ServerSessionClose) -> Result<Option<ServerStream>, SessionError> {
+    match closed {
+        ServerSessionClose::Local | ServerSessionClose::Peer { code: 0, .. } => Ok(None),
+        ServerSessionClose::Peer { code, reason } => Err(unsent(PeerClosed { code, reason })),
+        ServerSessionClose::Transport(error) => Err(error),
+    }
+}
+
+#[cfg(feature = "server")]
+#[derive(Debug, thiserror::Error)]
+#[error("peer closed the connection with application code {code} and reason bytes {reason:?}")]
+struct PeerClosed {
+    code: u64,
+    reason: Vec<u8>,
 }
 
 #[cfg(feature = "server")]

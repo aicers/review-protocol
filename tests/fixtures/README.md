@@ -42,6 +42,24 @@ A tail ending before an entire optional field is valid; a present `Some` marker
 without its value is malformed. Tests distinguish those cases and compare the
 legacy and guarded decoders against these same fixtures.
 
+## Framed handshake replies
+
+The `handshake-acceptance.bin` and `handshake-rejection.bin` fixtures include
+the four-byte big-endian frame length and the entire reply body. They were
+captured by sending the pinned full agent handshake over loopback to
+`server::handshake` from tag `0.21.0` (`76e28fe3`) and tag `0.27.0`
+(`4b35f3e1`) before adapting the session handshake for the listener.
+The capture used a requirement of `>=0.49.0` and a ceiling of `0.49.0`.
+Acceptance used the fixture unchanged, and rejection changed the agent
+version to `0.48.0`.
+
+Both releases reply with `Ok("0.49.0")` on acceptance. The 0.21.0 rejection
+contains only the requirement, `Err(">=0.49.0")`. The 0.27.0 release and
+the listener report the full accepted range, `Err(">=0.49.0, <=0.49.0")`.
+Both results use bincode 2 standard serde encoding. The listener replays
+the acceptance bytes across all valid field boundaries and rejects
+truncated present fields using the existing bounded decoder.
+
 ## Server processing in 0.27.0
 
 The `current/server-*.bin` fixtures were captured against the released
