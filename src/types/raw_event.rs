@@ -5,7 +5,8 @@
 //! at tag `0.29.2`.
 //!
 //! `Debug` is derived on every struct except [`Http`], [`Ftp`], [`Ldap`]
-//! and [`Radius`], whose credential fields are printed as `<redacted>`.
+//! and [`Radius`], whose fields that can carry credentials are printed as
+//! `<redacted>`.
 
 use std::{fmt, net::IpAddr};
 
@@ -129,8 +130,11 @@ pub struct Http {
 }
 
 /// `password` and `cookie` carry credentials captured from the
-/// session, so they are redacted rather than derived; every other
-/// field is printed as a derived `Debug` would print it.
+/// session, and `uri` (the full request target, query included),
+/// `referer` and `body` (the raw request body, such as a submitted
+/// form) can carry tokens or passwords too, so all five are redacted
+/// rather than derived; every other field is printed as a derived
+/// `Debug` would print it.
 impl fmt::Debug for Http {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Destructured so that a field added to the struct fails to
@@ -149,8 +153,8 @@ impl fmt::Debug for Http {
             resp_l2_bytes,
             method,
             host,
-            uri,
-            referer,
+            uri: _,
+            referer: _,
             version,
             user_agent,
             request_len,
@@ -165,7 +169,7 @@ impl fmt::Debug for Http {
             cache_control,
             filenames,
             mime_types,
-            body,
+            body: _,
             state,
         } = self;
         f.debug_struct("Http")
@@ -182,8 +186,8 @@ impl fmt::Debug for Http {
             .field("resp_l2_bytes", resp_l2_bytes)
             .field("method", method)
             .field("host", host)
-            .field("uri", uri)
-            .field("referer", referer)
+            .field("uri", &REDACTED)
+            .field("referer", &REDACTED)
             .field("version", version)
             .field("user_agent", user_agent)
             .field("request_len", request_len)
@@ -198,7 +202,7 @@ impl fmt::Debug for Http {
             .field("cache_control", cache_control)
             .field("filenames", filenames)
             .field("mime_types", mime_types)
-            .field("body", body)
+            .field("body", &REDACTED)
             .field("state", state)
             .finish()
     }
@@ -1052,6 +1056,9 @@ mod tests {
 
     const HTTP_PASSWORD: &str = "http-password-secret";
     const HTTP_COOKIE: &str = "session=http-cookie-secret";
+    const HTTP_URI: &str = "/login?access_token=http-uri-secret";
+    const HTTP_REFERER: &str = "https://example.net/?access_token=http-referer-secret";
+    const HTTP_BODY: &[u8] = b"user=user&password=http-body-secret";
     const FTP_PASSWORD: &str = "ftp-password-secret";
     const LDAP_ARGUMENT: &str = "ldap-bind-password-secret";
     const RADIUS_USER_PASSWD: &[u8] = b"radius-user-passwd-secret";
@@ -1237,8 +1244,8 @@ mod tests {
                 resp_l2_bytes: 400,
                 method: s("POST"),
                 host: s("example.org"),
-                uri: s("/login"),
-                referer: s("https://example.net/"),
+                uri: s(HTTP_URI),
+                referer: s(HTTP_REFERER),
                 version: s("1.1"),
                 user_agent: s("synthetic-agent"),
                 request_len: 512,
@@ -1253,7 +1260,7 @@ mod tests {
                 cache_control: s("no-cache"),
                 filenames: strings("file"),
                 mime_types: strings("mime"),
-                body: vec![1, 2, 3],
+                body: HTTP_BODY.to_vec(),
                 state: s("done"),
             }),
             RawEventBody::Rdp(Rdp {
@@ -1895,6 +1902,9 @@ mod tests {
         let secrets = [
             format!("{HTTP_PASSWORD:?}"),
             format!("{HTTP_COOKIE:?}"),
+            format!("{HTTP_URI:?}"),
+            format!("{HTTP_REFERER:?}"),
+            format!("{:?}", HTTP_BODY.to_vec()),
             format!("{FTP_PASSWORD:?}"),
             format!("{LDAP_ARGUMENT:?}"),
             format!("{:?}", RADIUS_USER_PASSWD.to_vec()),
