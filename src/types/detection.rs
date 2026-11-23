@@ -14,6 +14,9 @@ use super::{EventCategory, RawEventBody, RawEventKind};
 /// `truncated_related_ips`.
 pub const MAX_RELATED_IPS: usize = 64;
 
+/// The maximum number of slots in [`WindowOutlierDetail::top_slots`].
+const MAX_TOP_SLOTS: usize = 3;
+
 /// What `Debug` prints in place of a captured credential.
 const REDACTED: &str = "<redacted>";
 
@@ -86,6 +89,33 @@ pub enum DetectionModel {
     /// (see [`FarOutlierDetail::Prefix`]), and 1 when there is no cluster
     /// prefix or the pattern has no token.
     FarOutlier = 19,
+    /// Windows of per-IP time series that fall in no cluster of a time-series
+    /// clustering model's round.
+    ///
+    /// A time series is one internal IP's series of a time-series generation
+    /// policy, identified as `<policy id>/<IP>`
+    /// ([`WindowOutlierDetail::time_series_id`]). Every producer follows this
+    /// contract:
+    ///
+    /// - One detection event per window of a time series that falls in no
+    ///   cluster of the round, carrying a [`Detail::WindowOutlier`].
+    /// - `time` is the window's start, `category` is `None`, and
+    ///   `raw_event_kind` is the kind the time series counts, for example
+    ///   [`RawEventKind::Tls`].
+    /// - `sensor` is filled by `REview` on receipt from the series' policy:
+    ///   its single sensor, otherwise `None`. Any value the engine sends is
+    ///   overwritten.
+    /// - The target is [`Target::Subject`] with `primary`
+    ///   [`PrimarySubject::Host`] `{ ip, role }`, no `related_ips`, and a
+    ///   `window`. `ip` is the IP part of `time_series_id`, and `role` is the
+    ///   threat role of the series' time-series type.
+    /// - `window` runs from the start of the earliest slot in
+    ///   [`top_slots`](WindowOutlierDetail::top_slots) to the end of the
+    ///   latest one, where a slot's end is its start + slot size − 1 ns. When
+    ///   `top_slots` is empty, it is the whole window: from the window start
+    ///   to the window start + window size − 1 ns.
+    /// - `score` is [`distance`](WindowOutlierDetail::distance).
+    WindowOutlier = 20,
 }
 
 /// A detection: what a detection model found, about which target, and why.
@@ -240,6 +270,7 @@ pub enum Detail {
     UnusualDestinationPattern(UnusualDestinationPatternDetail),
     LabelDbMatch(LabelDbMatchDetail),
     FarOutlier(FarOutlierDetail),
+    WindowOutlier(WindowOutlierDetail),
 }
 
 impl Detail {
@@ -267,6 +298,40 @@ impl Detail {
             Self::UnusualDestinationPattern(_) => DetectionModel::UnusualDestinationPattern,
             Self::LabelDbMatch(_) => DetectionModel::LabelDbMatch,
             Self::FarOutlier(_) => DetectionModel::FarOutlier,
+            Self::WindowOutlier(_) => DetectionModel::WindowOutlier,
+        }
+    }
+
+    /// Returns the id of the time series the detection is about, if the
+    /// detail carries one.
+    ///
+    /// Receivers use it to find the time-series generation policy behind a
+    /// time-series detection: the id is `<policy id>/<IP>`. It is `Some` for
+    /// [`Detail::WindowOutlier`] and `None` for every other variant.
+    #[must_use]
+    pub fn time_series_id(&self) -> Option<&str> {
+        match self {
+            Self::WindowOutlier(detail) => Some(&detail.time_series_id),
+            Self::WatchlistMatch(_)
+            | Self::CryptocurrencyMiningPool(_)
+            | Self::LockyRansomware
+            | Self::SuspiciousTlsTraffic
+            | Self::PortScan(_)
+            | Self::MultiHostPortScan(_)
+            | Self::ExternalDdos(_)
+            | Self::RdpBruteForce(_)
+            | Self::FtpBruteForce(_)
+            | Self::LdapBruteForce(_)
+            | Self::RepeatedHttpSessions(_)
+            | Self::FtpPlainText
+            | Self::LdapPlainText
+            | Self::NonBrowser
+            | Self::TorExitNode
+            | Self::DomainGenerationAlgorithm
+            | Self::DnsCovertChannel
+            | Self::UnusualDestinationPattern(_)
+            | Self::LabelDbMatch(_)
+            | Self::FarOutlier(_) => None,
         }
     }
 }
@@ -498,6 +563,46 @@ pub enum FarOutlierDetail {
     },
 }
 
+/// The detail of a [`DetectionModel::WindowOutlier`] detection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowOutlierDetail {
+    /// The time series the window belongs to, `<policy id>/<IP>`, with the IP
+    /// in the form Rust's [`IpAddr`] `Display` prints.
+    pub time_series_id: String,
+    /// The start of the window that is the outlier.
+    #[serde(with = "jiff::fmt::serde::timestamp::nanosecond::required")]
+    pub window_start: jiff::Timestamp,
+    /// The cluster whose centroid is nearest to the window.
+    pub nearest_cluster_id: u32,
+    /// The Euclidean distance from the window, after the time-series type's
+    /// input transform, to the centroid of
+    /// [`nearest_cluster_id`](Self::nearest_cluster_id).
+    pub distance: f64,
+    /// At most 3 slots of the window that differ most from the centroid.
+    pub top_slots: Vec<SlotDeviation>,
+    /// The number of [`DetectionModel::WindowOutlier`] detections of this
+    /// round and this policy that the per-round output cap cut.
+    pub truncated: u64,
+    /// The number of sessions in the detection's time window that were not
+    /// requested as PCAP because of the PCAP request cap; `None` when the
+    /// session lookup failed.
+    pub pcap_truncated: Option<u64>,
+}
+
+/// One slot of a [`WindowOutlierDetail`]'s window and how far it lies from
+/// the nearest centroid.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SlotDeviation {
+    /// The slot's start.
+    #[serde(with = "jiff::fmt::serde::timestamp::nanosecond::required")]
+    pub slot_start: jiff::Timestamp,
+    /// The slot's value, before the time-series type's input transform.
+    pub value: f64,
+    /// The nearest centroid's value for this slot, with the input transform
+    /// reversed.
+    pub centroid_value: f64,
+}
+
 impl DetectionEvent {
     /// Checks the rules a well-formed detection event follows.
     ///
@@ -512,6 +617,15 @@ impl DetectionEvent {
     /// 6. `score` is finite.
     /// 7. For [`Target::RawEvent`]: `time` equals the raw event's time, the
     ///    Giganto key timestamp in that target's `time`.
+    ///
+    /// Rules 8 and 9 are not checked here: they are the checks `REview` makes
+    /// on receipt, against its own state.
+    ///
+    /// 10. For [`Detail::WindowOutlier`]: the target is [`Target::Subject`]
+    ///     with a [`PrimarySubject::Host`] primary subject; `top_slots` has at
+    ///     most 3 entries; and `time_series_id` contains `/`, the part after
+    ///     the first `/` parses as an [`IpAddr`], and that address equals the
+    ///     host's `ip`. The part before `/` is not checked.
     ///
     /// It accepts [`PrimarySubject::Network`] and [`PrimarySubject::Cluster`]
     /// subjects: whether to take those depends on the connection and request,
@@ -573,8 +687,55 @@ impl DetectionEvent {
                 raw_event_time: *time,
             });
         }
+        if let Detail::WindowOutlier(detail) = &self.detail {
+            validate_window_outlier(&self.target, detail)?;
+        }
         Ok(())
     }
+}
+
+/// Checks rule 10 of [`DetectionEvent::validate`] for a
+/// [`Detail::WindowOutlier`] event.
+fn validate_window_outlier(
+    target: &Target,
+    detail: &WindowOutlierDetail,
+) -> Result<(), DetectionEventError> {
+    let Target::Subject { primary, .. } = target else {
+        return Err(DetectionEventError::InvalidWindowOutlier(
+            WindowOutlierViolation::NotSubjectTarget,
+        ));
+    };
+    let PrimarySubject::Host { ip: host, .. } = primary else {
+        return Err(DetectionEventError::InvalidWindowOutlier(
+            WindowOutlierViolation::NotHostSubject,
+        ));
+    };
+    if detail.top_slots.len() > MAX_TOP_SLOTS {
+        return Err(DetectionEventError::InvalidWindowOutlier(
+            WindowOutlierViolation::TooManyTopSlots {
+                count: detail.top_slots.len(),
+            },
+        ));
+    }
+    let Some((_, ip)) = detail.time_series_id.split_once('/') else {
+        return Err(DetectionEventError::InvalidWindowOutlier(
+            WindowOutlierViolation::TimeSeriesIdWithoutSlash,
+        ));
+    };
+    let Ok(ip) = ip.parse::<IpAddr>() else {
+        return Err(DetectionEventError::InvalidWindowOutlier(
+            WindowOutlierViolation::TimeSeriesIdWithoutIp,
+        ));
+    };
+    if ip != *host {
+        return Err(DetectionEventError::InvalidWindowOutlier(
+            WindowOutlierViolation::TimeSeriesIpMismatch {
+                time_series_ip: ip,
+                host: *host,
+            },
+        ));
+    }
+    Ok(())
 }
 
 /// Returns the kind a raw event body belongs to. The match has no wildcard,
@@ -671,11 +832,70 @@ pub enum DetectionEventError {
         /// The raw event's time.
         raw_event_time: jiff::Timestamp,
     },
+    /// Rule 10: a [`Detail::WindowOutlier`] event breaks a requirement of
+    /// that detail.
+    InvalidWindowOutlier(WindowOutlierViolation),
+}
+
+/// The requirement of rule 10 of [`DetectionEvent::validate`] that a
+/// [`Detail::WindowOutlier`] event breaks.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WindowOutlierViolation {
+    /// The target is a [`Target::RawEvent`], not a [`Target::Subject`].
+    NotSubjectTarget,
+    /// The primary subject is not a [`PrimarySubject::Host`].
+    NotHostSubject,
+    /// `top_slots` has more than 3 entries.
+    TooManyTopSlots {
+        /// The number of entries in `top_slots`.
+        count: usize,
+    },
+    /// `time_series_id` contains no `/`.
+    TimeSeriesIdWithoutSlash,
+    /// The part of `time_series_id` after the first `/` is not an IP address.
+    TimeSeriesIdWithoutIp,
+    /// The IP in `time_series_id` differs from the host's IP.
+    TimeSeriesIpMismatch {
+        /// The IP parsed from `time_series_id`.
+        time_series_ip: IpAddr,
+        /// The primary subject's host IP.
+        host: IpAddr,
+    },
+}
+
+impl fmt::Display for WindowOutlierViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotSubjectTarget => {
+                f.write_str("a WindowOutlier detail requires a subject target")
+            }
+            Self::NotHostSubject => {
+                f.write_str("a WindowOutlier detail requires a host primary subject")
+            }
+            Self::TooManyTopSlots { count } => {
+                write!(f, "{count} top slots exceed the maximum of {MAX_TOP_SLOTS}")
+            }
+            Self::TimeSeriesIdWithoutSlash => f.write_str("time_series_id contains no '/'"),
+            Self::TimeSeriesIdWithoutIp => {
+                f.write_str("the part of time_series_id after '/' is not an IP address")
+            }
+            Self::TimeSeriesIpMismatch {
+                time_series_ip,
+                host,
+            } => write!(
+                f,
+                "time_series_id IP {time_series_ip} differs from the host IP {host}"
+            ),
+        }
+    }
 }
 
 impl DetectionEventError {
-    /// Returns the number, 1 to 7, of the rule of
-    /// [`DetectionEvent::validate`] that failed.
+    /// Returns the number of the rule of [`DetectionEvent::validate`] that
+    /// failed: 1 to 7, or 10.
+    ///
+    /// Numbers 8 and 9 are never returned: they name the checks `REview` makes
+    /// on receipt, which `validate` does not make.
     #[must_use]
     pub fn rule(&self) -> u8 {
         match self {
@@ -686,6 +906,7 @@ impl DetectionEventError {
             Self::TooManyRelatedIps { .. } => 5,
             Self::NonFiniteScore { .. } => 6,
             Self::RawEventTimeMismatch { .. } => 7,
+            Self::InvalidWindowOutlier(_) => 10,
         }
     }
 }
@@ -727,6 +948,7 @@ impl fmt::Display for DetectionEventError {
                 f,
                 "time {time} differs from the raw event's time {raw_event_time}"
             ),
+            Self::InvalidWindowOutlier(violation) => violation.fmt(f),
         }
     }
 }
@@ -741,7 +963,7 @@ mod tests {
     use crate::types::raw_event;
 
     /// The models and numbers the schema commits to.
-    pub(super) const TABLE: [(DetectionModel, u32); 20] = [
+    pub(super) const TABLE: [(DetectionModel, u32); 21] = [
         (DetectionModel::WatchlistMatch, 0),
         (DetectionModel::CryptocurrencyMiningPool, 1),
         (DetectionModel::LockyRansomware, 2),
@@ -762,6 +984,7 @@ mod tests {
         (DetectionModel::UnusualDestinationPattern, 17),
         (DetectionModel::LabelDbMatch, 18),
         (DetectionModel::FarOutlier, 19),
+        (DetectionModel::WindowOutlier, 20),
     ];
 
     /// 2026-03-15T15:00:04.12Z.
@@ -834,6 +1057,60 @@ mod tests {
         }
     }
 
+    /// A slot of [`window_outlier`]'s window, starting `offset` ns after
+    /// [`NANOS`].
+    fn slot(offset: i128, value: f64, centroid_value: f64) -> SlotDeviation {
+        SlotDeviation {
+            slot_start: at(NANOS + offset),
+            value,
+            centroid_value,
+        }
+    }
+
+    /// A [`WindowOutlierDetail`] of the series of [`host`]'s IP, with three
+    /// top slots and `pcap_truncated` `Some`.
+    pub(super) fn window_outlier() -> WindowOutlierDetail {
+        WindowOutlierDetail {
+            time_series_id: "7/192.0.2.9".to_string(),
+            window_start: at(NANOS),
+            nearest_cluster_id: 5,
+            distance: 2.5,
+            top_slots: vec![
+                slot(0, 1.0, 0.5),
+                slot(60_000_000_000, 40.0, 2.0),
+                slot(120_000_000_000, 0.0, 3.25),
+            ],
+            truncated: 3,
+            pcap_truncated: Some(250),
+        }
+    }
+
+    /// A [`WindowOutlierDetail`] with no top slots and `pcap_truncated`
+    /// `None`.
+    pub(super) fn window_outlier_without_slots() -> WindowOutlierDetail {
+        WindowOutlierDetail {
+            top_slots: Vec::new(),
+            truncated: 0,
+            pcap_truncated: None,
+            ..window_outlier()
+        }
+    }
+
+    /// Returns [`window_outlier`] cut to each number of top slots from 0 to
+    /// 3, each with `pcap_truncated` `Some(0)`, `Some(u64::MAX)` and `None`.
+    pub(super) fn window_outlier_variants() -> Vec<WindowOutlierDetail> {
+        let mut variants = Vec::new();
+        for count in 0..=MAX_TOP_SLOTS {
+            for pcap_truncated in [Some(0), Some(u64::MAX), None] {
+                let mut detail = window_outlier();
+                detail.top_slots.truncate(count);
+                detail.pcap_truncated = pcap_truncated;
+                variants.push(detail);
+            }
+        }
+        variants
+    }
+
     /// Returns one detail per model, in [`TABLE`] order.
     pub(super) fn details() -> Vec<Detail> {
         vec![
@@ -897,7 +1174,38 @@ mod tests {
             }),
             Detail::LabelDbMatch(label_db_match()),
             Detail::FarOutlier(far_outlier()),
+            Detail::WindowOutlier(window_outlier()),
         ]
+    }
+
+    /// A valid `WindowOutlier` detection event about [`host`] carrying
+    /// `detail`, whose window spans the three top slots of
+    /// [`window_outlier`].
+    pub(super) fn window_outlier_event(detail: WindowOutlierDetail) -> DetectionEvent {
+        DetectionEvent {
+            time: detail.window_start,
+            sensor: None,
+            detection_model: DetectionModel::WindowOutlier,
+            raw_event_kind: RawEventKind::Tls,
+            category: None,
+            target: Target::Subject {
+                primary: host(),
+                related_ips: Vec::new(),
+                window: TimeWindow {
+                    start: at(NANOS),
+                    end: at(NANOS + 180_000_000_000 - 1),
+                },
+            },
+            score: detail.distance,
+            detail: Detail::WindowOutlier(detail),
+        }
+    }
+
+    fn window_outlier_detail(event: &mut DetectionEvent) -> &mut WindowOutlierDetail {
+        match &mut event.detail {
+            Detail::WindowOutlier(detail) => detail,
+            _ => unreachable!("the event has a WindowOutlier detail"),
+        }
     }
 
     fn raw_event_target() -> DetectionEvent {
@@ -986,13 +1294,14 @@ mod tests {
             assert_eq!(
                 usize::try_from(*number).expect("fits usize"),
                 index,
-                "numbers are 0-19 with no gap"
+                "numbers are 0-20 with no gap"
             );
             assert_eq!(DetectionModel::try_from(*number).ok(), Some(*model));
         }
         assert_eq!(u32::from(DetectionModel::LabelDbMatch), 18);
         assert_eq!(u32::from(DetectionModel::FarOutlier), 19);
-        assert!(DetectionModel::try_from(20_u32).is_err());
+        assert_eq!(u32::from(DetectionModel::WindowOutlier), 20);
+        assert!(DetectionModel::try_from(21_u32).is_err());
         assert!(DetectionModel::try_from(u32::MAX).is_err());
     }
 
@@ -1024,7 +1333,15 @@ mod tests {
             serde_json::from_str::<DetectionModel>("19").ok(),
             Some(DetectionModel::FarOutlier)
         );
-        assert!(serde_json::from_str::<DetectionModel>("20").is_err());
+        assert_eq!(
+            serde_json::to_string(&DetectionModel::WindowOutlier).expect("serializes"),
+            "20"
+        );
+        assert_eq!(
+            serde_json::from_str::<DetectionModel>("20").ok(),
+            Some(DetectionModel::WindowOutlier)
+        );
+        assert!(serde_json::from_str::<DetectionModel>("21").is_err());
         assert!(serde_json::from_str::<DetectionModel>("\"PortScan\"").is_err());
     }
 
@@ -1172,6 +1489,10 @@ mod tests {
             (
                 Detail::FarOutlier(far_outlier()),
                 DetectionModel::FarOutlier,
+            ),
+            (
+                Detail::WindowOutlier(window_outlier()),
+                DetectionModel::WindowOutlier,
             ),
         ] {
             let mut event = raw_event_target();
@@ -1346,6 +1667,304 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_window_outlier_events() {
+        let v6 = PrimarySubject::Host {
+            ip: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10)),
+            role: ThreatRole::Target,
+        };
+        let mut events = Vec::new();
+        for detail in window_outlier_variants() {
+            events.push(window_outlier_event(detail));
+        }
+        let mut ipv6 = window_outlier_event(window_outlier());
+        window_outlier_detail(&mut ipv6).time_series_id = "12/2001:db8::10".to_string();
+        let Target::Subject { primary, .. } = &mut ipv6.target else {
+            unreachable!("the event has a subject target");
+        };
+        *primary = v6.clone();
+        events.push(ipv6.clone());
+        // Written differently, but the same address as the host's.
+        for written in [
+            "12/2001:0db8:0000:0000:0000:0000:0000:0010",
+            "12/2001:DB8::0:10",
+        ] {
+            let mut event = ipv6.clone();
+            window_outlier_detail(&mut event).time_series_id = written.to_string();
+            events.push(event);
+        }
+        // The part before `/` is not checked, and only the first `/` splits.
+        let mut any_policy = window_outlier_event(window_outlier());
+        window_outlier_detail(&mut any_policy).time_series_id = "/192.0.2.9".to_string();
+        events.push(any_policy);
+        let mut empty = window_outlier_event(window_outlier_without_slots());
+        *window_of(&mut empty) = TimeWindow {
+            start: at(NANOS),
+            end: at(NANOS + 3_600_000_000_000 - 1),
+        };
+        events.push(empty);
+        for event in events {
+            assert_eq!(event.validate(), Ok(()), "{event:?}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_window_outlier_breaking_rule_10() {
+        let raw = {
+            let mut event = window_outlier_event(window_outlier());
+            event.sensor = Some("sensor-1".to_string());
+            event.raw_event_kind = RawEventKind::Conn;
+            event.target = Target::RawEvent {
+                time: event.time,
+                body: conn(),
+            };
+            event
+        };
+        let with_primary = |primary: PrimarySubject| {
+            let mut event = window_outlier_event(window_outlier());
+            event.sensor = Some("sensor-1".to_string());
+            let Target::Subject { primary: p, .. } = &mut event.target else {
+                unreachable!("the event has a subject target");
+            };
+            *p = primary;
+            event
+        };
+        let with_id = |id: &str| {
+            let mut event = window_outlier_event(window_outlier());
+            window_outlier_detail(&mut event).time_series_id = id.to_string();
+            event
+        };
+        let mut four_slots = window_outlier_event(window_outlier());
+        window_outlier_detail(&mut four_slots)
+            .top_slots
+            .push(slot(180_000_000_000, 1.0, 1.0));
+
+        let cases = [
+            (raw, WindowOutlierViolation::NotSubjectTarget),
+            (
+                with_primary(PrimarySubject::Sensor),
+                WindowOutlierViolation::NotHostSubject,
+            ),
+            (
+                with_primary(PrimarySubject::Cluster {
+                    clustering_model: 4,
+                    cluster_id: 17,
+                }),
+                WindowOutlierViolation::NotHostSubject,
+            ),
+            (
+                with_primary(PrimarySubject::Network {
+                    customer: 2,
+                    name: "office".to_string(),
+                    role: ThreatRole::Actor,
+                }),
+                WindowOutlierViolation::NotHostSubject,
+            ),
+            (
+                four_slots,
+                WindowOutlierViolation::TooManyTopSlots { count: 4 },
+            ),
+            (
+                with_id("192.0.2.9"),
+                WindowOutlierViolation::TimeSeriesIdWithoutSlash,
+            ),
+            (
+                with_id("7/host-a"),
+                WindowOutlierViolation::TimeSeriesIdWithoutIp,
+            ),
+            (with_id("7/"), WindowOutlierViolation::TimeSeriesIdWithoutIp),
+            (
+                with_id("7/192.0.2.9/24"),
+                WindowOutlierViolation::TimeSeriesIdWithoutIp,
+            ),
+            (
+                with_id("7/192.0.2.10"),
+                WindowOutlierViolation::TimeSeriesIpMismatch {
+                    time_series_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                    host: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
+                },
+            ),
+            (
+                with_id("7/::ffff:192.0.2.9"),
+                WindowOutlierViolation::TimeSeriesIpMismatch {
+                    time_series_ip: IpAddr::V6(Ipv4Addr::new(192, 0, 2, 9).to_ipv6_mapped()),
+                    host: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
+                },
+            ),
+        ];
+        for (event, violation) in cases {
+            let error = assert_rule(&event, 10);
+            assert_eq!(
+                error,
+                DetectionEventError::InvalidWindowOutlier(violation),
+                "{event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_describes_each_rule_10_violation() {
+        for (violation, message) in [
+            (
+                WindowOutlierViolation::NotSubjectTarget,
+                "a WindowOutlier detail requires a subject target",
+            ),
+            (
+                WindowOutlierViolation::NotHostSubject,
+                "a WindowOutlier detail requires a host primary subject",
+            ),
+            (
+                WindowOutlierViolation::TooManyTopSlots { count: 4 },
+                "4 top slots exceed the maximum of 3",
+            ),
+            (
+                WindowOutlierViolation::TimeSeriesIdWithoutSlash,
+                "time_series_id contains no '/'",
+            ),
+            (
+                WindowOutlierViolation::TimeSeriesIdWithoutIp,
+                "the part of time_series_id after '/' is not an IP address",
+            ),
+            (
+                WindowOutlierViolation::TimeSeriesIpMismatch {
+                    time_series_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                    host: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
+                },
+                "time_series_id IP 192.0.2.10 differs from the host IP 192.0.2.9",
+            ),
+        ] {
+            let error = DetectionEventError::InvalidWindowOutlier(violation);
+            assert_eq!(error.rule(), 10);
+            assert_eq!(
+                error.to_string(),
+                format!("detection event rule 10: {message}")
+            );
+        }
+    }
+
+    #[test]
+    fn validate_checks_rule_10_after_rules_1_to_7() {
+        // Each event also breaks rule 10 (its IP differs from the host's),
+        // so the lower-numbered rule is the one reported.
+        let broken = || {
+            let mut event = window_outlier_event(window_outlier());
+            window_outlier_detail(&mut event).time_series_id = "7/192.0.2.10".to_string();
+            event
+        };
+        assert_rule(&broken(), 10);
+
+        let mut mismatch = broken();
+        mismatch.detection_model = DetectionModel::FarOutlier;
+        assert_rule(&mismatch, 1);
+
+        let mut raw = broken();
+        raw.raw_event_kind = RawEventKind::Conn;
+        raw.target = Target::RawEvent {
+            time: raw.time,
+            body: conn(),
+        };
+        assert_rule(&raw, 2);
+        raw.sensor = Some("sensor-1".to_string());
+        raw.time = at(NANOS + 1);
+        assert_rule(&raw, 7);
+
+        let mut sensor = broken();
+        let Target::Subject { primary, .. } = &mut sensor.target else {
+            unreachable!("the event has a subject target");
+        };
+        *primary = PrimarySubject::Sensor;
+        assert_rule(&sensor, 3);
+
+        let mut inverted = broken();
+        window_of(&mut inverted).start = at(NANOS + 180_000_000_000);
+        assert_rule(&inverted, 4);
+
+        let mut related = broken();
+        let Target::Subject {
+            related_ips: too_many,
+            ..
+        } = with_related_ips(MAX_RELATED_IPS + 1).target
+        else {
+            unreachable!("with_related_ips() builds a subject target");
+        };
+        let Target::Subject { related_ips, .. } = &mut related.target else {
+            unreachable!("the event has a subject target");
+        };
+        *related_ips = too_many;
+        assert_rule(&related, 5);
+
+        let mut score = broken();
+        score.score = f64::NAN;
+        assert_rule(&score, 6);
+    }
+
+    #[test]
+    fn time_series_id_names_the_series_of_window_outlier_only() {
+        let details = details();
+        for detail in &details {
+            let expected = match detail {
+                Detail::WindowOutlier(_) => Some("7/192.0.2.9"),
+                _ => None,
+            };
+            assert_eq!(detail.time_series_id(), expected, "{detail:?}");
+        }
+        assert!(
+            details
+                .iter()
+                .any(|detail| matches!(detail, Detail::WindowOutlier(_)))
+        );
+        for detail in window_outlier_variants() {
+            let id = detail.time_series_id.clone();
+            assert_eq!(
+                Detail::WindowOutlier(detail).time_series_id(),
+                Some(id.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn window_outlier_times_encode_as_nanosecond_number_in_json() {
+        let expected = serde_json::Value::from(
+            i64::try_from(NANOS).expect("the test timestamp fits i64 nanoseconds"),
+        );
+        let event = window_outlier_event(window_outlier());
+        let value = serde_json::to_value(&event).expect("serializes");
+        let detail = &value["detail"]["WindowOutlier"];
+        assert_eq!(detail["window_start"], expected);
+        assert_eq!(detail["top_slots"][0]["slot_start"], expected);
+        assert_eq!(
+            detail["top_slots"][1]["slot_start"],
+            serde_json::Value::from(
+                i64::try_from(NANOS + 60_000_000_000).expect("fits i64 nanoseconds")
+            )
+        );
+
+        let mut wide = window_outlier();
+        wide.window_start = at(WIDE_NANOS);
+        wide.top_slots = vec![SlotDeviation {
+            slot_start: at(-WIDE_NANOS),
+            value: 1.0,
+            centroid_value: 0.5,
+        }];
+        let json = serde_json::to_string(&wide).expect("serializes");
+        assert!(
+            json.contains(r#""window_start":200000000000000000000,"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""slot_start":-200000000000000000000,"#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<WindowOutlierDetail>(&json).expect("deserializes"),
+            wide
+        );
+        let decoded: DetectionEvent =
+            serde_json::from_str(&serde_json::to_string(&event).expect("serializes"))
+                .expect("deserializes");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
     fn time_fields_encode_as_nanosecond_number_in_json() {
         let expected = serde_json::Value::from(
             i64::try_from(NANOS).expect("the test timestamp fits i64 nanoseconds"),
@@ -1482,6 +2101,14 @@ mod tests {
                 Detail::FarOutlier(far_outlier_without_prefix()),
                 r#"{"FarOutlier":{"Prefix":{"nearest_cluster_id":null,"nearest_signature":null,"matched_tokens":0,"prefix_len":0,"diverged_token":null,"pattern_count":1,"truncated_in_pattern":0}}}"#,
             ),
+            (
+                Detail::WindowOutlier(window_outlier()),
+                r#"{"WindowOutlier":{"time_series_id":"7/192.0.2.9","window_start":1773586804120000000,"nearest_cluster_id":5,"distance":2.5,"top_slots":[{"slot_start":1773586804120000000,"value":1.0,"centroid_value":0.5},{"slot_start":1773586864120000000,"value":40.0,"centroid_value":2.0},{"slot_start":1773586924120000000,"value":0.0,"centroid_value":3.25}],"truncated":3,"pcap_truncated":250}}"#,
+            ),
+            (
+                Detail::WindowOutlier(window_outlier_without_slots()),
+                r#"{"WindowOutlier":{"time_series_id":"7/192.0.2.9","window_start":1773586804120000000,"nearest_cluster_id":5,"distance":2.5,"top_slots":[],"truncated":0,"pcap_truncated":null}}"#,
+            ),
         ] {
             assert_eq!(serde_json::to_string(&detail).expect("serializes"), json);
             let decoded: Detail = serde_json::from_str(json).expect("deserializes");
@@ -1491,7 +2118,10 @@ mod tests {
 
     #[test]
     fn every_detail_round_trips_through_json() {
-        for detail in details() {
+        let window_outliers = window_outlier_variants()
+            .into_iter()
+            .map(Detail::WindowOutlier);
+        for detail in details().into_iter().chain(window_outliers) {
             let json = serde_json::to_string(&detail).expect("serializes");
             let decoded: Detail = serde_json::from_str(&json).expect("deserializes");
             assert_eq!(decoded, detail);
@@ -1513,7 +2143,8 @@ mod bincode_tests {
 
     use super::tests::{
         NANOS, TABLE, WIDE_NANOS, at, conn, details, far_outlier, far_outlier_without_prefix,
-        label_db_match,
+        label_db_match, window_outlier, window_outlier_event, window_outlier_variants,
+        window_outlier_without_slots,
     };
     use super::*;
 
@@ -1556,9 +2187,14 @@ mod bincode_tests {
             DetectionModel::LabelDbMatch
         );
         assert_eq!(decode::<DetectionModel>(&[19]), DetectionModel::FarOutlier);
+        assert_eq!(encode(&DetectionModel::WindowOutlier), [20]);
+        assert_eq!(
+            decode::<DetectionModel>(&[20]),
+            DetectionModel::WindowOutlier
+        );
         assert!(
             bincode::serde::decode_from_slice::<DetectionModel, _>(
-                &encode(&20_u32),
+                &encode(&21_u32),
                 bincode::config::standard(),
             )
             .is_err()
@@ -1752,9 +2388,96 @@ mod bincode_tests {
     }
 
     #[test]
+    fn window_outlier_encodes_after_every_existing_variant() {
+        let slot = |offset: i128, value: f64, centroid_value: f64| {
+            let mut bytes = encode(&(NANOS + offset));
+            bytes.extend(value.to_le_bytes());
+            bytes.extend(centroid_value.to_le_bytes());
+            bytes
+        };
+        let mut prefix = vec![20, 11];
+        prefix.extend(b"7/192.0.2.9");
+        prefix.extend(NANOS_BYTES);
+        prefix.push(5);
+        prefix.extend([0, 0, 0, 0, 0, 0, 0x04, 0x40]);
+
+        let mut full = prefix.clone();
+        full.push(3);
+        full.extend(NANOS_BYTES);
+        full.extend([0, 0, 0, 0, 0, 0, 0xf0, 0x3f, 0, 0, 0, 0, 0, 0, 0xe0, 0x3f]);
+        full.extend(slot(60_000_000_000, 40.0, 2.0));
+        full.extend(slot(120_000_000_000, 0.0, 3.25));
+        full.extend([3, 1, 250]);
+
+        let mut empty = prefix;
+        empty.extend([0, 0, 0]);
+
+        for (detail, bytes) in [
+            (Detail::WindowOutlier(window_outlier()), full),
+            (Detail::WindowOutlier(window_outlier_without_slots()), empty),
+        ] {
+            assert_eq!(encode(&detail), bytes, "{detail:?}");
+            assert_eq!(decode::<Detail>(&bytes), detail);
+        }
+    }
+
+    #[test]
+    fn window_outlier_times_encode_as_nanosecond_i128() {
+        let mut detail = window_outlier();
+        detail.window_start = at(WIDE_NANOS);
+        detail.top_slots.truncate(1);
+        detail.top_slots[0].slot_start = at(WIDE_NANOS);
+        let mut expected = vec![20, 11];
+        expected.extend(b"7/192.0.2.9");
+        expected.extend(WIDE_NANOS_BYTES);
+        expected.push(5);
+        expected.extend(2.5_f64.to_le_bytes());
+        expected.push(1);
+        expected.extend(WIDE_NANOS_BYTES);
+        expected.extend(1.0_f64.to_le_bytes());
+        expected.extend(0.5_f64.to_le_bytes());
+        expected.extend([3, 1, 250]);
+        let detail = Detail::WindowOutlier(detail);
+        assert_eq!(encode(&detail), expected);
+        assert_eq!(decode::<Detail>(&expected), detail);
+    }
+
+    #[test]
     fn every_detail_round_trips_through_bincode() {
-        for detail in details() {
+        let window_outliers = window_outlier_variants()
+            .into_iter()
+            .map(Detail::WindowOutlier);
+        for detail in details().into_iter().chain(window_outliers) {
             assert_eq!(decode::<Detail>(&encode(&detail)), detail);
+        }
+    }
+
+    #[test]
+    fn shared_detection_events_are_valid_and_carry_window_outlier() {
+        let events = crate::test::detection_events();
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(
+                event.validate().is_err(),
+                index == crate::test::INVALID_DETECTION_EVENT,
+                "{index}: {event:?}"
+            );
+        }
+        let pcap_truncated: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.detail {
+                Detail::WindowOutlier(detail) => Some(detail.pcap_truncated.is_some()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pcap_truncated, [true, false]);
+    }
+
+    #[test]
+    fn window_outlier_events_round_trip_through_bincode() {
+        for detail in window_outlier_variants() {
+            let event = window_outlier_event(detail);
+            assert_eq!(event.validate(), Ok(()));
+            assert_eq!(decode::<DetectionEvent>(&encode(&event)), event);
         }
     }
 

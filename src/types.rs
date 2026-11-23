@@ -20,8 +20,9 @@ pub use self::detection::{
     CryptocurrencyMiningPoolDetail, Detail, DetectionEvent, DetectionEventError, DetectionModel,
     EndpointRole, ExternalDdosDetail, FarOutlierDetail, FtpBruteForceDetail, LabelDbMatchDetail,
     LdapBruteForceDetail, MAX_RELATED_IPS, MultiHostPortScanDetail, PortScanDetail, PrimarySubject,
-    RdpBruteForceDetail, RelatedIp, RepeatedHttpSessionsDetail, Target, ThreatRole, TimeWindow,
-    UnusualDestinationPatternDetail, WatchlistMatchDetail,
+    RdpBruteForceDetail, RelatedIp, RepeatedHttpSessionsDetail, SlotDeviation, Target, ThreatRole,
+    TimeWindow, UnusualDestinationPatternDetail, WatchlistMatchDetail, WindowOutlierDetail,
+    WindowOutlierViolation,
 };
 
 /// A request to delete data belonging to a customer from a service.
