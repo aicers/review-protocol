@@ -444,10 +444,11 @@ pub const INVALID_DETECTION_EVENT: usize = 9;
 /// Returns a batch of synthetic detection events.
 ///
 /// Between them they carry every `Detail` variant, both `Target` kinds and
-/// every `PrimarySubject`; the `LabelDbMatch` and `FarOutlier` details appear
-/// twice each, once with their `Option` fields `Some` and once `None`. Every
-/// event is valid except the one at [`INVALID_DETECTION_EVENT`], which carries
-/// a detail of another model and sits between valid events.
+/// every `PrimarySubject`; the `LabelDbMatch`, `FarOutlier` and
+/// `WindowOutlier` details appear twice each, once with their `Option` fields
+/// `Some` and once `None`. Every event is valid except the one at
+/// [`INVALID_DETECTION_EVENT`], which carries a detail of another model and
+/// sits between valid events.
 #[allow(clippy::too_many_lines)] // One synthetic event per detection model.
 #[must_use]
 pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
@@ -458,8 +459,8 @@ pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
         EventCategory, ExternalDdosDetail, FarOutlierDetail, FtpBruteForceDetail,
         LabelDbMatchDetail, LdapBruteForceDetail, MultiHostPortScanDetail, PortScanDetail,
         PrimarySubject, RawEventBody, RawEventKind, RdpBruteForceDetail, RelatedIp,
-        RepeatedHttpSessionsDetail, Target, ThreatRole, TimeWindow,
-        UnusualDestinationPatternDetail, WatchlistMatchDetail, raw_event,
+        RepeatedHttpSessionsDetail, SlotDeviation, Target, ThreatRole, TimeWindow,
+        UnusualDestinationPatternDetail, WatchlistMatchDetail, WindowOutlierDetail, raw_event,
     };
 
     const BASE: i128 = 1_773_586_804_120_000_000;
@@ -841,6 +842,64 @@ pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
                 truncated_in_pattern: 0,
             }),
         ),
+        DetectionEvent {
+            time: at(-3_600_000_000_000),
+            sensor: None,
+            detection_model: DetectionModel::WindowOutlier,
+            raw_event_kind: RawEventKind::Tls,
+            category: None,
+            target: Target::Subject {
+                primary: host(15, ThreatRole::Actor),
+                related_ips: Vec::new(),
+                window: window(-3_540_000_000_000, -3_420_000_000_001),
+            },
+            score: 12.5,
+            detail: Detail::WindowOutlier(WindowOutlierDetail {
+                time_series_id: "3/192.0.2.15".to_string(),
+                window_start: at(-3_600_000_000_000),
+                nearest_cluster_id: 2,
+                distance: 12.5,
+                top_slots: vec![
+                    SlotDeviation {
+                        slot_start: at(-3_480_000_000_000),
+                        value: 310.0,
+                        centroid_value: 12.0,
+                    },
+                    SlotDeviation {
+                        slot_start: at(-3_540_000_000_000),
+                        value: 95.0,
+                        centroid_value: 10.5,
+                    },
+                ],
+                truncated: 4,
+                pcap_truncated: Some(17),
+            }),
+        },
+        DetectionEvent {
+            time: at(-7_200_000_000_000),
+            sensor: Some("sensor-1".to_string()),
+            detection_model: DetectionModel::WindowOutlier,
+            raw_event_kind: RawEventKind::Conn,
+            category: None,
+            target: Target::Subject {
+                primary: PrimarySubject::Host {
+                    ip: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x16)),
+                    role: ThreatRole::Target,
+                },
+                related_ips: Vec::new(),
+                window: window(-7_200_000_000_000, -3_600_000_000_001),
+            },
+            score: 3.0,
+            detail: Detail::WindowOutlier(WindowOutlierDetail {
+                time_series_id: "4/2001:db8::16".to_string(),
+                window_start: at(-7_200_000_000_000),
+                nearest_cluster_id: 0,
+                distance: 3.0,
+                top_slots: Vec::new(),
+                truncated: 0,
+                pcap_truncated: None,
+            }),
+        },
     ]
 }
 
