@@ -5,6 +5,13 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.0](https://github.com/aicers/review-protocol/compare/0.29.0...0.30.0) - 2026-11-23
+
+### Added
+
+- *(types)* [**breaking**] add the WindowOutlier detection model ([#359](https://github.com/aicers/review-protocol/pull/359))
+- *(types)* [**breaking**] replace sampling policies with time-series generation policies ([#357](https://github.com/aicers/review-protocol/pull/357))
+
 ## [0.29.0](https://github.com/aicers/review-protocol/compare/0.28.0...0.29.0) - 2026-11-23
 
 ### Added
