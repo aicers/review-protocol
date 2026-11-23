@@ -37,7 +37,8 @@ use crate::protocol_error::{DispatchError, ProtocolErrorKind};
 use crate::types::{
     ColumnStatisticsUpdate, CustomerDataDeletionReport, DataSource, DataSourceKey, DetectionEvent,
     DetectorStatusReport, HostNetworkGroup, LabelDb, NetworkListItem, OutlierInfo,
-    ReportedRunState, SamplingPolicy, TimeSeriesUpdate, UpdateClusterRequest, UserAgent,
+    ReportedRunState, TimeSeriesGenerationPolicy, TimeSeriesUpdate, UpdateClusterRequest,
+    UserAgent,
 };
 
 /// A request handler that can handle a request to the server.
@@ -107,7 +108,10 @@ pub trait Handler {
         Err("not supported".to_string())
     }
 
-    async fn get_sampling_policy_list(&self, _peer: &str) -> Result<Vec<SamplingPolicy>, String> {
+    async fn get_time_series_generation_policy_list(
+        &self,
+        _peer: &str,
+    ) -> Result<Vec<TimeSeriesGenerationPolicy>, String> {
         Err("not supported".to_string())
     }
 
@@ -437,9 +441,11 @@ where
                 let result = handler.get_pretrained_model(&name).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
-            RequestCode::GetSamplingPolicyList => {
+            RequestCode::GetTimeSeriesGenerationPolicyList => {
                 parse_args::<()>(body)?;
-                let result = handler.get_sampling_policy_list(peer_name).await;
+                let result = handler
+                    .get_time_series_generation_policy_list(peer_name)
+                    .await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
             RequestCode::InsertColumnStatistics => {
@@ -696,9 +702,11 @@ where
                 let result = handler.get_pretrained_model(&name).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
-            RequestCode::GetSamplingPolicyList => {
+            RequestCode::GetTimeSeriesGenerationPolicyList => {
                 parse_args::<()>(body)?;
-                let result = handler.get_sampling_policy_list(peer_name).await;
+                let result = handler
+                    .get_time_series_generation_policy_list(peer_name)
+                    .await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
             RequestCode::InsertColumnStatistics => {

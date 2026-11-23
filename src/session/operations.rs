@@ -41,7 +41,7 @@ use crate::{
     server::{Handler, RequestCode as ServerCode},
     types::{
         ColumnStatisticsUpdate, DataSource, DataSourceKey, DetectionEvent, HostNetworkGroup,
-        OutlierInfo, SamplingPolicy, TimeSeriesUpdate, UpdateClusterRequest, UserAgent,
+        OutlierInfo, TimeSeriesGenerationPolicy, TimeSeriesUpdate, UpdateClusterRequest, UserAgent,
     },
 };
 
@@ -832,8 +832,8 @@ server_operations! {
             => |h, peer, hosts| h.update_host_ports(peer, &hosts).await,
         UpdateHostOsAgents(Vec<(IpAddr, Vec<UserAgent>, Vec<String>)>) -> ()
             => |h, peer, hosts| h.update_host_user_agents(peer, &hosts).await,
-        GetSamplingPolicyList(()) -> Vec<SamplingPolicy>
-            => |h, peer, ()| h.get_sampling_policy_list(peer).await,
+        GetTimeSeriesGenerationPolicyList(()) -> Vec<TimeSeriesGenerationPolicy>
+            => |h, peer, ()| h.get_time_series_generation_policy_list(peer).await,
     }
 }
 

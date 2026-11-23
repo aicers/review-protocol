@@ -51,7 +51,7 @@ use crate::{
     client::RequestCode,
     types::{
         CloneModelRequest, CustomerDataDeletionRequest, HostNetworkGroup, NetworkListItem, Process,
-        ResourceUsage, SamplingPolicy, TrafficFilterRule, TrainModelRequest,
+        ResourceUsage, TimeSeriesGenerationPolicy, TrafficFilterRule, TrainModelRequest,
         node::{
             InstallPreflight, NodeEnrollRequest, NodeEnrollResponse, NodeHostnameRequest,
             NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
@@ -649,8 +649,11 @@ pub trait Handler: Send {
         return Err("not supported".to_string());
     }
 
-    /// Updates the list of sampling policies.
-    async fn sampling_policy_list(&mut self, _policies: &[SamplingPolicy]) -> Result<(), String> {
+    /// Updates the list of time-series generation policies.
+    async fn time_series_generation_policy_list(
+        &mut self,
+        _policies: &[TimeSeriesGenerationPolicy],
+    ) -> Result<(), String> {
         return Err("not supported".to_string());
     }
 
@@ -661,7 +664,10 @@ pub trait Handler: Send {
         return Err("not supported".to_string());
     }
 
-    async fn delete_sampling_policy(&mut self, _policies_ids: &[u32]) -> Result<(), String> {
+    async fn delete_time_series_generation_policy(
+        &mut self,
+        _policies_ids: &[u32],
+    ) -> Result<(), String> {
         return Err("not supported".to_string());
     }
 
@@ -1456,16 +1462,19 @@ pub async fn handle<H: Handler>(
                     .await
                     .map_err(HandlerError::SendError)?;
             }
-            RequestCode::SamplingPolicyList => {
-                let list = decode_args::<Vec<SamplingPolicy>>(send, code, body, None).await?;
-                let result = handler.sampling_policy_list(&list).await;
+            RequestCode::TimeSeriesGenerationPolicyList => {
+                let list =
+                    decode_args::<Vec<TimeSeriesGenerationPolicy>>(send, code, body, None).await?;
+                let result = handler.time_series_generation_policy_list(&list).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
-            RequestCode::DeleteSamplingPolicy => {
+            RequestCode::DeleteTimeSeriesGenerationPolicy => {
                 let policy_ids = decode_args::<Vec<u32>>(send, code, body, None).await?;
-                let result = handler.delete_sampling_policy(&policy_ids).await;
+                let result = handler
+                    .delete_time_series_generation_policy(&policy_ids)
+                    .await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;

@@ -87,7 +87,7 @@ below.
 | 36 | GetConfig | `get_config` | Configuration string |
 | 37 | UpdateHostOpenedPorts | `update_host_ports` | Unit |
 | 38 | UpdateHostOsAgents | `update_host_user_agents` | Unit |
-| 39 | GetSamplingPolicyList | `get_sampling_policy_list` | Sampling policies |
+| 39 | GetTimeSeriesGenerationPolicyList | `get_time_series_generation_policy_list` | Time-series generation policies |
 | 40 | ReportCustomerDataDeletion | `report_customer_data_deletion` | Unit |
 | 41 | UploadRunModel | `upload_run_model` | Unit |
 | 42 | ReportRun | `report_run` | Unit |

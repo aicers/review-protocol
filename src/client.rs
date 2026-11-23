@@ -46,8 +46,8 @@ pub(crate) enum RequestCode {
     /// Update the list of tor exit nodes
     TorExitNodeList = 8,
 
-    /// Update the list of sampling policies
-    SamplingPolicyList = 9,
+    /// Update the list of time-series generation policies
+    TimeSeriesGenerationPolicyList = 9,
 
     /// Update traffic filter rules
     ReloadFilterRule = 10,
@@ -55,8 +55,8 @@ pub(crate) enum RequestCode {
     /// Update Configuration
     UpdateConfig = 12,
 
-    /// Delete the list of sampling policies
-    DeleteSamplingPolicy = 13,
+    /// Delete the list of time-series generation policies
+    DeleteTimeSeriesGenerationPolicy = 13,
 
     /// Update the list of Internal network
     InternalNetworkList = 14,

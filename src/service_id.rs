@@ -312,9 +312,10 @@ pub const COMMON_DELETE_CUSTOMER_DATA: ServiceId = ServiceId::new("common", "del
 pub const COMMON_RELOAD_TI: ServiceId = ServiceId::new("common", "reload_ti");
 pub const COMMON_TOR_EXIT_NODE_LIST: ServiceId = ServiceId::new("common", "tor_exit_node_list");
 pub const COMMON_TRUSTED_DOMAIN_LIST: ServiceId = ServiceId::new("common", "trusted_domain_list");
-pub const COMMON_SAMPLING_POLICY_LIST: ServiceId = ServiceId::new("common", "sampling_policy_list");
-pub const COMMON_DELETE_SAMPLING_POLICY: ServiceId =
-    ServiceId::new("common", "delete_sampling_policy");
+pub const COMMON_TIME_SERIES_GENERATION_POLICY_LIST: ServiceId =
+    ServiceId::new("common", "time_series_generation_policy_list");
+pub const COMMON_DELETE_TIME_SERIES_GENERATION_POLICY: ServiceId =
+    ServiceId::new("common", "delete_time_series_generation_policy");
 pub const COMMON_RELOAD_FILTER_RULE: ServiceId = ServiceId::new("common", "reload_filter_rule");
 pub const COMMON_INTERNAL_NETWORK_LIST: ServiceId =
     ServiceId::new("common", "internal_network_list");
@@ -409,7 +410,8 @@ pub const SERVER_LIST_ALLOWLIST: ServiceId = ServiceId::new("server.list", "allo
 pub const SERVER_LIST_BLOCKLIST: ServiceId = ServiceId::new("server.list", "blocklist");
 pub const SERVER_LIST_TRUSTED_USER_AGENT: ServiceId =
     ServiceId::new("server.list", "trusted_user_agent");
-pub const SERVER_LIST_SAMPLING_POLICY: ServiceId = ServiceId::new("server.list", "sampling_policy");
+pub const SERVER_LIST_TIME_SERIES_GENERATION_POLICY: ServiceId =
+    ServiceId::new("server.list", "time_series_generation_policy");
 
 // ── server.customer_data_deletion ──────────────────────────────
 
@@ -612,11 +614,15 @@ pub(crate) fn from_client_request_code(code: ClientRequestCode) -> Option<Servic
         ClientRequestCode::ReloadTi => Some(COMMON_RELOAD_TI),
         ClientRequestCode::ResourceUsage => Some(NODE_OBSERVATION_RESOURCE_USAGE),
         ClientRequestCode::TorExitNodeList => Some(COMMON_TOR_EXIT_NODE_LIST),
-        ClientRequestCode::SamplingPolicyList => Some(COMMON_SAMPLING_POLICY_LIST),
+        ClientRequestCode::TimeSeriesGenerationPolicyList => {
+            Some(COMMON_TIME_SERIES_GENERATION_POLICY_LIST)
+        }
         ClientRequestCode::ReloadFilterRule => Some(COMMON_RELOAD_FILTER_RULE),
         ClientRequestCode::UpdateConfig => Some(COMMON_UPDATE_CONFIG),
         ClientRequestCode::DeleteCustomerData => Some(COMMON_DELETE_CUSTOMER_DATA),
-        ClientRequestCode::DeleteSamplingPolicy => Some(COMMON_DELETE_SAMPLING_POLICY),
+        ClientRequestCode::DeleteTimeSeriesGenerationPolicy => {
+            Some(COMMON_DELETE_TIME_SERIES_GENERATION_POLICY)
+        }
         ClientRequestCode::InternalNetworkList => Some(COMMON_INTERNAL_NETWORK_LIST),
         ClientRequestCode::Allowlist => Some(COMMON_ALLOWLIST),
         ClientRequestCode::Blocklist => Some(COMMON_BLOCKLIST),
@@ -692,7 +698,9 @@ pub(crate) fn from_server_request_code(code: ServerRequestCode) -> Option<Servic
         ServerRequestCode::GetAllowlist => Some(SERVER_LIST_ALLOWLIST),
         ServerRequestCode::GetBlocklist => Some(SERVER_LIST_BLOCKLIST),
         ServerRequestCode::GetTrustedUserAgentList => Some(SERVER_LIST_TRUSTED_USER_AGENT),
-        ServerRequestCode::GetSamplingPolicyList => Some(SERVER_LIST_SAMPLING_POLICY),
+        ServerRequestCode::GetTimeSeriesGenerationPolicyList => {
+            Some(SERVER_LIST_TIME_SERIES_GENERATION_POLICY)
+        }
         ServerRequestCode::ReportCustomerDataDeletion => Some(SERVER_CUSTOMER_DATA_DELETION_REPORT),
         ServerRequestCode::UploadRunModel => Some(SERVER_RUN_UPLOAD_MODEL),
         ServerRequestCode::ReportRun => Some(SERVER_RUN_REPORT),
@@ -793,8 +801,8 @@ pub fn all() -> &'static [ServiceId] {
         COMMON_RELOAD_TI,
         COMMON_TOR_EXIT_NODE_LIST,
         COMMON_TRUSTED_DOMAIN_LIST,
-        COMMON_SAMPLING_POLICY_LIST,
-        COMMON_DELETE_SAMPLING_POLICY,
+        COMMON_TIME_SERIES_GENERATION_POLICY_LIST,
+        COMMON_DELETE_TIME_SERIES_GENERATION_POLICY,
         COMMON_RELOAD_FILTER_RULE,
         COMMON_INTERNAL_NETWORK_LIST,
         COMMON_ALLOWLIST,
@@ -857,7 +865,7 @@ pub fn all() -> &'static [ServiceId] {
         SERVER_LIST_ALLOWLIST,
         SERVER_LIST_BLOCKLIST,
         SERVER_LIST_TRUSTED_USER_AGENT,
-        SERVER_LIST_SAMPLING_POLICY,
+        SERVER_LIST_TIME_SERIES_GENERATION_POLICY,
     ]
 }
 
@@ -1027,11 +1035,11 @@ mod tests {
             ClientRequestCode::ReloadTi,
             ClientRequestCode::ResourceUsage,
             ClientRequestCode::TorExitNodeList,
-            ClientRequestCode::SamplingPolicyList,
+            ClientRequestCode::TimeSeriesGenerationPolicyList,
             ClientRequestCode::ReloadFilterRule,
             ClientRequestCode::UpdateConfig,
             ClientRequestCode::DeleteCustomerData,
-            ClientRequestCode::DeleteSamplingPolicy,
+            ClientRequestCode::DeleteTimeSeriesGenerationPolicy,
             ClientRequestCode::InternalNetworkList,
             ClientRequestCode::Allowlist,
             ClientRequestCode::Blocklist,
@@ -1099,7 +1107,7 @@ mod tests {
             ServerRequestCode::GetConfig,
             ServerRequestCode::UpdateHostOpenedPorts,
             ServerRequestCode::UpdateHostOsAgents,
-            ServerRequestCode::GetSamplingPolicyList,
+            ServerRequestCode::GetTimeSeriesGenerationPolicyList,
             ServerRequestCode::ReportCustomerDataDeletion,
             ServerRequestCode::UploadRunModel,
             ServerRequestCode::ReportRun,
@@ -1153,6 +1161,35 @@ mod tests {
         let service = from_server_request_code(code).expect("request 13 has a service ID");
         assert_eq!(service, SERVER_EVENT_INSERT_LABELS);
         assert_eq!(service.to_string(), "server.event.insert_labels");
+    }
+
+    /// The three time-series generation policy request codes map to their
+    /// service IDs, whose strings are pinned.
+    #[test]
+    fn time_series_generation_policy_service_ids() {
+        let client = from_client_request_code(ClientRequestCode::TimeSeriesGenerationPolicyList)
+            .expect("the request code has a service ID");
+        assert_eq!(client, COMMON_TIME_SERIES_GENERATION_POLICY_LIST);
+        assert_eq!(
+            client.to_string(),
+            "common.time_series_generation_policy_list"
+        );
+
+        let delete = from_client_request_code(ClientRequestCode::DeleteTimeSeriesGenerationPolicy)
+            .expect("the request code has a service ID");
+        assert_eq!(delete, COMMON_DELETE_TIME_SERIES_GENERATION_POLICY);
+        assert_eq!(
+            delete.to_string(),
+            "common.delete_time_series_generation_policy"
+        );
+
+        let server = from_server_request_code(ServerRequestCode::GetTimeSeriesGenerationPolicyList)
+            .expect("the request code has a service ID");
+        assert_eq!(server, SERVER_LIST_TIME_SERIES_GENERATION_POLICY);
+        assert_eq!(
+            server.to_string(),
+            "server.list.time_series_generation_policy"
+        );
     }
 
     /// All service identifiers returned by [`all()`] should have
