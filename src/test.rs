@@ -443,9 +443,10 @@ pub const INVALID_DETECTION_EVENT: usize = 9;
 /// Returns a batch of synthetic detection events.
 ///
 /// Between them they carry every `Detail` variant, both `Target` kinds and
-/// every `PrimarySubject`. Every event is valid except the one at
-/// [`INVALID_DETECTION_EVENT`], which carries a detail of another model and
-/// sits between valid events.
+/// every `PrimarySubject`; the `LabelDbMatch` and `FarOutlier` details appear
+/// twice each, once with their `Option` fields `Some` and once `None`. Every
+/// event is valid except the one at [`INVALID_DETECTION_EVENT`], which carries
+/// a detail of another model and sits between valid events.
 #[allow(clippy::too_many_lines)] // One synthetic event per detection model.
 #[must_use]
 pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
@@ -453,9 +454,10 @@ pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
 
     use crate::types::{
         CryptocurrencyMiningPoolDetail, Detail, DetectionEvent, DetectionModel, EndpointRole,
-        EventCategory, ExternalDdosDetail, FtpBruteForceDetail, LdapBruteForceDetail,
-        MultiHostPortScanDetail, PortScanDetail, PrimarySubject, RawEventBody, RawEventKind,
-        RdpBruteForceDetail, RelatedIp, RepeatedHttpSessionsDetail, Target, ThreatRole, TimeWindow,
+        EventCategory, ExternalDdosDetail, FarOutlierDetail, FtpBruteForceDetail,
+        LabelDbMatchDetail, LdapBruteForceDetail, MultiHostPortScanDetail, PortScanDetail,
+        PrimarySubject, RawEventBody, RawEventKind, RdpBruteForceDetail, RelatedIp,
+        RepeatedHttpSessionsDetail, Target, ThreatRole, TimeWindow,
         UnusualDestinationPatternDetail, WatchlistMatchDetail, raw_event,
     };
 
@@ -753,7 +755,7 @@ pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
             17,
             DetectionModel::DnsCovertChannel,
             Some(EventCategory::Exfiltration),
-            conn,
+            conn.clone(),
             0.85,
             Detail::DnsCovertChannel,
         ),
@@ -772,6 +774,70 @@ pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
                 std_deviation: 1.25,
                 z_score: 30.0,
                 truncated_related_ips: 2,
+            }),
+        ),
+        raw_event(
+            19,
+            DetectionModel::LabelDbMatch,
+            Some(EventCategory::InitialAccess),
+            conn.clone(),
+            0.8,
+            Detail::LabelDbMatch(LabelDbMatchDetail {
+                label_db: "label-db-1".to_string(),
+                rule_id: 42,
+                rule_name: "rule-a".to_string(),
+                matched_to: "GET /index.html".to_string(),
+                cluster_id: 3,
+                rule_confidence: Some(0.8),
+                match_score: 0.75,
+            }),
+        ),
+        raw_event(
+            20,
+            DetectionModel::LabelDbMatch,
+            Some(EventCategory::Discovery),
+            conn.clone(),
+            1.0,
+            Detail::LabelDbMatch(LabelDbMatchDetail {
+                label_db: "label-db-2".to_string(),
+                rule_id: 7,
+                rule_name: "rule-b".to_string(),
+                matched_to: "198.51.100.9".to_string(),
+                cluster_id: 11,
+                rule_confidence: None,
+                match_score: 1.0,
+            }),
+        ),
+        raw_event(
+            21,
+            DetectionModel::FarOutlier,
+            None,
+            conn.clone(),
+            0.5,
+            Detail::FarOutlier(FarOutlierDetail::Prefix {
+                nearest_cluster_id: Some(4),
+                nearest_signature: Some("GET /api".to_string()),
+                matched_tokens: 2,
+                prefix_len: 4,
+                diverged_token: Some("v9".to_string()),
+                pattern_count: 1_200,
+                truncated_in_pattern: 1_100,
+            }),
+        ),
+        raw_event(
+            22,
+            DetectionModel::FarOutlier,
+            None,
+            conn,
+            1.0,
+            Detail::FarOutlier(FarOutlierDetail::Prefix {
+                nearest_cluster_id: None,
+                nearest_signature: None,
+                matched_tokens: 0,
+                prefix_len: 0,
+                diverged_token: None,
+                pattern_count: 1,
+                truncated_in_pattern: 0,
             }),
         ),
     ]
