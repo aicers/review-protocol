@@ -18,10 +18,10 @@ pub mod raw_event;
 
 pub use self::detection::{
     CryptocurrencyMiningPoolDetail, Detail, DetectionEvent, DetectionEventError, DetectionModel,
-    EndpointRole, ExternalDdosDetail, FtpBruteForceDetail, LdapBruteForceDetail, MAX_RELATED_IPS,
-    MultiHostPortScanDetail, PortScanDetail, PrimarySubject, RdpBruteForceDetail, RelatedIp,
-    RepeatedHttpSessionsDetail, Target, ThreatRole, TimeWindow, UnusualDestinationPatternDetail,
-    WatchlistMatchDetail,
+    EndpointRole, ExternalDdosDetail, FarOutlierDetail, FtpBruteForceDetail, LabelDbMatchDetail,
+    LdapBruteForceDetail, MAX_RELATED_IPS, MultiHostPortScanDetail, PortScanDetail, PrimarySubject,
+    RdpBruteForceDetail, RelatedIp, RepeatedHttpSessionsDetail, Target, ThreatRole, TimeWindow,
+    UnusualDestinationPatternDetail, WatchlistMatchDetail,
 };
 
 /// A request to delete data belonging to a customer from a service.
@@ -86,52 +86,136 @@ pub struct TrainModelRequest {
     /// `log_path`, `[auth]` or `[review]`). The definition carries no `name`
     /// key: the name of the model is [`model`](Self::model) only.
     ///
-    /// ```toml
-    /// raw_event_kind = "http"                        # required; Giganto raw event kind (string)
-    /// method = "multidimension"                      # required; "multidimension" | "prefix" | "timeseries"
-    /// sources = ["piglet.node2.example.com"]         # required; non-empty array of strings, no repeats
-    /// window_start = "2026-10-14T00:00:00Z"          # required; RFC 3339 with offset; inclusive
-    /// window_end = "2026-10-21T00:00:00Z"            # required; RFC 3339 with offset; exclusive; after window_start
-    /// batch_size = 1000000                           # optional usize; default 1000000 (total events read)
-    /// algorithm = "dbscan"                           # optional; "dbscan" | "hdbscan" | "optics"; default "dbscan"
-    /// eps = 2.0                                      # optional f64; default 2.0
-    /// min_token_length = 3                           # optional usize; default 3
-    /// max_token_length = 10                          # optional usize; no default; ignored with a warning when < 2 * min_token_length
-    /// max_data_len = 30                              # optional usize; no default
-    /// long_pattern_len = 16000                       # optional usize; default 16000
-    /// precision = 2                                  # optional i32; default 2 (DEFAULT_PRECISION)
-    /// numbers_of_top_n = [30, 30]                    # optional array of usize; default []
-    /// max_event_id_num = 25                          # optional u32; default 25; capped at 100
-    /// suspicious_tokens = "indicator-name"           # optional; an indicator NAME, never a path
+    /// A definition carries every value its method uses. The engine has no
+    /// default for any key. Each key below has a value type and, under each
+    /// `method`, one of these statuses:
     ///
-    /// [data_store]                                   # required
-    /// address = "10.0.0.5:38371"                     # socket address "ip:port"
+    /// - **required**: absent is refused.
+    /// - **absent means none**: an absent key means the feature is not used.
+    /// - **refused**: the method does not use the key, so it is refused when
+    ///   present.
+    ///
+    /// | Key | Value | `multidimension` | `prefix` | `timeseries` |
+    /// | --- | --- | --- | --- | --- |
+    /// | `type` | string: a clustering model type id, or `"custom"` | required | required | required |
+    /// | `type_version` | u32 | required for a type id, refused for `"custom"` | required for a type id, refused for `"custom"` | required for a type id, refused for `"custom"` |
+    /// | `raw_event_kind` | string | required: a Giganto raw event kind in snake case that has a clustering model type | required, always `"log"` | required; its meaning is set by later work |
+    /// | `log_kind` | string | refused | required: a Giganto log kind name, not one of Giganto's other raw event kind names | refused |
+    /// | `method` | string: `"multidimension"`, `"prefix"` or `"timeseries"` | required | required | required |
+    /// | `sources` | non-empty array of strings, no repeats | required | required | required |
+    /// | `window_start` | string: RFC 3339 with offset; inclusive | required | required | required |
+    /// | `window_end` | string: RFC 3339 with offset; exclusive; after `window_start` | required | required | required |
+    /// | `[data_store]` | table: `address`, a socket address `"ip:port"`, and `server_name`, a string; both required | required | required | required |
+    /// | `batch_size` | usize (total events read) | required | required | required |
+    /// | `max_event_id_num` | u32; capped at 100 | required | required | required |
+    /// | `suspicious_tokens` | string: an indicator NAME, never a path | absent means none | absent means none | absent means none |
+    /// | `algorithm` | string: `"dbscan"`, `"hdbscan"` or `"optics"` | required | refused | required |
+    /// | `eps` | f64 | required | refused | required |
+    /// | `precision` | i32 | required | refused | required |
+    /// | `numbers_of_top_n` | array of usize; filled as stated below | required | refused | required |
+    /// | `min_token_length` | usize | required | required | refused |
+    /// | `long_pattern_len` | usize | required | required | refused |
+    /// | `max_data_len` | usize | absent means no limit | absent means no limit | refused |
+    /// | `max_token_length` | usize; ignored with a warning when < 2 * `min_token_length` | refused | absent means no limit | refused |
+    /// | `[csv]` | table: the keys below | required | refused | refused |
+    ///
+    /// `[csv]`, which only the multidimension method takes, has these keys:
+    ///
+    /// | Key | Value | Status |
+    /// | --- | --- | --- |
+    /// | `reader` | inline table `{ delimiter, quote }`: both keys u8, both required | required |
+    /// | `format` | array, one entry per column, in column order; each entry has `data_type`: `"int64"`, `"float64"`, `"datetime"`, `"ipaddr"`, `"enum"`, `"utf8"` or `"binary"`; `weight`: f64, required; `name`: optional string; `format`: optional string (a datetime parse format) | required |
+    /// | `time_intervals` | array of u32 (seconds) | filled as stated below when absent or short |
+    /// | `time_column` | usize | absent means none |
+    /// | `count_columns` | array of usize | absent means none |
+    /// | `prefix_columns` | array of usize | absent means none: without it the clustering uses the centroid approach |
+    ///
+    /// A multidimension definition:
+    ///
+    /// ```toml
+    /// type = "custom"
+    /// raw_event_kind = "http"
+    /// method = "multidimension"
+    /// sources = ["piglet.node2.example.com"]
+    /// window_start = "2026-10-14T00:00:00Z"
+    /// window_end = "2026-10-21T00:00:00Z"
+    /// batch_size = 1000000
+    /// max_event_id_num = 25
+    /// algorithm = "dbscan"
+    /// eps = 2.0
+    /// precision = 2
+    /// numbers_of_top_n = [30, 30]
+    /// min_token_length = 3
+    /// long_pattern_len = 16000
+    /// max_data_len = 30
+    /// suspicious_tokens = "indicator-name"
+    ///
+    /// [data_store]
+    /// address = "10.0.0.5:38371"
     /// server_name = "001.giganto.node1.example.com"
     ///
-    /// [csv]                                          # required when method = "multidimension"; refused otherwise
-    /// reader = { delimiter = 9, quote = 0 }          # optional; both u8 keys required when present; default { delimiter = 44, quote = 34 }
-    /// format = [                                     # optional array; one entry per column, in column order
+    /// [csv]
+    /// reader = { delimiter = 9, quote = 0 }
+    /// format = [
     ///   { data_type = "utf8", weight = 0.0, name = "time" },
     ///   { data_type = "utf8", weight = 1.0, name = "host" },
-    /// ]                                              # data_type: "int64" | "float64" | "datetime" | "ipaddr" | "enum" | "utf8" | "binary"; weight: f64, required; name: optional string; format: optional string (a datetime parse format)
-    /// time_intervals = [60]                          # optional array of u32 (seconds)
-    /// time_column = 0                                # optional usize
-    /// count_columns = [0]                            # optional array of usize
-    /// prefix_columns = [14, 15]                      # optional array of usize
+    /// ]
+    /// time_column = 0
+    /// count_columns = [0]
+    /// prefix_columns = [1]
     /// ```
     ///
+    /// A prefix definition:
+    ///
+    /// ```toml
+    /// type = "custom"
+    /// raw_event_kind = "log"
+    /// log_kind = "web-access"
+    /// method = "prefix"
+    /// sources = ["piglet.node2.example.com"]
+    /// window_start = "2026-10-14T00:00:00Z"
+    /// window_end = "2026-10-21T00:00:00Z"
+    /// batch_size = 1000000
+    /// max_event_id_num = 25
+    /// min_token_length = 3
+    /// max_token_length = 10
+    /// long_pattern_len = 16000
+    ///
+    /// [data_store]
+    /// address = "10.0.0.5:38371"
+    /// server_name = "001.giganto.node1.example.com"
+    /// ```
+    ///
+    /// - `log_kind` is present exactly when `raw_event_kind = "log"`.
     /// - `[csv]` is exactly `crate::remake::csv::Config` (columns
     ///   `ColumnDescription`, `reader` = `structured::csv::Config`,
     ///   `data_type` = `structured::ColumnType`), with `deny_unknown_fields`
-    ///   added.
-    /// - The defaults are the engine's and equal RFC 0006 §5.5's.
+    ///   added; the statuses above apply to its keys.
     /// - `event_type` is derived from `method` as in E1 (multidimension →
     ///   `csv`, prefix → `log`, timeseries → `timeseries`).
-    /// - The engine refuses a definition that does not parse, has empty
-    ///   `sources`, repeats a source in `sources`, has `window_end` not after
-    ///   `window_start`, has `method = "multidimension"` without `[csv]`, or
-    ///   has `[csv]` with another method. Other bounds (§5.2) are
-    ///   review-web's.
+    /// - **Fill values.** These are contract values, not engine defaults.
+    ///   Changing them changes the contract.
+    ///   - When `time_intervals` is absent or shorter than the number of
+    ///     `datetime` columns, each remaining `datetime` column gets 3600
+    ///     seconds.
+    ///   - For the multidimension method, when `numbers_of_top_n` is shorter
+    ///     than the number of columns (an empty list included), each
+    ///     remaining `datetime` column gets 336 and each other remaining
+    ///     column gets 30. For the timeseries method, the key is required;
+    ///     its fill is set by later work.
+    /// - The engine refuses a definition that does not parse, lacks a key its
+    ///   method requires, carries a key its method refuses, has
+    ///   `type_version` with `type = "custom"` or lacks it with a type id,
+    ///   has `log_kind` when `raw_event_kind` is not `"log"` or lacks it when
+    ///   `raw_event_kind = "log"`, has empty `sources`, repeats a
+    ///   source in `sources`, has `window_end` not after `window_start`, has
+    ///   `method = "multidimension"` without `[csv]`, or has `[csv]` with
+    ///   another method.
+    /// - These checks belong to review-web, not the engine: the type id is
+    ///   known, its version is current, and `method`, `raw_event_kind` and
+    ///   the type's fixed values equal the type's; operator values are in
+    ///   range (§5.2); a multidimension `raw_event_kind` has a clustering
+    ///   model type; a prefix `log_kind` is a log kind name.
     pub definition: String,
 }
 

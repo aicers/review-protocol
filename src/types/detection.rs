@@ -57,6 +57,35 @@ pub enum DetectionModel {
     DomainGenerationAlgorithm = 15,
     DnsCovertChannel = 16,
     UnusualDestinationPattern = 17,
+    /// Label DB rules matched against the raw events in the clusters of a
+    /// clustering model's round.
+    ///
+    /// One detection event per matched raw event and rule, carrying a
+    /// [`Detail::LabelDbMatch`]. `category` is the rule's category. `score`
+    /// is the rule's confidence ([`LabelDbMatchDetail::rule_confidence`])
+    /// when the rule has one, otherwise the match score
+    /// ([`LabelDbMatchDetail::match_score`]).
+    LabelDbMatch = 18,
+    /// Raw events of a new outlier token pattern far from every known cluster
+    /// prefix of a clustering model's round.
+    ///
+    /// Each raw event that is a new outlier of this round (not an outlier
+    /// carried over from an earlier round), and whose token pattern is not
+    /// the pattern of any carried-over outlier, is one candidate. A candidate
+    /// becomes a detection event, carrying a [`Detail::FarOutlier`], unless
+    /// the exclusion-list filter, the per-pattern cap or the per-round cap
+    /// removes it. `category` is `None`.
+    ///
+    /// The **best prefix** is chosen among the prefixes of all clusters after
+    /// the round's clustering, including clusters created in this round. It
+    /// is the prefix with the highest share of its tokens matched by the
+    /// outlier's pattern from the first token on. Ties go to more matched
+    /// tokens, then the lower cluster id, then the earlier regex.
+    ///
+    /// `score` is 1 − (`matched_tokens` ÷ `prefix_len`) for the best prefix
+    /// (see [`FarOutlierDetail::Prefix`]), and 1 when there is no cluster
+    /// prefix or the pattern has no token.
+    FarOutlier = 19,
 }
 
 /// A detection: what a detection model found, about which target, and why.
@@ -209,6 +238,8 @@ pub enum Detail {
     DomainGenerationAlgorithm,
     DnsCovertChannel,
     UnusualDestinationPattern(UnusualDestinationPatternDetail),
+    LabelDbMatch(LabelDbMatchDetail),
+    FarOutlier(FarOutlierDetail),
 }
 
 impl Detail {
@@ -234,6 +265,8 @@ impl Detail {
             Self::DomainGenerationAlgorithm => DetectionModel::DomainGenerationAlgorithm,
             Self::DnsCovertChannel => DetectionModel::DnsCovertChannel,
             Self::UnusualDestinationPattern(_) => DetectionModel::UnusualDestinationPattern,
+            Self::LabelDbMatch(_) => DetectionModel::LabelDbMatch,
+            Self::FarOutlier(_) => DetectionModel::FarOutlier,
         }
     }
 }
@@ -391,6 +424,78 @@ pub struct UnusualDestinationPatternDetail {
     pub z_score: f64,
     /// The number of related IPs dropped to stay within [`MAX_RELATED_IPS`].
     pub truncated_related_ips: u64,
+}
+
+/// The detail of a [`DetectionModel::LabelDbMatch`] detection.
+///
+/// `Debug` is derived: `matched_to` is printed as is, because RFC 0008 leaves
+/// its classification and masking to RFC 0010 D112.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LabelDbMatchDetail {
+    /// The name of the label DB that holds the matched rule.
+    ///
+    /// Rule ids are assigned per label DB, so the name is needed to identify
+    /// the rule.
+    pub label_db: String,
+    /// The matched rule's id within [`label_db`](Self::label_db).
+    pub rule_id: u32,
+    /// The matched rule's name.
+    pub rule_name: String,
+    /// The signature that matched.
+    pub matched_to: String,
+    /// The cluster of the round that the raw event belongs to.
+    pub cluster_id: u32,
+    /// The rule's confidence, 0–1; `None` when the rule has none.
+    pub rule_confidence: Option<f32>,
+    /// How well the rule matched, 0–1.
+    ///
+    /// For token rules it is the share of the rule's tokens that matched. For
+    /// exact, URL, IP and regex rules it is 1.0.
+    pub match_score: f32,
+}
+
+/// The detail of a [`DetectionModel::FarOutlier`] detection, one variant per
+/// approach that measures how far the outlier is.
+///
+/// `Debug` is derived: `nearest_signature` and `diverged_token` are printed
+/// as is, because RFC 0008 leaves their classification and masking to
+/// RFC 0010 D112.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum FarOutlierDetail {
+    /// The prefix-approach form, measured against the best prefix that
+    /// [`DetectionModel::FarOutlier`] defines. Other approaches may add
+    /// variants later.
+    Prefix {
+        /// The cluster of the best prefix; `None` when there is no cluster
+        /// prefix.
+        nearest_cluster_id: Option<u32>,
+        /// The signature of the best prefix's cluster; `None` when there is
+        /// no cluster prefix.
+        nearest_signature: Option<String>,
+        /// The number of leading tokens of the outlier's pattern equal to the
+        /// best prefix's.
+        ///
+        /// It is also the 0-based position where the two diverge.
+        matched_tokens: u32,
+        /// The best prefix's length in tokens.
+        prefix_len: u32,
+        /// The outlier's token at the position
+        /// [`matched_tokens`](Self::Prefix::matched_tokens) names; `None`
+        /// when the pattern has no token there.
+        diverged_token: Option<String>,
+        /// The number of the round's raw events with this pattern, counted
+        /// before the exclusion-list filter.
+        pattern_count: u64,
+        /// The number of this pattern's detection events dropped by the
+        /// per-pattern cap, counted after the exclusion-list filter.
+        ///
+        /// Events dropped by the per-round cap are not counted here. The
+        /// round's [`DetectionModelStatus::truncated`] counts the drops of
+        /// both caps.
+        ///
+        /// [`DetectionModelStatus::truncated`]: super::DetectionModelStatus::truncated
+        truncated_in_pattern: u64,
+    },
 }
 
 impl DetectionEvent {
@@ -636,7 +741,7 @@ mod tests {
     use crate::types::raw_event;
 
     /// The models and numbers the schema commits to.
-    pub(super) const TABLE: [(DetectionModel, u32); 18] = [
+    pub(super) const TABLE: [(DetectionModel, u32); 20] = [
         (DetectionModel::WatchlistMatch, 0),
         (DetectionModel::CryptocurrencyMiningPool, 1),
         (DetectionModel::LockyRansomware, 2),
@@ -655,6 +760,8 @@ mod tests {
         (DetectionModel::DomainGenerationAlgorithm, 15),
         (DetectionModel::DnsCovertChannel, 16),
         (DetectionModel::UnusualDestinationPattern, 17),
+        (DetectionModel::LabelDbMatch, 18),
+        (DetectionModel::FarOutlier, 19),
     ];
 
     /// 2026-03-15T15:00:04.12Z.
@@ -685,6 +792,46 @@ mod tests {
             orig_l2_bytes: 200,
             resp_l2_bytes: 400,
         })
+    }
+
+    /// A [`LabelDbMatchDetail`] whose `Option` field is `Some`.
+    pub(super) fn label_db_match() -> LabelDbMatchDetail {
+        LabelDbMatchDetail {
+            label_db: "ldb".to_string(),
+            rule_id: 300,
+            rule_name: "r".to_string(),
+            matched_to: "sig".to_string(),
+            cluster_id: 7,
+            rule_confidence: Some(0.5),
+            match_score: 1.0,
+        }
+    }
+
+    /// A [`FarOutlierDetail::Prefix`] whose `Option` fields are `Some`.
+    pub(super) fn far_outlier() -> FarOutlierDetail {
+        FarOutlierDetail::Prefix {
+            nearest_cluster_id: Some(5),
+            nearest_signature: Some("ab".to_string()),
+            matched_tokens: 2,
+            prefix_len: 4,
+            diverged_token: Some("x".to_string()),
+            pattern_count: 1000,
+            truncated_in_pattern: 3,
+        }
+    }
+
+    /// A [`FarOutlierDetail::Prefix`] whose `Option` fields are `None`: no
+    /// cluster prefix and no token at the divergence.
+    pub(super) fn far_outlier_without_prefix() -> FarOutlierDetail {
+        FarOutlierDetail::Prefix {
+            nearest_cluster_id: None,
+            nearest_signature: None,
+            matched_tokens: 0,
+            prefix_len: 0,
+            diverged_token: None,
+            pattern_count: 1,
+            truncated_in_pattern: 0,
+        }
     }
 
     /// Returns one detail per model, in [`TABLE`] order.
@@ -748,6 +895,8 @@ mod tests {
                 z_score: 30.0,
                 truncated_related_ips: 2,
             }),
+            Detail::LabelDbMatch(label_db_match()),
+            Detail::FarOutlier(far_outlier()),
         ]
     }
 
@@ -837,11 +986,13 @@ mod tests {
             assert_eq!(
                 usize::try_from(*number).expect("fits usize"),
                 index,
-                "numbers are 0-17 with no gap"
+                "numbers are 0-19 with no gap"
             );
             assert_eq!(DetectionModel::try_from(*number).ok(), Some(*model));
         }
-        assert!(DetectionModel::try_from(18_u32).is_err());
+        assert_eq!(u32::from(DetectionModel::LabelDbMatch), 18);
+        assert_eq!(u32::from(DetectionModel::FarOutlier), 19);
+        assert!(DetectionModel::try_from(20_u32).is_err());
         assert!(DetectionModel::try_from(u32::MAX).is_err());
     }
 
@@ -857,7 +1008,23 @@ mod tests {
             serde_json::to_string(&DetectionModel::UnusualDestinationPattern).expect("serializes"),
             "17"
         );
-        assert!(serde_json::from_str::<DetectionModel>("18").is_err());
+        assert_eq!(
+            serde_json::to_string(&DetectionModel::LabelDbMatch).expect("serializes"),
+            "18"
+        );
+        assert_eq!(
+            serde_json::to_string(&DetectionModel::FarOutlier).expect("serializes"),
+            "19"
+        );
+        assert_eq!(
+            serde_json::from_str::<DetectionModel>("18").ok(),
+            Some(DetectionModel::LabelDbMatch)
+        );
+        assert_eq!(
+            serde_json::from_str::<DetectionModel>("19").ok(),
+            Some(DetectionModel::FarOutlier)
+        );
+        assert!(serde_json::from_str::<DetectionModel>("20").is_err());
         assert!(serde_json::from_str::<DetectionModel>("\"PortScan\"").is_err());
     }
 
@@ -935,6 +1102,94 @@ mod tests {
             error.to_string(),
             "detection event rule 1: detail is for LockyRansomware, but detection_model is \
              PortScan"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_new_models_with_their_detail() {
+        for detail in [
+            Detail::LabelDbMatch(label_db_match()),
+            Detail::LabelDbMatch(LabelDbMatchDetail {
+                rule_confidence: None,
+                ..label_db_match()
+            }),
+            Detail::FarOutlier(far_outlier()),
+            Detail::FarOutlier(far_outlier_without_prefix()),
+        ] {
+            let mut event = raw_event_target();
+            event.detection_model = detail.detection_model();
+            event.category = None;
+            event.detail = detail;
+            assert_eq!(event.validate(), Ok(()), "{event:?}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_new_model_with_another_models_detail() {
+        for (detection_model, detail, detail_model) in [
+            (
+                DetectionModel::LabelDbMatch,
+                Detail::FarOutlier(far_outlier()),
+                DetectionModel::FarOutlier,
+            ),
+            (
+                DetectionModel::FarOutlier,
+                Detail::LabelDbMatch(label_db_match()),
+                DetectionModel::LabelDbMatch,
+            ),
+            (
+                DetectionModel::LabelDbMatch,
+                Detail::NonBrowser,
+                DetectionModel::NonBrowser,
+            ),
+            (
+                DetectionModel::FarOutlier,
+                Detail::NonBrowser,
+                DetectionModel::NonBrowser,
+            ),
+        ] {
+            let mut event = raw_event_target();
+            event.detection_model = detection_model;
+            event.detail = detail;
+            let error = assert_rule(&event, 1);
+            assert_eq!(
+                error,
+                DetectionEventError::DetailMismatch {
+                    detection_model,
+                    detail: detail_model,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_existing_model_with_a_new_detail() {
+        for (detail, detail_model) in [
+            (
+                Detail::LabelDbMatch(label_db_match()),
+                DetectionModel::LabelDbMatch,
+            ),
+            (
+                Detail::FarOutlier(far_outlier()),
+                DetectionModel::FarOutlier,
+            ),
+        ] {
+            let mut event = raw_event_target();
+            event.detail = detail;
+            let error = assert_rule(&event, 1);
+            assert_eq!(
+                error,
+                DetectionEventError::DetailMismatch {
+                    detection_model: DetectionModel::NonBrowser,
+                    detail: detail_model,
+                }
+            );
+        }
+        let mut event = raw_event_target();
+        event.detail = Detail::FarOutlier(far_outlier());
+        assert_eq!(
+            assert_rule(&event, 1).to_string(),
+            "detection event rule 1: detail is for FarOutlier, but detection_model is NonBrowser"
         );
     }
 
@@ -1194,6 +1449,47 @@ mod tests {
     }
 
     #[test]
+    fn new_details_debug_print_their_strings_as_is() {
+        assert_eq!(
+            format!("{:?}", label_db_match()),
+            r#"LabelDbMatchDetail { label_db: "ldb", rule_id: 300, rule_name: "r", matched_to: "sig", cluster_id: 7, rule_confidence: Some(0.5), match_score: 1.0 }"#
+        );
+        assert_eq!(
+            format!("{:?}", far_outlier()),
+            r#"Prefix { nearest_cluster_id: Some(5), nearest_signature: Some("ab"), matched_tokens: 2, prefix_len: 4, diverged_token: Some("x"), pattern_count: 1000, truncated_in_pattern: 3 }"#
+        );
+    }
+
+    #[test]
+    fn new_details_encode_as_json() {
+        for (detail, json) in [
+            (
+                Detail::LabelDbMatch(label_db_match()),
+                r#"{"LabelDbMatch":{"label_db":"ldb","rule_id":300,"rule_name":"r","matched_to":"sig","cluster_id":7,"rule_confidence":0.5,"match_score":1.0}}"#,
+            ),
+            (
+                Detail::LabelDbMatch(LabelDbMatchDetail {
+                    rule_confidence: None,
+                    ..label_db_match()
+                }),
+                r#"{"LabelDbMatch":{"label_db":"ldb","rule_id":300,"rule_name":"r","matched_to":"sig","cluster_id":7,"rule_confidence":null,"match_score":1.0}}"#,
+            ),
+            (
+                Detail::FarOutlier(far_outlier()),
+                r#"{"FarOutlier":{"Prefix":{"nearest_cluster_id":5,"nearest_signature":"ab","matched_tokens":2,"prefix_len":4,"diverged_token":"x","pattern_count":1000,"truncated_in_pattern":3}}}"#,
+            ),
+            (
+                Detail::FarOutlier(far_outlier_without_prefix()),
+                r#"{"FarOutlier":{"Prefix":{"nearest_cluster_id":null,"nearest_signature":null,"matched_tokens":0,"prefix_len":0,"diverged_token":null,"pattern_count":1,"truncated_in_pattern":0}}}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&detail).expect("serializes"), json);
+            let decoded: Detail = serde_json::from_str(json).expect("deserializes");
+            assert_eq!(decoded, detail);
+        }
+    }
+
+    #[test]
     fn every_detail_round_trips_through_json() {
         for detail in details() {
             let json = serde_json::to_string(&detail).expect("serializes");
@@ -1215,7 +1511,10 @@ mod bincode_tests {
 
     use serde::{Serialize, de::DeserializeOwned};
 
-    use super::tests::{NANOS, TABLE, WIDE_NANOS, at, conn, details};
+    use super::tests::{
+        NANOS, TABLE, WIDE_NANOS, at, conn, details, far_outlier, far_outlier_without_prefix,
+        label_db_match,
+    };
     use super::*;
 
     /// The crate's bincode 2 encoding of [`NANOS`] as an `i128`: the
@@ -1250,9 +1549,16 @@ mod bincode_tests {
             assert_eq!(decode::<DetectionModel>(&bytes), model);
         }
         assert_eq!(encode(&DetectionModel::UnusualDestinationPattern), [17]);
+        assert_eq!(encode(&DetectionModel::LabelDbMatch), [18]);
+        assert_eq!(encode(&DetectionModel::FarOutlier), [19]);
+        assert_eq!(
+            decode::<DetectionModel>(&[18]),
+            DetectionModel::LabelDbMatch
+        );
+        assert_eq!(decode::<DetectionModel>(&[19]), DetectionModel::FarOutlier);
         assert!(
             bincode::serde::decode_from_slice::<DetectionModel, _>(
-                &encode(&18_u32),
+                &encode(&20_u32),
                 bincode::config::standard(),
             )
             .is_err()
@@ -1364,6 +1670,84 @@ mod bincode_tests {
             expected.extend(encode(&event.detail));
             assert_eq!(encode(&event), expected);
             assert_eq!(decode::<DetectionEvent>(&expected), event);
+        }
+    }
+
+    #[test]
+    fn existing_detail_encodings_are_unchanged() {
+        // The released encodings: each variant's tag is its declaration
+        // index, a one-byte varint, followed by its payload.
+        let expected: [&[u8]; 18] = [
+            &[
+                0, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 12, 3, 1,
+            ],
+            &[1, 2, 3, b'x', b'm', b'r', 3, b'b', b't', b'c'],
+            &[2],
+            &[3],
+            &[4, 3, 22, 80, 0xfb, 0xbb, 0x01, 6],
+            &[5, 0xfb, 0xbd, 0x01, 6, 1],
+            &[6, 17, 9],
+            &[7, 6, 0],
+            &[
+                8, 21, 6, 2, 6, b'u', b's', b'e', b'r', b'-', b'a', 6, b'u', b's', b'e', b'r',
+                b'-', b'b', 0,
+            ],
+            &[
+                9, 0xfb, 0x85, 0x01, 6, 1, 6, b'u', b's', b'e', b'r', b'-', b'a', 9, b's', b'y',
+                b'n', b't', b'h', b'e', b't', b'i', b'c',
+            ],
+            &[10, 0xfb, 0x50, 0xc3, 0xfb, 0x90, 0x1f, 6],
+            &[11],
+            &[12],
+            &[13],
+            &[14],
+            &[15],
+            &[16],
+            &[
+                17, 40, 0, 0, 0, 0, 0, 0, 0x04, 0x40, 0, 0, 0, 0, 0, 0, 0xf4, 0x3f, 0, 0, 0, 0, 0,
+                0, 0x3e, 0x40, 2,
+            ],
+        ];
+        let details = details();
+        for (detail, bytes) in details.iter().zip(expected) {
+            assert_eq!(encode(detail), bytes, "{detail:?}");
+            assert_eq!(&decode::<Detail>(bytes), detail);
+        }
+    }
+
+    #[test]
+    fn new_details_encode_after_every_existing_variant() {
+        for (detail, bytes) in [
+            (
+                Detail::LabelDbMatch(label_db_match()),
+                &[
+                    18, 3, b'l', b'd', b'b', 0xfb, 0x2c, 0x01, 1, b'r', 3, b's', b'i', b'g', 7, 1,
+                    0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x80, 0x3f,
+                ][..],
+            ),
+            (
+                Detail::LabelDbMatch(LabelDbMatchDetail {
+                    rule_confidence: None,
+                    ..label_db_match()
+                }),
+                &[
+                    18, 3, b'l', b'd', b'b', 0xfb, 0x2c, 0x01, 1, b'r', 3, b's', b'i', b'g', 7, 0,
+                    0x00, 0x00, 0x80, 0x3f,
+                ][..],
+            ),
+            (
+                Detail::FarOutlier(far_outlier()),
+                &[
+                    19, 0, 1, 5, 1, 2, b'a', b'b', 2, 4, 1, 1, b'x', 0xfb, 0xe8, 0x03, 3,
+                ][..],
+            ),
+            (
+                Detail::FarOutlier(far_outlier_without_prefix()),
+                &[19, 0, 0, 0, 0, 0, 0, 1, 0][..],
+            ),
+        ] {
+            assert_eq!(encode(&detail), bytes, "{detail:?}");
+            assert_eq!(decode::<Detail>(bytes), detail);
         }
     }
 
