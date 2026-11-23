@@ -11,7 +11,7 @@ use crate::{
     server,
     types::{
         DataSource, DataSourceKey, DetectorStatusReport, HostNetworkGroup, NetworkListItem,
-        ReportedRunState, SamplingPolicy, UserAgent,
+        ReportedRunState, TimeSeriesGenerationPolicy, UserAgent,
     },
     unary_request,
 };
@@ -227,14 +227,20 @@ impl Connection {
         res.map_err(io::Error::other)
     }
 
-    /// Fetches the list of sampling policies from the server.
+    /// Fetches the list of time-series generation policies from the server.
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails or the response is invalid.
-    pub async fn get_sampling_policy_list(&self) -> io::Result<Vec<SamplingPolicy>> {
-        let res: Result<Vec<SamplingPolicy>, String> =
-            request(self, server::RequestCode::GetSamplingPolicyList, ()).await?;
+    pub async fn get_time_series_generation_policy_list(
+        &self,
+    ) -> io::Result<Vec<TimeSeriesGenerationPolicy>> {
+        let res: Result<Vec<TimeSeriesGenerationPolicy>, String> = request(
+            self,
+            server::RequestCode::GetTimeSeriesGenerationPolicyList,
+            (),
+        )
+        .await?;
         res.map_err(io::Error::other)
     }
 
@@ -531,7 +537,7 @@ mod tests {
         },
         types::{
             CustomerDataDeletionOutcome, CustomerDataDeletionReport, CustomerDataDeletionReporter,
-            DataSourceKey, DetectorState, DetectorStatusReport, ReportedRunState,
+            DataSourceKey, DetectorState, DetectorStatusReport, RawEventKind, ReportedRunState,
         },
     };
 
@@ -971,14 +977,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_sampling_policy_list() {
+    async fn get_time_series_generation_policy_list() {
         run_test(|client_conn| async move {
-            let client_res = client_conn.get_sampling_policy_list().await;
+            let client_res = client_conn.get_time_series_generation_policy_list().await;
             assert!(client_res.is_ok());
             let policies = client_res.unwrap();
             assert_eq!(policies.len(), 1);
             assert_eq!(policies[0].id, 1);
-            assert_eq!(policies[0].node, Some("node1".to_string()));
+            assert_eq!(policies[0].raw_event_kind, RawEventKind::Dns);
+            assert_eq!(policies[0].sensors, ["node1"]);
+            assert_eq!(policies[0].time_series_type, None);
         })
         .await;
     }

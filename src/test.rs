@@ -17,8 +17,9 @@ use tokio::sync::Mutex;
 
 #[cfg(all(feature = "client", feature = "server"))]
 use crate::types::{
-    DataSource, DataSourceKey, DataType, EventCategory, HostNetworkGroup, LabelDb, LabelDbKind,
-    LabelDbRule, NetworkListItem, SamplingKind, SamplingPolicy,
+    CounterpartScope, DataSource, DataSourceKey, DataType, EventCategory, GroupByUnit,
+    HostNetworkGroup, LabelDb, LabelDbKind, LabelDbRule, Measure, NetworkListItem, RawEventKind,
+    TimeSeriesGenerationPolicy,
 };
 
 #[allow(dead_code)]
@@ -1009,17 +1010,25 @@ impl crate::server::Handler for TestServerHandler {
         })
     }
 
-    async fn get_sampling_policy_list(&self, _peer: &str) -> Result<Vec<SamplingPolicy>, String> {
-        Ok(vec![SamplingPolicy {
+    async fn get_time_series_generation_policy_list(
+        &self,
+        _peer: &str,
+    ) -> Result<Vec<TimeSeriesGenerationPolicy>, String> {
+        Ok(vec![TimeSeriesGenerationPolicy {
             id: 1,
-            kind: SamplingKind::Conn,
-            interval: std::time::Duration::from_mins(1),
-            period: std::time::Duration::from_hours(1),
-            offset: 0,
+            raw_event_kind: RawEventKind::Dns,
+            measure: Measure::Count,
+            group_by: None,
+            group_by_unit: GroupByUnit::Ip,
+            counterpart_scope: CounterpartScope::Any,
+            slot_size: std::time::Duration::from_mins(1),
+            window_size: std::time::Duration::from_hours(1),
+            utc_offset: 0,
             src_ip: None,
             dst_ip: None,
-            node: Some("node1".to_string()),
-            column: None,
+            sensors: vec!["node1".to_string()],
+            time_series_type: None,
+            internal_networks: HostNetworkGroup::default(),
         }])
     }
 

@@ -289,7 +289,7 @@ pub(crate) enum RequestCode {
     GetConfig = 36,
     UpdateHostOpenedPorts = 37,
     UpdateHostOsAgents = 38,
-    GetSamplingPolicyList = 39,
+    GetTimeSeriesGenerationPolicyList = 39,
     ReportCustomerDataDeletion = 40,
     UploadRunModel = 41,
     ReportRun = 42,

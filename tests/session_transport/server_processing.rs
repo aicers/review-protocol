@@ -16,8 +16,8 @@ use review_protocol::{
     types::{
         ColumnStatisticsUpdate, CustomerDataDeletionReport, DataSource, DataSourceKey, Detail,
         DetectionEvent, DetectionModel, DetectorStatusReport, HostNetworkGroup, LabelDb,
-        NetworkListItem, OutlierInfo, PrimarySubject, RawEventKind, ReportedRunState,
-        SamplingPolicy, Target, TimeSeriesUpdate, TimeWindow, UpdateClusterRequest, UserAgent,
+        NetworkListItem, OutlierInfo, PrimarySubject, RawEventKind, ReportedRunState, Target,
+        TimeSeriesGenerationPolicy, TimeSeriesUpdate, TimeWindow, UpdateClusterRequest, UserAgent,
     },
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -294,9 +294,12 @@ impl Handler for FixtureHandler {
         self.unsupported(service_id::SERVER_HOST_UPDATE_OS_AGENTS)
     }
 
-    async fn get_sampling_policy_list(&self, peer: &str) -> Result<Vec<SamplingPolicy>, String> {
+    async fn get_time_series_generation_policy_list(
+        &self,
+        peer: &str,
+    ) -> Result<Vec<TimeSeriesGenerationPolicy>, String> {
         assert_eq!(peer, "verified-peer");
-        self.unsupported(service_id::SERVER_LIST_SAMPLING_POLICY)
+        self.unsupported(service_id::SERVER_LIST_TIME_SERIES_GENERATION_POLICY)
     }
 
     async fn report_customer_data_deletion(
@@ -565,7 +568,7 @@ async fn runner_dispatches_every_built_in_on_one_stream() {
         SERVER_CONFIG_GET,
         SERVER_HOST_UPDATE_OPENED_PORTS,
         SERVER_HOST_UPDATE_OS_AGENTS,
-        SERVER_LIST_SAMPLING_POLICY,
+        SERVER_LIST_TIME_SERIES_GENERATION_POLICY,
         SERVER_CUSTOMER_DATA_DELETION_REPORT,
         SERVER_RUN_UPLOAD_MODEL,
         SERVER_RUN_REPORT,

@@ -99,7 +99,7 @@ pub struct TrainModelRequest {
     /// | --- | --- | --- | --- | --- |
     /// | `type` | string: a clustering model type id, or `"custom"` | required | required | required |
     /// | `type_version` | u32 | required for a type id, refused for `"custom"` | required for a type id, refused for `"custom"` | required for a type id, refused for `"custom"` |
-    /// | `raw_event_kind` | string | required: a Giganto raw event kind in snake case that has a clustering model type | required, always `"log"` | required; its meaning is set by later work |
+    /// | `raw_event_kind` | string | required: a Giganto raw event kind in snake case that has a clustering model type | required, always `"log"` | required: one of the 20 network raw event kinds in snake case, the source policies' kind (for example `"tls"`); the engine records it on the model and on detection events, and always reads Giganto's periodic time-series kind whatever this value is |
     /// | `log_kind` | string | refused | required: a Giganto log kind name, not one of Giganto's other raw event kind names | refused |
     /// | `method` | string: `"multidimension"`, `"prefix"` or `"timeseries"` | required | required | required |
     /// | `sources` | non-empty array of strings, no repeats | required | required | required |
@@ -117,6 +117,11 @@ pub struct TrainModelRequest {
     /// | `long_pattern_len` | usize | required | required | refused |
     /// | `max_data_len` | usize | absent means no limit | absent means no limit | refused |
     /// | `max_token_length` | usize; ignored with a warning when < 2 * `min_token_length` | refused | absent means no limit | refused |
+    /// | `group_by` | string: `"source"` or `"destination"` (`EndpointRole` in snake case) | refused | refused | required for a type id; for `"custom"`, present exactly when the source policies split by an endpoint, and then equal to theirs |
+    /// | `slot_size` | u32 (seconds); equals the source policies' slot size | refused | refused | required |
+    /// | `threat_role` | string: `"actor"` or `"target"` | refused | refused | required for a type id, refused for `"custom"` |
+    /// | `min_cluster_size` | usize | refused | refused | required |
+    /// | `transform` | string: `"none"` or `"log1p"` | refused | refused | required |
     /// | `[csv]` | table: the keys below | required | refused | refused |
     ///
     /// `[csv]`, which only the multidimension method takes, has these keys:
@@ -125,7 +130,7 @@ pub struct TrainModelRequest {
     /// | --- | --- | --- |
     /// | `reader` | inline table `{ delimiter, quote }`: both keys u8, both required | required |
     /// | `format` | array, one entry per column, in column order; each entry has `data_type`: `"int64"`, `"float64"`, `"datetime"`, `"ipaddr"`, `"enum"`, `"utf8"` or `"binary"`; `weight`: f64, required; `name`: optional string; `format`: optional string (a datetime parse format) | required |
-    /// | `time_intervals` | array of u32 (seconds) | filled as stated below when absent or short |
+    /// | `slot_sizes` | array of u32 (seconds) | filled as stated below when absent or short |
     /// | `time_column` | usize | absent means none |
     /// | `count_columns` | array of usize | absent means none |
     /// | `prefix_columns` | array of usize | absent means none: without it the clustering uses the centroid approach |
@@ -186,6 +191,31 @@ pub struct TrainModelRequest {
     /// server_name = "001.giganto.node1.example.com"
     /// ```
     ///
+    /// A timeseries definition:
+    ///
+    /// ```toml
+    /// type = "custom"
+    /// raw_event_kind = "tls"
+    /// method = "timeseries"
+    /// sources = ["piglet.node2.example.com"]
+    /// window_start = "2026-10-14T00:00:00Z"
+    /// window_end = "2026-10-21T00:00:00Z"
+    /// batch_size = 1000000
+    /// max_event_id_num = 25
+    /// algorithm = "dbscan"
+    /// eps = 0.5
+    /// precision = 2
+    /// numbers_of_top_n = []
+    /// group_by = "source"
+    /// slot_size = 3600
+    /// min_cluster_size = 5
+    /// transform = "log1p"
+    ///
+    /// [data_store]
+    /// address = "10.0.0.5:38371"
+    /// server_name = "001.giganto.node1.example.com"
+    /// ```
+    ///
     /// - `log_kind` is present exactly when `raw_event_kind = "log"`.
     /// - `[csv]` is exactly `crate::remake::csv::Config` (columns
     ///   `ColumnDescription`, `reader` = `structured::csv::Config`,
@@ -195,27 +225,34 @@ pub struct TrainModelRequest {
     ///   `csv`, prefix → `log`, timeseries → `timeseries`).
     /// - **Fill values.** These are contract values, not engine defaults.
     ///   Changing them changes the contract.
-    ///   - When `time_intervals` is absent or shorter than the number of
+    ///   - When `slot_sizes` is absent or shorter than the number of
     ///     `datetime` columns, each remaining `datetime` column gets 3600
     ///     seconds.
     ///   - For the multidimension method, when `numbers_of_top_n` is shorter
     ///     than the number of columns (an empty list included), each
     ///     remaining `datetime` column gets 336 and each other remaining
-    ///     column gets 30. For the timeseries method, the key is required;
-    ///     its fill is set by later work.
+    ///     column gets 30.
+    ///   - For the timeseries method, when `numbers_of_top_n` is shorter than
+    ///     the number of slots in a window (an empty list included), each
+    ///     remaining slot gets 30.
     /// - The engine refuses a definition that does not parse, lacks a key its
     ///   method requires, carries a key its method refuses, has
     ///   `type_version` with `type = "custom"` or lacks it with a type id,
     ///   has `log_kind` when `raw_event_kind` is not `"log"` or lacks it when
     ///   `raw_event_kind = "log"`, has empty `sources`, repeats a
     ///   source in `sources`, has `window_end` not after `window_start`, has
-    ///   `method = "multidimension"` without `[csv]`, or has `[csv]` with
-    ///   another method.
+    ///   `method = "multidimension"` without `[csv]`, has `[csv]` with
+    ///   another method, has `method = "timeseries"` and `type = "custom"`
+    ///   with `threat_role`, or has `method = "timeseries"` and a type id
+    ///   without `threat_role` or without `group_by`.
     /// - These checks belong to review-web, not the engine: the type id is
     ///   known, its version is current, and `method`, `raw_event_kind` and
     ///   the type's fixed values equal the type's; operator values are in
     ///   range (§5.2); a multidimension `raw_event_kind` has a clustering
-    ///   model type; a prefix `log_kind` is a log kind name.
+    ///   model type; a prefix `log_kind` is a log kind name; a timeseries
+    ///   `raw_event_kind` is a network kind; for a timeseries `"custom"`
+    ///   definition, `raw_event_kind`, `group_by` and `slot_size` equal the
+    ///   source policies' values.
     pub definition: String,
 }
 
@@ -461,27 +498,109 @@ pub struct NetworkListItem {
     pub group: HostNetworkGroup,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[repr(u32)]
-pub enum SamplingKind {
-    Conn = 0,
-    Dns = 1,
-    Http = 2,
-    Rdp = 3,
+/// A time-series generation policy: what a generator counts, how it splits
+/// the counts into series, and how it slots and windows them.
+///
+/// One policy produces one series per internal IP of the endpoint named by
+/// [`group_by`](Self::group_by), or a single series when that is `None`.
+/// Every field but [`internal_networks`](Self::internal_networks) belongs to
+/// the generation spec.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeSeriesGenerationPolicy {
+    /// The policy's id.
+    pub id: u32,
+    /// The raw event kind the policy counts. The type admits any kind;
+    /// consumers accept only the network kinds.
+    pub raw_event_kind: RawEventKind,
+    /// The value counted per slot.
+    pub measure: Measure,
+    /// The endpoint whose IP splits the series. `None` means one series for
+    /// the whole policy.
+    pub group_by: Option<EndpointRole>,
+    /// The unit [`group_by`](Self::group_by) splits by.
+    pub group_by_unit: GroupByUnit,
+    /// A filter on whether the other endpoint is inside
+    /// [`internal_networks`](Self::internal_networks).
+    pub counterpart_scope: CounterpartScope,
+    /// The length of one slot.
+    pub slot_size: Duration,
+    /// The length of one window, which is one series sample.
+    pub window_size: Duration,
+    /// The offset from UTC, in seconds, that aligns window boundaries to
+    /// local time.
+    pub utc_offset: i32,
+    /// The source IP a raw event must have to be counted, if any.
+    pub src_ip: Option<IpAddr>,
+    /// The destination IP a raw event must have to be counted, if any.
+    pub dst_ip: Option<IpAddr>,
+    /// One or more sensor names. More than one means the sensors observe
+    /// disjoint parts of the same network.
+    pub sensors: Vec<String>,
+    /// The catalog type the policy was made from. `None` means a custom
+    /// policy.
+    pub time_series_type: Option<TimeSeriesTypeRef>,
+    /// The customer's internal ranges, Intranet and Gateway merged.
+    ///
+    /// The Central Manager fills it when it sends the policy. It is not part
+    /// of the generation spec.
+    pub internal_networks: HostNetworkGroup,
 }
 
-// A policy for time series sampling.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SamplingPolicy {
-    pub id: u32,
-    pub kind: SamplingKind,
-    pub interval: Duration,
-    pub period: Duration,
-    pub offset: i32,
-    pub src_ip: Option<IpAddr>,
-    pub dst_ip: Option<IpAddr>,
-    pub node: Option<String>,
-    pub column: Option<u32>,
+/// The value a [`TimeSeriesGenerationPolicy`] counts per slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Measure {
+    /// Counts raw events.
+    Count,
+    /// Sums the given Conn field.
+    Sum(ConnField),
+}
+
+/// A numeric field of a Conn raw event that [`Measure::Sum`] can sum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnField {
+    /// The duration of the connection.
+    Duration,
+    /// The bytes the originator sent.
+    OrigBytes,
+    /// The bytes the responder sent.
+    RespBytes,
+    /// The packets the originator sent.
+    OrigPkts,
+    /// The packets the responder sent.
+    RespPkts,
+}
+
+/// The unit a [`TimeSeriesGenerationPolicy`] splits its series by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupByUnit {
+    /// Splits by single IP.
+    Ip,
+    /// Reserved for a later per-network unit. The Central Manager does not
+    /// accept it yet.
+    OwnedNetwork,
+}
+
+/// A filter on whether the other endpoint of a raw event is inside the
+/// policy's [`internal_networks`](TimeSeriesGenerationPolicy::internal_networks).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CounterpartScope {
+    /// No filter.
+    Any,
+    /// Counts only raw events whose other endpoint is inside the internal
+    /// networks.
+    Internal,
+    /// Counts only raw events whose other endpoint is outside the internal
+    /// networks.
+    External,
+}
+
+/// A reference to the catalog time-series type a policy was made from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeSeriesTypeRef {
+    /// The type's id, in snake case.
+    pub id: String,
+    /// The type's version.
+    pub version: u32,
 }
 
 // IP address, port numbers, and protocols.
@@ -5107,6 +5226,100 @@ mod tests {
         let (decoded, _len): (ProvisioningFingerprint, usize) =
             bincode::serde::decode_from_slice(&encoded, config).unwrap();
         assert_eq!(decoded, multi);
+    }
+
+    /// Returns time-series generation policies that together cover every
+    /// variant of every policy enum and both states of every optional field.
+    fn time_series_generation_policies() -> Vec<super::TimeSeriesGenerationPolicy> {
+        use std::{
+            net::{IpAddr, Ipv4Addr, Ipv6Addr},
+            time::Duration,
+        };
+
+        use super::{
+            ConnField, CounterpartScope, EndpointRole, GroupByUnit, HostNetworkGroup, Measure,
+            RawEventKind, TimeSeriesGenerationPolicy, TimeSeriesTypeRef,
+        };
+
+        let measures = [
+            Measure::Count,
+            Measure::Sum(ConnField::Duration),
+            Measure::Sum(ConnField::OrigBytes),
+            Measure::Sum(ConnField::RespBytes),
+            Measure::Sum(ConnField::OrigPkts),
+            Measure::Sum(ConnField::RespPkts),
+        ];
+        let group_bys = [
+            None,
+            Some(EndpointRole::Source),
+            Some(EndpointRole::Destination),
+        ];
+        let units = [GroupByUnit::Ip, GroupByUnit::OwnedNetwork];
+        let scopes = [
+            CounterpartScope::Any,
+            CounterpartScope::Internal,
+            CounterpartScope::External,
+        ];
+
+        measures
+            .into_iter()
+            .enumerate()
+            .map(|(i, measure)| {
+                let id = u32::try_from(i).expect("fewer measures than u32::MAX");
+                let custom = i % 2 == 0;
+                TimeSeriesGenerationPolicy {
+                    id,
+                    raw_event_kind: if custom {
+                        RawEventKind::Tls
+                    } else {
+                        RawEventKind::Conn
+                    },
+                    measure,
+                    group_by: group_bys[i % group_bys.len()],
+                    group_by_unit: units[i % units.len()],
+                    counterpart_scope: scopes[i % scopes.len()],
+                    slot_size: Duration::from_mins(10),
+                    window_size: Duration::from_hours(24),
+                    utc_offset: -18_000,
+                    src_ip: custom.then_some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+                    dst_ip: (!custom).then_some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+                    sensors: vec!["sensor1".to_string(), "sensor2".to_string()],
+                    time_series_type: (!custom).then(|| TimeSeriesTypeRef {
+                        id: "outbound_bytes".to_string(),
+                        version: 2,
+                    }),
+                    internal_networks: HostNetworkGroup {
+                        hosts: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))],
+                        networks: vec!["192.168.0.0/16".parse().unwrap()],
+                        ip_ranges: vec![
+                            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))
+                                ..=IpAddr::V4(Ipv4Addr::new(172, 16, 0, 9)),
+                        ],
+                    },
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn time_series_generation_policy_json_round_trip() {
+        let policies = time_series_generation_policies();
+        let json = serde_json::to_string(&policies).unwrap();
+        let decoded: Vec<super::TimeSeriesGenerationPolicy> = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, policies);
+    }
+
+    #[cfg(any(feature = "client", feature = "server"))]
+    #[test]
+    fn time_series_generation_policy_bincode_round_trip() {
+        let config = bincode::config::standard();
+        for policy in time_series_generation_policies() {
+            let encoded = bincode::serde::encode_to_vec(&policy, config).unwrap();
+            let (decoded, len): (TimeSeriesGenerationPolicy, usize) =
+                bincode::serde::decode_from_slice(&encoded, config).unwrap();
+            assert_eq!(decoded, policy);
+            assert_eq!(len, encoded.len());
+        }
     }
 
     #[cfg(any(feature = "client", feature = "server"))]

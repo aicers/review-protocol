@@ -8,7 +8,7 @@ use crate::{
     client,
     types::{
         CloneModelRequest, CustomerDataDeletionRequest, HostNetworkGroup, NetworkListItem,
-        SamplingPolicy, TrafficFilterRule, TrainModelRequest,
+        TimeSeriesGenerationPolicy, TrafficFilterRule, TrainModelRequest,
         node::{
             InstallPreflight, NodeEnrollRequest, NodeEnrollResponse, NodeHostnameRequest,
             NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
@@ -240,13 +240,16 @@ impl Connection {
             .await
     }
 
-    /// Sends the sampling policies.
+    /// Sends the time-series generation policies.
     ///
     /// # Errors
     ///
     /// Returns an error if serialization failed or communication with the client failed.
-    pub async fn send_sampling_policies(&self, list: &[SamplingPolicy]) -> anyhow::Result<()> {
-        self.send_request(client::RequestCode::SamplingPolicyList, list)
+    pub async fn send_time_series_generation_policies(
+        &self,
+        list: &[TimeSeriesGenerationPolicy],
+    ) -> anyhow::Result<()> {
+        self.send_request(client::RequestCode::TimeSeriesGenerationPolicyList, list)
             .await
     }
 
@@ -1636,8 +1639,9 @@ mod tests {
         crate::{
             test::TEST_ENV,
             types::{
-                CustomerDataDeletionRequest, HostNetworkGroup, NetworkListItem, Process,
-                ResourceUsage, SamplingKind, SamplingPolicy,
+                ConnField, CounterpartScope, CustomerDataDeletionRequest, EndpointRole,
+                GroupByUnit, HostNetworkGroup, Measure, NetworkListItem, Process, RawEventKind,
+                ResourceUsage, TimeSeriesGenerationPolicy, TimeSeriesTypeRef,
             },
         },
         ipnet::IpNet,
@@ -1656,6 +1660,35 @@ mod tests {
 
     #[cfg(all(feature = "client", feature = "server"))]
     const DELETION_REQUEST_ID: u32 = 42;
+
+    #[cfg(all(feature = "client", feature = "server"))]
+    /// Returns the time-series generation policy the server sends and the
+    /// agent's handler expects.
+    fn time_series_generation_policy() -> TimeSeriesGenerationPolicy {
+        TimeSeriesGenerationPolicy {
+            id: 42,
+            raw_event_kind: RawEventKind::Conn,
+            measure: Measure::Sum(ConnField::OrigBytes),
+            group_by: Some(EndpointRole::Source),
+            group_by_unit: GroupByUnit::Ip,
+            counterpart_scope: CounterpartScope::External,
+            slot_size: Duration::from_mins(1),
+            window_size: Duration::from_hours(1),
+            utc_offset: 32_400,
+            src_ip: None,
+            dst_ip: Some(IP_ADDR_1),
+            sensors: vec!["sensor1".to_string(), "sensor2".to_string()],
+            time_series_type: Some(TimeSeriesTypeRef {
+                id: "outbound_bytes".to_string(),
+                version: 1,
+            }),
+            internal_networks: HostNetworkGroup {
+                hosts: vec![IP_ADDR_1],
+                networks: vec!["10.0.0.0/8".parse::<IpNet>().unwrap()],
+                ip_ranges: vec![],
+            },
+        }
+    }
 
     #[cfg(all(feature = "client", feature = "server"))]
     // Shared handler for all tests
@@ -1911,14 +1944,14 @@ mod tests {
             }
         }
 
-        async fn sampling_policy_list(
+        async fn time_series_generation_policy_list(
             &mut self,
-            policies: &[super::SamplingPolicy],
+            policies: &[super::TimeSeriesGenerationPolicy],
         ) -> Result<(), String> {
-            if policies.len() == 1 && policies[0].id == 42 {
+            if policies == [time_series_generation_policy()] {
                 Ok(())
             } else {
-                Err("unexpected sampling policies".to_string())
+                Err("unexpected time-series generation policies".to_string())
             }
         }
 
@@ -2300,21 +2333,11 @@ mod tests {
 
     #[cfg(all(feature = "client", feature = "server"))]
     #[tokio::test]
-    async fn send_sampling_policies() {
+    async fn send_time_series_generation_policies() {
         let test_env = TEST_ENV.lock().await;
         let (server_conn, client_conn) = test_env.setup().await;
 
-        let sampling_policies_to_send = vec![SamplingPolicy {
-            id: 42,
-            kind: SamplingKind::Conn,
-            interval: Duration::from_mins(1),
-            period: Duration::from_hours(1),
-            offset: 0,
-            src_ip: None,
-            dst_ip: None,
-            node: None,
-            column: None,
-        }];
+        let policies_to_send = vec![time_series_generation_policy()];
 
         let mut handler = TestHandler;
         let handler_conn = client_conn.clone();
@@ -2324,7 +2347,7 @@ mod tests {
             crate::request::handle(&mut handler, &mut send, &mut recv).await
         });
         let server_res = server_conn
-            .send_sampling_policies(&sampling_policies_to_send)
+            .send_time_series_generation_policies(&policies_to_send)
             .await;
         assert!(server_res.is_ok());
         let client_res = client_handle.await.unwrap();

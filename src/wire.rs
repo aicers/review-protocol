@@ -41,10 +41,16 @@ mod tests {
             (crate::client::RequestCode::ReloadTi, 5_u32),
             (crate::client::RequestCode::ResourceUsage, 7_u32),
             (crate::client::RequestCode::TorExitNodeList, 8_u32),
-            (crate::client::RequestCode::SamplingPolicyList, 9_u32),
+            (
+                crate::client::RequestCode::TimeSeriesGenerationPolicyList,
+                9_u32,
+            ),
             (crate::client::RequestCode::ReloadFilterRule, 10_u32),
             (crate::client::RequestCode::UpdateConfig, 12_u32),
-            (crate::client::RequestCode::DeleteSamplingPolicy, 13_u32),
+            (
+                crate::client::RequestCode::DeleteTimeSeriesGenerationPolicy,
+                13_u32,
+            ),
             (crate::client::RequestCode::InternalNetworkList, 14_u32),
             (crate::client::RequestCode::Allowlist, 15_u32),
             (crate::client::RequestCode::Blocklist, 16_u32),
@@ -114,7 +120,10 @@ mod tests {
             (crate::server::RequestCode::GetConfig, 36_u32),
             (crate::server::RequestCode::UpdateHostOpenedPorts, 37_u32),
             (crate::server::RequestCode::UpdateHostOsAgents, 38_u32),
-            (crate::server::RequestCode::GetSamplingPolicyList, 39_u32),
+            (
+                crate::server::RequestCode::GetTimeSeriesGenerationPolicyList,
+                39_u32,
+            ),
             (
                 crate::server::RequestCode::ReportCustomerDataDeletion,
                 40_u32,
