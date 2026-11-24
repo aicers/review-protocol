@@ -1,7 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io,
-    net::IpAddr,
     sync::{Arc, Mutex},
 };
 
@@ -17,7 +16,7 @@ use review_protocol::{
         ColumnStatisticsUpdate, CustomerDataDeletionReport, DataSource, DataSourceKey, Detail,
         DetectionEvent, DetectionModel, DetectorStatusReport, HostNetworkGroup, LabelDb,
         NetworkListItem, OutlierInfo, PrimarySubject, RawEventKind, ReportedRunState, Target,
-        TimeSeriesGenerationPolicy, TimeSeriesUpdate, TimeWindow, UpdateClusterRequest, UserAgent,
+        TimeSeriesGenerationPolicy, TimeSeriesUpdate, TimeWindow, UpdateClusterRequest,
     },
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -271,27 +270,6 @@ impl Handler for FixtureHandler {
 
     async fn get_trusted_user_agent_list(&self) -> Result<Vec<String>, String> {
         self.unsupported(service_id::SERVER_LIST_TRUSTED_USER_AGENT)
-    }
-
-    async fn update_host_ports(
-        &self,
-        peer: &str,
-        hosts: &HashMap<IpAddr, HashMap<(u16, u8), u32>>,
-    ) -> Result<(), String> {
-        assert_eq!(peer, "verified-peer");
-        assert_eq!(hosts[&IpAddr::from([127, 0, 0, 1])][&(53, 17)], 9);
-        self.unsupported(service_id::SERVER_HOST_UPDATE_OPENED_PORTS)
-    }
-
-    async fn update_host_user_agents(
-        &self,
-        peer: &str,
-        hosts: &[(IpAddr, Vec<UserAgent>, Vec<String>)],
-    ) -> Result<(), String> {
-        assert_eq!(peer, "verified-peer");
-        assert_eq!(hosts[0].1[0].name, "agent");
-        assert_eq!(hosts[0].2, ["description"]);
-        self.unsupported(service_id::SERVER_HOST_UPDATE_OS_AGENTS)
     }
 
     async fn get_time_series_generation_policy_list(
@@ -566,8 +544,6 @@ async fn runner_dispatches_every_built_in_on_one_stream() {
         SERVER_MODEL_GET_PRETRAINED,
         SERVER_LIST_TRUSTED_USER_AGENT,
         SERVER_CONFIG_GET,
-        SERVER_HOST_UPDATE_OPENED_PORTS,
-        SERVER_HOST_UPDATE_OS_AGENTS,
         SERVER_LIST_TIME_SERIES_GENERATION_POLICY,
         SERVER_CUSTOMER_DATA_DELETION_REPORT,
         SERVER_RUN_UPLOAD_MODEL,
@@ -1360,4 +1336,155 @@ async fn low_level_stream_refuses_list_pulls_from_an_agent_before_item_lists() {
     let mut responses = Vec::new();
     recv.read_to_end(&mut responses).await.unwrap();
     assert_list_pulls_refused(&responses);
+}
+
+/// Returns a legacy request frame: big-endian length, little-endian `code`,
+/// bincode 2 standard `arguments`.
+fn request_frame<T: serde::Serialize>(code: u32, arguments: &T) -> Vec<u8> {
+    let arguments = bincode::serde::encode_to_vec(arguments, bincode::config::standard()).unwrap();
+    let mut frame = u32::try_from(4 + arguments.len())
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
+    frame.extend(code.to_le_bytes());
+    frame.extend(arguments);
+    frame
+}
+
+/// Decodes a response frame body as `Result<T, String>`, consuming it whole.
+fn decode_response<T: serde::de::DeserializeOwned>(frame: &[u8]) -> Result<T, String> {
+    let (answer, len) = bincode::serde::decode_from_slice::<Result<T, String>, _>(
+        frame,
+        bincode::config::standard(),
+    )
+    .unwrap();
+    assert_eq!(len, frame.len());
+    answer
+}
+
+/// The owned runner serves each DAI request (codes 45 through 51) on one
+/// stream through the handler, returns the handler's replies intact, and
+/// authorizes each with its own service ID.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn runner_serves_every_dai_request() {
+    use review_protocol::{
+        test::{
+            DAI_RENEWED_LEASE_END, DaiTestHandler, dai_cursors, dai_extractor_config,
+            dai_observation_batches, dai_range_days, dai_range_grants, dai_range_late,
+            dai_range_marks, dai_range_unit, dai_sensors, dai_store_acks,
+        },
+        types::{DaiCursors, DaiExtractorConfig, DaiRangeGrant, DaiRangeMark, DaiStoreAck},
+    };
+
+    let requests = [
+        request_frame(45, &dai_sensors()),
+        request_frame(46, &dai_sensors()),
+        request_frame(47, &dai_observation_batches()[0]),
+        request_frame(48, &(dai_range_unit(), 5_u64)),
+        request_frame(49, &(dai_range_unit(), 0x0bad_cafe_0bad_cafe_u64)),
+        request_frame(50, &dai_range_days()[0]),
+        request_frame(51, &dai_range_late()),
+    ]
+    .concat();
+
+    let (incoming, _, _, node) = raw_sessions_at(
+        SessionOptions::legacy_compatible(),
+        review_protocol::PROTOCOL_VERSION,
+    )
+    .await;
+    let policy = Policy::default();
+    let trace = policy.trace.clone();
+    let mut incoming = incoming.with_authorization(context(), Arc::new(policy));
+    let handler = Arc::new(DaiTestHandler {
+        peer: "verified-peer",
+    });
+    let (mut send, mut recv) = open_requests(&node, &requests).await;
+    send.finish().unwrap();
+    assert!(matches!(
+        request_stream(&mut incoming).await.run(handler).await,
+        Ok(ServerRequestOutcome::Finished)
+    ));
+    let mut responses = Vec::new();
+    recv.read_to_end(&mut responses).await.unwrap();
+
+    let frames = response_frames(&responses);
+    let [config, cursors, observations, begin, renew, range_day, late] = frames.as_slice() else {
+        panic!("expected seven responses, got {}", frames.len());
+    };
+    assert_eq!(
+        decode_response::<DaiExtractorConfig>(config),
+        Ok(dai_extractor_config())
+    );
+    assert_eq!(decode_response::<DaiCursors>(cursors), Ok(dai_cursors()));
+    assert_eq!(
+        decode_response::<DaiStoreAck>(observations),
+        Ok(dai_store_acks().remove(1))
+    );
+    assert_eq!(
+        decode_response::<DaiRangeGrant>(begin),
+        Ok(dai_range_grants().remove(0))
+    );
+    assert_eq!(
+        decode_response::<Option<i64>>(renew),
+        Ok(Some(DAI_RENEWED_LEASE_END))
+    );
+    assert_eq!(
+        decode_response::<DaiStoreAck>(range_day),
+        Ok(dai_store_acks().remove(1))
+    );
+    assert_eq!(
+        decode_response::<Vec<DaiRangeMark>>(late),
+        Ok(dai_range_marks())
+    );
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            service_id::SERVER_DAI_GET_EXTRACTOR_CONFIG,
+            service_id::SERVER_DAI_GET_CURSORS,
+            service_id::SERVER_DAI_SEND_OBSERVATIONS,
+            service_id::SERVER_DAI_BEGIN_RANGE_DAY,
+            service_id::SERVER_DAI_RENEW_RANGE_DAY,
+            service_id::SERVER_DAI_SEND_RANGE_DAY,
+            service_id::SERVER_DAI_REPORT_RANGE_LATE,
+        ]
+        .map(Observation::Authorization)
+    );
+}
+
+/// The retired host report codes 37 and 38 are unknown to the owned runner:
+/// it answers `unknown request code` and stops dispatch.
+#[tokio::test]
+async fn runner_answers_retired_host_report_codes_as_unknown() {
+    for code in [37_u32, 38] {
+        let (incoming, _, _, node) = raw_sessions(SessionOptions::legacy_compatible()).await;
+        let handler = Arc::new(FixtureHandler::default());
+        let trace = handler.0.clone();
+        let policy = Policy {
+            trace: trace.clone(),
+            deny: None,
+        };
+        let mut incoming = incoming.with_authorization(context(), Arc::new(policy));
+        let requests = [request_frame(code, &()), GET_CONFIG.to_vec()].concat();
+        let (mut send, mut recv) = open_requests(&node, &requests).await;
+        send.finish().unwrap();
+        assert!(
+            request_stream(&mut incoming)
+                .await
+                .run(handler)
+                .await
+                .is_err()
+        );
+        let mut responses = Vec::new();
+        recv.read_to_end(&mut responses).await.unwrap();
+        let frames = response_frames(&responses);
+        let [answer] = frames.as_slice() else {
+            panic!("expected one response, got {}", frames.len());
+        };
+        assert_eq!(
+            decode_response::<()>(answer),
+            Err("unknown request code".to_string())
+        );
+        assert_eq!(*trace.lock().unwrap(), []);
+    }
 }

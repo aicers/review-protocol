@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    io,
-    net::IpAddr,
-};
+use std::{collections::HashSet, io};
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -10,8 +6,10 @@ use super::Connection;
 use crate::{
     server,
     types::{
-        DataSource, DataSourceKey, DetectorStatusReport, HostNetworkGroup, NetworkListItem,
-        ReportedRunState, TimeSeriesGenerationPolicy, UserAgent,
+        DaiCursors, DaiExtractorConfig, DaiObservationBatch, DaiRangeDay, DaiRangeGrant,
+        DaiRangeLate, DaiRangeMark, DaiRangeUnit, DaiStoreAck, DataSource, DataSourceKey,
+        DetectorStatusReport, HostNetworkGroup, NetworkListItem, ReportedRunState,
+        TimeSeriesGenerationPolicy,
     },
     unary_request,
 };
@@ -456,45 +454,146 @@ impl Connection {
         res.map_err(io::Error::other)
     }
 
-    /// Updates host opened ports information on the server.
+    /// Fetches the DAI extractor configuration for `sensors`.
     ///
-    /// # Arguments
-    ///
-    /// * `hosts` - The opened ports information of the host.
-    ///   - Key: IP address of the host
-    ///   - Value: `HashMap` where key is (port number, protocol) and value is
-    ///     timestamp
+    /// A list that is exactly `["all"]` stands for every sensor that belongs
+    /// to a customer. Otherwise the answer covers only the named sensors that
+    /// belong to a customer; other names are left out, not reported as
+    /// errors. See [`DaiExtractorConfig`] for what the answer holds.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or the response is invalid.
-    pub async fn update_host_ports(
+    /// Returns an error if the request fails, the response is invalid, or the
+    /// server rejects the request; a server that does not serve it answers
+    /// `not supported`.
+    pub async fn get_dai_extractor_config(
         &self,
-        hosts: &HashMap<IpAddr, HashMap<(u16, u8), u32>>,
-    ) -> io::Result<()> {
-        let res: Result<(), String> =
-            request(self, server::RequestCode::UpdateHostOpenedPorts, hosts).await?;
+        sensors: &[String],
+    ) -> io::Result<DaiExtractorConfig> {
+        let res: Result<DaiExtractorConfig, String> =
+            request(self, server::RequestCode::GetDaiExtractorConfig, sensors).await?;
         res.map_err(io::Error::other)
     }
 
-    /// Updates host OS and agent software information on the server.
+    /// Fetches the DAI read cursors for `sensors`.
     ///
-    /// # Arguments
-    ///
-    /// * `hosts` - The OS & agent software information of the host.
-    ///   - First element: IP address of the host
-    ///   - Second element: Vector of `UserAgent` information
-    ///   - Third element: Vector of OS information strings
+    /// The sensor list is read as for
+    /// [`get_dai_extractor_config`](Self::get_dai_extractor_config). See
+    /// [`DaiCursors`] for what the answer holds.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or the response is invalid.
-    pub async fn update_host_user_agents(
+    /// Returns an error if the request fails, the response is invalid, or the
+    /// server rejects the request; a server that does not serve it answers
+    /// `not supported`.
+    pub async fn get_dai_cursors(&self, sensors: &[String]) -> io::Result<DaiCursors> {
+        let res: Result<DaiCursors, String> =
+            request(self, server::RequestCode::GetDaiCursors, sensors).await?;
+        res.map_err(io::Error::other)
+    }
+
+    /// Sends one part of one send of the observations of a slot.
+    ///
+    /// See [`DaiObservationBatch`] for the rules the server applies to it and
+    /// [`DaiStoreAck`] for the answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the response is invalid, or the
+    /// server rejects the request; a server that does not serve it answers
+    /// `not supported`.
+    pub async fn send_dai_observations(
         &self,
-        hosts: &[(IpAddr, Vec<UserAgent>, Vec<String>)],
-    ) -> io::Result<()> {
-        let res: Result<(), String> =
-            request(self, server::RequestCode::UpdateHostOsAgents, hosts).await?;
+        batch: &DaiObservationBatch,
+    ) -> io::Result<DaiStoreAck> {
+        let res: Result<DaiStoreAck, String> =
+            request(self, server::RequestCode::SendDaiObservations, batch).await?;
+        res.map_err(io::Error::other)
+    }
+
+    /// Starts a round of range day `unit`, holding `restore_generation`.
+    ///
+    /// A grant raises the unit's version and grants a lease with a fresh
+    /// random lease token. See [`DaiRangeGrant`] for the answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the response is invalid, or the
+    /// server rejects the request; a server that does not serve it answers
+    /// `not supported`.
+    pub async fn begin_dai_range_day(
+        &self,
+        unit: &DaiRangeUnit,
+        restore_generation: u64,
+    ) -> io::Result<DaiRangeGrant> {
+        let res: Result<DaiRangeGrant, String> = request(
+            self,
+            server::RequestCode::BeginDaiRangeDay,
+            (unit, restore_generation),
+        )
+        .await?;
+        res.map_err(io::Error::other)
+    }
+
+    /// Renews the lease `lease_token` on range day `unit`.
+    ///
+    /// Returns the new lease end, in nanoseconds since the UNIX epoch, or
+    /// `None` when the token is no longer the unit's current one; the round
+    /// then stops.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the response is invalid, or the
+    /// server rejects the request; a server that does not serve it answers
+    /// `not supported`.
+    pub async fn renew_dai_range_day(
+        &self,
+        unit: &DaiRangeUnit,
+        lease_token: u64,
+    ) -> io::Result<Option<i64>> {
+        let res: Result<Option<i64>, String> = request(
+            self,
+            server::RequestCode::RenewDaiRangeDay,
+            (unit, lease_token),
+        )
+        .await?;
+        res.map_err(io::Error::other)
+    }
+
+    /// Sends the counts of a range day.
+    ///
+    /// The server answers [`DaiStoreAck::Stored`] also for a result from a
+    /// superseded lease, which it discards; see [`DaiRangeDay`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the response is invalid, or the
+    /// server rejects the request; a server that does not serve it answers
+    /// `not supported`.
+    pub async fn send_dai_range_day(&self, day: &DaiRangeDay) -> io::Result<DaiStoreAck> {
+        let res: Result<DaiStoreAck, String> =
+            request(self, server::RequestCode::SendDaiRangeDay, day).await?;
+        res.map_err(io::Error::other)
+    }
+
+    /// Reports late range days and subnets, and returns the marks the server
+    /// assigned to `late_days`.
+    ///
+    /// `late_subnets` are recorded without a mark; see [`DaiRangeLate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the response is invalid, or the
+    /// server rejects the request; a server that does not serve it answers
+    /// `not supported`. A rejection (for example when the restore generation
+    /// differs) means nothing was recorded: call
+    /// [`get_dai_cursors`](Self::get_dai_cursors) again before reporting.
+    pub async fn report_dai_range_late(
+        &self,
+        late: &DaiRangeLate,
+    ) -> io::Result<Vec<DaiRangeMark>> {
+        let res: Result<Vec<DaiRangeMark>, String> =
+            request(self, server::RequestCode::ReportDaiRangeLate, late).await?;
         res.map_err(io::Error::other)
     }
 }
@@ -527,8 +626,6 @@ where
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use std::collections::HashMap;
-
     use crate::{
         server::handle,
         test::{
@@ -546,12 +643,22 @@ mod tests {
         F: FnOnce(crate::client::Connection) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        run_test_with(TestServerHandler, client_logic).await;
+    }
+
+    /// Runs `client_logic` against a server that serves one request stream
+    /// with `handler`.
+    async fn run_test_with<H, F, Fut>(mut handler: H, client_logic: F)
+    where
+        H: crate::server::Handler + Send + Sync + 'static,
+        F: FnOnce(crate::client::Connection) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let test_env = TEST_ENV.lock().await;
         let (server_conn, client_conn) = test_env.setup().await;
 
         let handler_conn = server_conn.clone();
         let server_handle = tokio::spawn(async move {
-            let mut handler = TestServerHandler;
             let (mut send, mut recv) = handler_conn.as_quinn().accept_bi().await.unwrap();
             handle(&mut handler, &mut send, &mut recv, "test-peer").await?;
             Ok(()) as std::io::Result<()>
@@ -1222,47 +1329,170 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
-    async fn update_host_ports() {
-        run_test(|client_conn| async move {
-            let mut hosts = HashMap::new();
-            let mut ports = HashMap::new();
-            ports.insert((80, 6), 1_234_567_890); // port 80, protocol 6 (TCP), timestamp
-            ports.insert((443, 6), 1_234_567_891);
-            hosts.insert("192.168.1.100".parse().unwrap(), ports);
+    /// A handler that overrides no DAI method.
+    struct DefaultHandler;
+    impl crate::server::Handler for DefaultHandler {}
 
-            let client_res = client_conn.update_host_ports(&hosts).await;
-            assert!(client_res.is_ok());
+    fn dai_handler() -> crate::test::DaiTestHandler {
+        crate::test::DaiTestHandler { peer: "test-peer" }
+    }
+
+    fn assert_not_supported<T: std::fmt::Debug>(result: std::io::Result<T>) {
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "not supported");
+    }
+
+    #[tokio::test]
+    async fn get_dai_extractor_config_returns_handler_reply() {
+        run_test_with(dai_handler(), |client_conn| async move {
+            let config = client_conn
+                .get_dai_extractor_config(&crate::test::dai_sensors())
+                .await
+                .unwrap();
+            assert_eq!(config, crate::test::dai_extractor_config());
         })
         .await;
     }
 
     #[tokio::test]
-    async fn update_host_user_agents() {
-        run_test(|client_conn| async move {
-            use crate::types::{RuleKind, UserAgent};
+    async fn get_dai_extractor_config_default_is_not_supported() {
+        run_test_with(DefaultHandler, |client_conn| async move {
+            assert_not_supported(
+                client_conn
+                    .get_dai_extractor_config(&["all".to_string()])
+                    .await,
+            );
+        })
+        .await;
+    }
 
-            let user_agents = vec![
-                UserAgent {
-                    name: "Chrome".to_string(),
-                    header: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)".to_string(),
-                    kind: RuleKind::AgentSoftware,
-                    last_modification_time: 1_234_567_890,
-                },
-                UserAgent {
-                    name: "Firefox".to_string(),
-                    header: "Mozilla/5.0 (X11; Linux x86_64)".to_string(),
-                    kind: RuleKind::AgentSoftware,
-                    last_modification_time: 1_234_567_891,
-                },
-            ];
+    #[tokio::test]
+    async fn get_dai_cursors_returns_handler_reply() {
+        run_test_with(dai_handler(), |client_conn| async move {
+            let cursors = client_conn
+                .get_dai_cursors(&crate::test::dai_sensors())
+                .await
+                .unwrap();
+            assert_eq!(cursors, crate::test::dai_cursors());
+        })
+        .await;
+    }
 
-            let os_info = vec!["Windows 10".to_string(), "Linux Ubuntu 20.04".to_string()];
+    #[tokio::test]
+    async fn get_dai_cursors_default_is_not_supported() {
+        run_test_with(DefaultHandler, |client_conn| async move {
+            assert_not_supported(client_conn.get_dai_cursors(&["all".to_string()]).await);
+        })
+        .await;
+    }
 
-            let hosts = vec![("192.168.1.100".parse().unwrap(), user_agents, os_info)];
+    #[tokio::test]
+    async fn send_dai_observations_returns_handler_reply() {
+        run_test_with(dai_handler(), |client_conn| async move {
+            let batch = crate::test::dai_observation_batches().remove(0);
+            let ack = client_conn.send_dai_observations(&batch).await.unwrap();
+            assert_eq!(ack, crate::test::dai_store_acks().remove(1));
+        })
+        .await;
+    }
 
-            let client_res = client_conn.update_host_user_agents(&hosts).await;
-            assert!(client_res.is_ok());
+    #[tokio::test]
+    async fn send_dai_observations_default_is_not_supported() {
+        run_test_with(DefaultHandler, |client_conn| async move {
+            let batch = crate::test::dai_observation_batches().remove(0);
+            assert_not_supported(client_conn.send_dai_observations(&batch).await);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn begin_dai_range_day_returns_handler_reply() {
+        run_test_with(dai_handler(), |client_conn| async move {
+            let grant = client_conn
+                .begin_dai_range_day(&crate::test::dai_range_unit(), 5)
+                .await
+                .unwrap();
+            assert_eq!(grant, crate::test::dai_range_grants().remove(0));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn begin_dai_range_day_default_is_not_supported() {
+        run_test_with(DefaultHandler, |client_conn| async move {
+            assert_not_supported(
+                client_conn
+                    .begin_dai_range_day(&crate::test::dai_range_unit(), 5)
+                    .await,
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn renew_dai_range_day_returns_handler_reply() {
+        run_test_with(dai_handler(), |client_conn| async move {
+            let lease_end = client_conn
+                .renew_dai_range_day(&crate::test::dai_range_unit(), 0x0bad_cafe_0bad_cafe)
+                .await
+                .unwrap();
+            assert_eq!(lease_end, Some(crate::test::DAI_RENEWED_LEASE_END));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn renew_dai_range_day_default_is_not_supported() {
+        run_test_with(DefaultHandler, |client_conn| async move {
+            assert_not_supported(
+                client_conn
+                    .renew_dai_range_day(&crate::test::dai_range_unit(), 1)
+                    .await,
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn send_dai_range_day_returns_handler_reply() {
+        run_test_with(dai_handler(), |client_conn| async move {
+            let day = crate::test::dai_range_days().remove(0);
+            let ack = client_conn.send_dai_range_day(&day).await.unwrap();
+            assert_eq!(ack, crate::test::dai_store_acks().remove(1));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn send_dai_range_day_default_is_not_supported() {
+        run_test_with(DefaultHandler, |client_conn| async move {
+            let day = crate::test::dai_range_days().remove(0);
+            assert_not_supported(client_conn.send_dai_range_day(&day).await);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn report_dai_range_late_returns_handler_reply() {
+        run_test_with(dai_handler(), |client_conn| async move {
+            let marks = client_conn
+                .report_dai_range_late(&crate::test::dai_range_late())
+                .await
+                .unwrap();
+            assert_eq!(marks, crate::test::dai_range_marks());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn report_dai_range_late_default_is_not_supported() {
+        run_test_with(DefaultHandler, |client_conn| async move {
+            assert_not_supported(
+                client_conn
+                    .report_dai_range_late(&crate::test::dai_range_late())
+                    .await,
+            );
         })
         .await;
     }

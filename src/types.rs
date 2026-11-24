@@ -13,9 +13,17 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 pub use structured::ColumnStatistics;
 
+mod dai;
 mod detection;
 pub mod raw_event;
 
+pub use self::dai::{
+    DaiCursorEntry, DaiCursors, DaiDhcpMsg, DaiExtractorConfig, DaiLateDay, DaiLateSlot,
+    DaiLateSubnet, DaiObservation, DaiObservationBatch, DaiObservationBody, DaiObservationKind,
+    DaiRangeBlock, DaiRangeDay, DaiRangeDayState, DaiRangeEvidence, DaiRangeGrant, DaiRangeLate,
+    DaiRangeMark, DaiRangeUnit, DaiReextractMark, DaiSensorConfig, DaiSide, DaiSoftwareSource,
+    DaiStoreAck,
+};
 pub use self::detection::{
     CryptocurrencyMiningPoolDetail, Detail, DetectionEvent, DetectionEventError, DetectionModel,
     EndpointRole, ExternalDdosDetail, FarOutlierDetail, FtpBruteForceDetail, LabelDbMatchDetail,
@@ -745,14 +753,6 @@ pub enum LabelDbKind {
 pub enum RuleKind {
     Os,
     AgentSoftware,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct UserAgent {
-    pub name: String,
-    pub header: String,
-    pub kind: RuleKind,
-    pub last_modification_time: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

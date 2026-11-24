@@ -391,13 +391,6 @@ pub const SERVER_CERTIFICATE_RENEW: ServiceId = ServiceId::new("server.certifica
 
 pub const SERVER_CONFIG_GET: ServiceId = ServiceId::new("server.config", "get");
 
-// ── server.host ───────────────────────────────────────────────
-
-pub const SERVER_HOST_UPDATE_OPENED_PORTS: ServiceId =
-    ServiceId::new("server.host", "update_opened_ports");
-pub const SERVER_HOST_UPDATE_OS_AGENTS: ServiceId =
-    ServiceId::new("server.host", "update_os_agents");
-
 // ── server.list ───────────────────────────────────────────────
 //
 // Server-side query operations for lists that the client pushes.
@@ -428,6 +421,21 @@ pub const SERVER_RUN_REPORT_ACTIVE: ServiceId = ServiceId::new("server.run", "re
 
 pub const SERVER_DETECTOR_REPORT_STATUS: ServiceId =
     ServiceId::new("server.detector", "report_status");
+
+// ── server.dai ────────────────────────────────────────────────
+//
+// Device identification: observations and range days an agent sends.
+
+pub const SERVER_DAI_GET_EXTRACTOR_CONFIG: ServiceId =
+    ServiceId::new("server.dai", "get_extractor_config");
+pub const SERVER_DAI_GET_CURSORS: ServiceId = ServiceId::new("server.dai", "get_cursors");
+pub const SERVER_DAI_SEND_OBSERVATIONS: ServiceId =
+    ServiceId::new("server.dai", "send_observations");
+pub const SERVER_DAI_BEGIN_RANGE_DAY: ServiceId = ServiceId::new("server.dai", "begin_range_day");
+pub const SERVER_DAI_RENEW_RANGE_DAY: ServiceId = ServiceId::new("server.dai", "renew_range_day");
+pub const SERVER_DAI_SEND_RANGE_DAY: ServiceId = ServiceId::new("server.dai", "send_range_day");
+pub const SERVER_DAI_REPORT_RANGE_LATE: ServiceId =
+    ServiceId::new("server.dai", "report_range_late");
 
 // ── Node request → method-level ServiceId ──────────────────────
 //
@@ -690,8 +698,6 @@ pub(crate) fn from_server_request_code(code: ServerRequestCode) -> Option<Servic
         ServerRequestCode::GetLabelDbPatterns => Some(SERVER_LABEL_GET_DB_PATTERNS),
         ServerRequestCode::RenewCertificate => Some(SERVER_CERTIFICATE_RENEW),
         ServerRequestCode::GetConfig => Some(SERVER_CONFIG_GET),
-        ServerRequestCode::UpdateHostOpenedPorts => Some(SERVER_HOST_UPDATE_OPENED_PORTS),
-        ServerRequestCode::UpdateHostOsAgents => Some(SERVER_HOST_UPDATE_OS_AGENTS),
         ServerRequestCode::GetTrustedDomainList => Some(SERVER_LIST_TRUSTED_DOMAIN),
         ServerRequestCode::GetTorExitNodeList => Some(SERVER_LIST_TOR_EXIT_NODE),
         ServerRequestCode::GetInternalNetworkList => Some(SERVER_LIST_INTERNAL_NETWORK),
@@ -706,6 +712,13 @@ pub(crate) fn from_server_request_code(code: ServerRequestCode) -> Option<Servic
         ServerRequestCode::ReportRun => Some(SERVER_RUN_REPORT),
         ServerRequestCode::ReportActiveRuns => Some(SERVER_RUN_REPORT_ACTIVE),
         ServerRequestCode::ReportDetectorStatus => Some(SERVER_DETECTOR_REPORT_STATUS),
+        ServerRequestCode::GetDaiExtractorConfig => Some(SERVER_DAI_GET_EXTRACTOR_CONFIG),
+        ServerRequestCode::GetDaiCursors => Some(SERVER_DAI_GET_CURSORS),
+        ServerRequestCode::SendDaiObservations => Some(SERVER_DAI_SEND_OBSERVATIONS),
+        ServerRequestCode::BeginDaiRangeDay => Some(SERVER_DAI_BEGIN_RANGE_DAY),
+        ServerRequestCode::RenewDaiRangeDay => Some(SERVER_DAI_RENEW_RANGE_DAY),
+        ServerRequestCode::SendDaiRangeDay => Some(SERVER_DAI_SEND_RANGE_DAY),
+        ServerRequestCode::ReportDaiRangeLate => Some(SERVER_DAI_REPORT_RANGE_LATE),
         ServerRequestCode::Unknown => None,
     }
 }
@@ -824,6 +837,14 @@ pub fn all() -> &'static [ServiceId] {
         SERVER_RUN_REPORT_ACTIVE,
         // server.detector
         SERVER_DETECTOR_REPORT_STATUS,
+        // server.dai
+        SERVER_DAI_GET_EXTRACTOR_CONFIG,
+        SERVER_DAI_GET_CURSORS,
+        SERVER_DAI_SEND_OBSERVATIONS,
+        SERVER_DAI_BEGIN_RANGE_DAY,
+        SERVER_DAI_RENEW_RANGE_DAY,
+        SERVER_DAI_SEND_RANGE_DAY,
+        SERVER_DAI_REPORT_RANGE_LATE,
         // server.data_source
         SERVER_DATA_SOURCE_GET,
         SERVER_DATA_SOURCE_LIST,
@@ -855,9 +876,6 @@ pub fn all() -> &'static [ServiceId] {
         SERVER_CERTIFICATE_RENEW,
         // server.config
         SERVER_CONFIG_GET,
-        // server.host
-        SERVER_HOST_UPDATE_OPENED_PORTS,
-        SERVER_HOST_UPDATE_OS_AGENTS,
         // server.list
         SERVER_LIST_TRUSTED_DOMAIN,
         SERVER_LIST_TOR_EXIT_NODE,
@@ -1105,14 +1123,19 @@ mod tests {
             ServerRequestCode::GetPretrainedModel,
             ServerRequestCode::GetTrustedUserAgentList,
             ServerRequestCode::GetConfig,
-            ServerRequestCode::UpdateHostOpenedPorts,
-            ServerRequestCode::UpdateHostOsAgents,
             ServerRequestCode::GetTimeSeriesGenerationPolicyList,
             ServerRequestCode::ReportCustomerDataDeletion,
             ServerRequestCode::UploadRunModel,
             ServerRequestCode::ReportRun,
             ServerRequestCode::ReportActiveRuns,
             ServerRequestCode::ReportDetectorStatus,
+            ServerRequestCode::GetDaiExtractorConfig,
+            ServerRequestCode::GetDaiCursors,
+            ServerRequestCode::SendDaiObservations,
+            ServerRequestCode::BeginDaiRangeDay,
+            ServerRequestCode::RenewDaiRangeDay,
+            ServerRequestCode::SendDaiRangeDay,
+            ServerRequestCode::ReportDaiRangeLate,
         ];
         for &code in codes {
             assert!(
@@ -1227,6 +1250,67 @@ mod tests {
         assert!(ids.contains(&ENGINE_TRAIN_MODEL));
         assert!(ids.contains(&SERVER_RUN_UPLOAD_MODEL));
         assert!(ids.contains(&SERVER_DETECTOR_REPORT_STATUS));
+    }
+
+    /// The DAI request codes map to their own service IDs, whose strings
+    /// are pinned, and `all()` lists them.
+    #[test]
+    fn dai_request_codes_map_to_their_ids() {
+        let cases = [
+            (
+                ServerRequestCode::GetDaiExtractorConfig,
+                SERVER_DAI_GET_EXTRACTOR_CONFIG,
+                "server.dai.get_extractor_config",
+            ),
+            (
+                ServerRequestCode::GetDaiCursors,
+                SERVER_DAI_GET_CURSORS,
+                "server.dai.get_cursors",
+            ),
+            (
+                ServerRequestCode::SendDaiObservations,
+                SERVER_DAI_SEND_OBSERVATIONS,
+                "server.dai.send_observations",
+            ),
+            (
+                ServerRequestCode::BeginDaiRangeDay,
+                SERVER_DAI_BEGIN_RANGE_DAY,
+                "server.dai.begin_range_day",
+            ),
+            (
+                ServerRequestCode::RenewDaiRangeDay,
+                SERVER_DAI_RENEW_RANGE_DAY,
+                "server.dai.renew_range_day",
+            ),
+            (
+                ServerRequestCode::SendDaiRangeDay,
+                SERVER_DAI_SEND_RANGE_DAY,
+                "server.dai.send_range_day",
+            ),
+            (
+                ServerRequestCode::ReportDaiRangeLate,
+                SERVER_DAI_REPORT_RANGE_LATE,
+                "server.dai.report_range_late",
+            ),
+        ];
+        let ids = all();
+        for (code, id, string) in cases {
+            assert_eq!(from_server_request_code(code), Some(id));
+            assert!(ids.contains(&id));
+            assert_eq!(id.to_string(), string);
+        }
+    }
+
+    /// The retired host report requests decode as unknown codes, which map
+    /// to no service ID, and `all()` lists no `server.host` ID.
+    #[test]
+    fn retired_host_report_codes_have_no_service_id() {
+        for code in [37_u32, 38] {
+            let code = ServerRequestCode::from(code);
+            assert_eq!(code, ServerRequestCode::Unknown);
+            assert_eq!(from_server_request_code(code), None);
+        }
+        assert!(all().iter().all(|id| id.family != "server.host"));
     }
 
     #[test]

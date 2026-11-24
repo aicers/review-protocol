@@ -22,11 +22,7 @@
 //! optional fields or a parallel error envelope) to avoid breaking
 //! existing clients.
 
-use std::{
-    collections::{HashMap, HashSet},
-    io,
-    net::IpAddr,
-};
+use std::{collections::HashSet, io};
 
 use num_enum::FromPrimitive;
 use oinq::request::parse_args;
@@ -35,10 +31,11 @@ use super::{AUTHORIZATION_DENIED, RequestCode, UNKNOWN_REQUEST_CODE};
 use crate::legacy_transport as oinq;
 use crate::protocol_error::{DispatchError, ProtocolErrorKind};
 use crate::types::{
-    ColumnStatisticsUpdate, CustomerDataDeletionReport, DataSource, DataSourceKey, DetectionEvent,
-    DetectorStatusReport, HostNetworkGroup, LabelDb, NetworkListItem, OutlierInfo,
-    ReportedRunState, TimeSeriesGenerationPolicy, TimeSeriesUpdate, UpdateClusterRequest,
-    UserAgent,
+    ColumnStatisticsUpdate, CustomerDataDeletionReport, DaiCursors, DaiExtractorConfig,
+    DaiObservationBatch, DaiRangeDay, DaiRangeGrant, DaiRangeLate, DaiRangeMark, DaiRangeUnit,
+    DaiStoreAck, DataSource, DataSourceKey, DetectionEvent, DetectorStatusReport, HostNetworkGroup,
+    LabelDb, NetworkListItem, OutlierInfo, ReportedRunState, TimeSeriesGenerationPolicy,
+    TimeSeriesUpdate, UpdateClusterRequest,
 };
 
 /// A request handler that can handle a request to the server.
@@ -204,19 +201,138 @@ pub trait Handler {
         Err("not supported".to_string())
     }
 
-    async fn update_host_ports(
+    /// Answers request 45, the DAI extractor configuration for the
+    /// `sensors` agent `peer` takes.
+    ///
+    /// A list that is exactly `["all"]` stands for every sensor that belongs
+    /// to a customer. Otherwise the answer covers only the named sensors that
+    /// belong to a customer; other names are left out, not reported as
+    /// errors. See [`DaiExtractorConfig`] for what the answer holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or the
+    /// manager refuses it.
+    async fn get_dai_extractor_config(
         &self,
         _peer: &str,
-        _hosts: &HashMap<IpAddr, HashMap<(u16, u8), u32>>,
-    ) -> Result<(), String> {
+        _sensors: &[String],
+    ) -> Result<DaiExtractorConfig, String> {
         Err("not supported".to_string())
     }
 
-    async fn update_host_user_agents(
+    /// Answers request 46, the DAI read cursors for the `sensors` agent
+    /// `peer` takes.
+    ///
+    /// The sensor list is read as for
+    /// [`get_dai_extractor_config`](Self::get_dai_extractor_config). See
+    /// [`DaiCursors`] for what the answer holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or the
+    /// manager refuses it.
+    async fn get_dai_cursors(
         &self,
         _peer: &str,
-        _hosts: &[(IpAddr, Vec<UserAgent>, Vec<String>)],
-    ) -> Result<(), String> {
+        _sensors: &[String],
+    ) -> Result<DaiCursors, String> {
+        Err("not supported".to_string())
+    }
+
+    /// Accepts request 47, one part of one send of the observations of a
+    /// slot from agent `peer`.
+    ///
+    /// The batch is taken by value, so it can be handed to another task
+    /// without a copy. See [`DaiObservationBatch`] for the rules the manager
+    /// applies to it and [`DaiStoreAck`] for the answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or the
+    /// manager refuses it.
+    async fn send_dai_observations(
+        &self,
+        _peer: &str,
+        _batch: DaiObservationBatch,
+    ) -> Result<DaiStoreAck, String> {
+        Err("not supported".to_string())
+    }
+
+    /// Answers request 48, starting a round of range day `unit` for agent
+    /// `peer`, which holds `restore_generation`.
+    ///
+    /// A grant raises the unit's version and grants a lease with a fresh
+    /// random lease token. See [`DaiRangeGrant`] for the answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or the
+    /// manager refuses it.
+    async fn begin_dai_range_day(
+        &self,
+        _peer: &str,
+        _unit: &DaiRangeUnit,
+        _restore_generation: u64,
+    ) -> Result<DaiRangeGrant, String> {
+        Err("not supported".to_string())
+    }
+
+    /// Answers request 49, renewing the lease `lease_token` on range day
+    /// `unit` for agent `peer`.
+    ///
+    /// Answers the new lease end, in nanoseconds since the UNIX epoch, or
+    /// `None` when the token is no longer the unit's current one, and the
+    /// agent stops.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or the
+    /// manager refuses it.
+    async fn renew_dai_range_day(
+        &self,
+        _peer: &str,
+        _unit: &DaiRangeUnit,
+        _lease_token: u64,
+    ) -> Result<Option<i64>, String> {
+        Err("not supported".to_string())
+    }
+
+    /// Accepts request 50, the counts of a range day from agent `peer`.
+    ///
+    /// The day is taken by value, so it can be handed to another task
+    /// without a copy. The answer is [`DaiStoreAck::Stored`] also for a
+    /// result from a superseded lease, which the manager discards; see
+    /// [`DaiRangeDay`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or the
+    /// manager refuses it.
+    async fn send_dai_range_day(
+        &self,
+        _peer: &str,
+        _day: DaiRangeDay,
+    ) -> Result<DaiStoreAck, String> {
+        Err("not supported".to_string())
+    }
+
+    /// Accepts request 51, the late range days and subnets agent `peer`
+    /// reports, and answers the marks assigned to `late_days`.
+    ///
+    /// `late_subnets` are recorded without a mark; see [`DaiRangeLate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or the
+    /// manager refuses it, for example when the restore generation differs.
+    /// An error means nothing was recorded, and the agent calls
+    /// `get_dai_cursors` again before reporting.
+    async fn report_dai_range_late(
+        &self,
+        _peer: &str,
+        _late: &DaiRangeLate,
+    ) -> Result<Vec<DaiRangeMark>, String> {
         Err("not supported".to_string())
     }
 
@@ -514,14 +630,43 @@ where
                     .await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
-            RequestCode::UpdateHostOpenedPorts => {
-                let hosts = parse_args::<HashMap<IpAddr, HashMap<(u16, u8), u32>>>(body)?;
-                let result = handler.update_host_ports(peer_name, &hosts).await;
+            RequestCode::GetDaiExtractorConfig => {
+                let sensors = parse_args::<Vec<String>>(body)?;
+                let result = handler.get_dai_extractor_config(peer_name, &sensors).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
-            RequestCode::UpdateHostOsAgents => {
-                let hosts = parse_args::<Vec<(IpAddr, Vec<UserAgent>, Vec<String>)>>(body)?;
-                let result = handler.update_host_user_agents(peer_name, &hosts).await;
+            RequestCode::GetDaiCursors => {
+                let sensors = parse_args::<Vec<String>>(body)?;
+                let result = handler.get_dai_cursors(peer_name, &sensors).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::SendDaiObservations => {
+                let batch = parse_args::<DaiObservationBatch>(body)?;
+                let result = handler.send_dai_observations(peer_name, batch).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::BeginDaiRangeDay => {
+                let (unit, restore_generation) = parse_args::<(DaiRangeUnit, u64)>(body)?;
+                let result = handler
+                    .begin_dai_range_day(peer_name, &unit, restore_generation)
+                    .await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::RenewDaiRangeDay => {
+                let (unit, lease_token) = parse_args::<(DaiRangeUnit, u64)>(body)?;
+                let result = handler
+                    .renew_dai_range_day(peer_name, &unit, lease_token)
+                    .await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::SendDaiRangeDay => {
+                let day = parse_args::<DaiRangeDay>(body)?;
+                let result = handler.send_dai_range_day(peer_name, day).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportDaiRangeLate => {
+                let late = parse_args::<DaiRangeLate>(body)?;
+                let result = handler.report_dai_range_late(peer_name, &late).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
             RequestCode::UploadRunModel => {
@@ -775,14 +920,43 @@ where
                     .await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
-            RequestCode::UpdateHostOpenedPorts => {
-                let hosts = parse_args::<HashMap<IpAddr, HashMap<(u16, u8), u32>>>(body)?;
-                let result = handler.update_host_ports(peer_name, &hosts).await;
+            RequestCode::GetDaiExtractorConfig => {
+                let sensors = parse_args::<Vec<String>>(body)?;
+                let result = handler.get_dai_extractor_config(peer_name, &sensors).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
-            RequestCode::UpdateHostOsAgents => {
-                let hosts = parse_args::<Vec<(IpAddr, Vec<UserAgent>, Vec<String>)>>(body)?;
-                let result = handler.update_host_user_agents(peer_name, &hosts).await;
+            RequestCode::GetDaiCursors => {
+                let sensors = parse_args::<Vec<String>>(body)?;
+                let result = handler.get_dai_cursors(peer_name, &sensors).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::SendDaiObservations => {
+                let batch = parse_args::<DaiObservationBatch>(body)?;
+                let result = handler.send_dai_observations(peer_name, batch).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::BeginDaiRangeDay => {
+                let (unit, restore_generation) = parse_args::<(DaiRangeUnit, u64)>(body)?;
+                let result = handler
+                    .begin_dai_range_day(peer_name, &unit, restore_generation)
+                    .await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::RenewDaiRangeDay => {
+                let (unit, lease_token) = parse_args::<(DaiRangeUnit, u64)>(body)?;
+                let result = handler
+                    .renew_dai_range_day(peer_name, &unit, lease_token)
+                    .await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::SendDaiRangeDay => {
+                let day = parse_args::<DaiRangeDay>(body)?;
+                let result = handler.send_dai_range_day(peer_name, day).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportDaiRangeLate => {
+                let late = parse_args::<DaiRangeLate>(body)?;
+                let result = handler.report_dai_range_late(peer_name, &late).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
             RequestCode::UploadRunModel => {
@@ -1279,6 +1453,288 @@ mod tests {
         drop(client_recv);
         assert!(server_task.await.unwrap().unwrap().is_none());
         assert_eq!(*received.lock().unwrap(), expected);
+    }
+
+    /// An authorizer that allows everything and records the service IDs it
+    /// was asked about.
+    #[derive(Clone, Default)]
+    struct RecordingAuthorizer(Arc<Mutex<Vec<crate::service_id::ServiceId>>>);
+
+    impl crate::auth::Authorizer for RecordingAuthorizer {
+        fn authorize(
+            &self,
+            _peer: &crate::auth::PeerContext,
+            service: &crate::service_id::ServiceId,
+        ) -> Result<(), crate::auth::AuthorizationError> {
+            self.0.lock().unwrap().push(*service);
+            Ok(())
+        }
+    }
+
+    /// The service IDs of the DAI requests, in the order
+    /// [`send_dai_requests`] sends them.
+    const DAI_SERVICES: [crate::service_id::ServiceId; 7] = [
+        crate::service_id::SERVER_DAI_GET_EXTRACTOR_CONFIG,
+        crate::service_id::SERVER_DAI_GET_CURSORS,
+        crate::service_id::SERVER_DAI_SEND_OBSERVATIONS,
+        crate::service_id::SERVER_DAI_BEGIN_RANGE_DAY,
+        crate::service_id::SERVER_DAI_RENEW_RANGE_DAY,
+        crate::service_id::SERVER_DAI_SEND_RANGE_DAY,
+        crate::service_id::SERVER_DAI_REPORT_RANGE_LATE,
+    ];
+
+    /// Sends one request of each DAI code over the stream, with the
+    /// arguments `crate::test::DaiTestHandler` accepts, and asserts every
+    /// answer is that handler's reply, or `not supported` when
+    /// `supported` is false.
+    async fn send_dai_requests(
+        client_send: &mut quinn::SendStream,
+        client_recv: &mut quinn::RecvStream,
+        supported: bool,
+    ) {
+        use crate::test::{
+            DAI_RENEWED_LEASE_END, dai_cursors, dai_extractor_config, dai_observation_batches,
+            dai_range_days, dai_range_grants, dai_range_late, dai_range_marks, dai_range_unit,
+            dai_sensors, dai_store_acks,
+        };
+
+        fn expect<T>(supported: bool, reply: T) -> Result<T, String> {
+            if supported {
+                Ok(reply)
+            } else {
+                Err("not supported".to_string())
+            }
+        }
+
+        let sensors = dai_sensors();
+        let response: Result<DaiExtractorConfig, String> = crate::unary_request(
+            client_send,
+            client_recv,
+            u32::from(RequestCode::GetDaiExtractorConfig),
+            &sensors,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, expect(supported, dai_extractor_config()));
+
+        let response: Result<DaiCursors, String> = crate::unary_request(
+            client_send,
+            client_recv,
+            u32::from(RequestCode::GetDaiCursors),
+            &sensors,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, expect(supported, dai_cursors()));
+
+        let response: Result<DaiStoreAck, String> = crate::unary_request(
+            client_send,
+            client_recv,
+            u32::from(RequestCode::SendDaiObservations),
+            &dai_observation_batches()[0],
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, expect(supported, dai_store_acks().remove(1)));
+
+        let response: Result<DaiRangeGrant, String> = crate::unary_request(
+            client_send,
+            client_recv,
+            u32::from(RequestCode::BeginDaiRangeDay),
+            (dai_range_unit(), 5_u64),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, expect(supported, dai_range_grants().remove(0)));
+
+        let response: Result<Option<i64>, String> = crate::unary_request(
+            client_send,
+            client_recv,
+            u32::from(RequestCode::RenewDaiRangeDay),
+            (dai_range_unit(), 0x0bad_cafe_0bad_cafe_u64),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, expect(supported, Some(DAI_RENEWED_LEASE_END)));
+
+        let response: Result<DaiStoreAck, String> = crate::unary_request(
+            client_send,
+            client_recv,
+            u32::from(RequestCode::SendDaiRangeDay),
+            &dai_range_days()[0],
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, expect(supported, dai_store_acks().remove(1)));
+
+        let response: Result<Vec<DaiRangeMark>, String> = crate::unary_request(
+            client_send,
+            client_recv,
+            u32::from(RequestCode::ReportDaiRangeLate),
+            dai_range_late(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, expect(supported, dai_range_marks()));
+    }
+
+    #[tokio::test]
+    async fn dai_requests_default_is_not_supported() {
+        struct DefaultHandler;
+        impl Handler for DefaultHandler {}
+
+        let not_supported = "not supported".to_string();
+        let unit = crate::test::dai_range_unit();
+        assert_eq!(
+            DefaultHandler
+                .get_dai_extractor_config("peer", &["all".to_string()])
+                .await,
+            Err(not_supported.clone())
+        );
+        assert_eq!(
+            DefaultHandler
+                .get_dai_cursors("peer", &["all".to_string()])
+                .await,
+            Err(not_supported.clone())
+        );
+        assert_eq!(
+            DefaultHandler
+                .send_dai_observations("peer", crate::test::dai_observation_batches().remove(0))
+                .await,
+            Err(not_supported.clone())
+        );
+        assert_eq!(
+            DefaultHandler.begin_dai_range_day("peer", &unit, 5).await,
+            Err(not_supported.clone())
+        );
+        assert_eq!(
+            DefaultHandler.renew_dai_range_day("peer", &unit, 1).await,
+            Err(not_supported.clone())
+        );
+        assert_eq!(
+            DefaultHandler
+                .send_dai_range_day("peer", crate::test::dai_range_days().remove(0))
+                .await,
+            Err(not_supported.clone())
+        );
+        assert_eq!(
+            DefaultHandler
+                .report_dai_range_late("peer", &crate::test::dai_range_late())
+                .await,
+            Err(not_supported)
+        );
+
+        // The default answer also reaches the agent over the wire.
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+        let server_task = tokio::spawn(async move {
+            super::handle(
+                &mut DefaultHandler,
+                &mut server_send,
+                &mut server_recv,
+                "test-peer",
+            )
+            .await
+        });
+        send_dai_requests(&mut client_send, &mut client_recv, false).await;
+        drop(client_send);
+        drop(client_recv);
+        assert!(server_task.await.unwrap().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn authorized_dispatches_dai_requests() {
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+        let authorizer = RecordingAuthorizer::default();
+        let services = Arc::clone(&authorizer.0);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = crate::test::DaiTestHandler {
+                peer: "agent.example.test",
+            };
+            super::handle_authorized(
+                &mut handler,
+                &mut server_send,
+                &mut server_recv,
+                &crate::auth::PeerContext::new("agent.example.test"),
+                &authorizer,
+            )
+            .await
+        });
+        send_dai_requests(&mut client_send, &mut client_recv, true).await;
+
+        drop(client_send);
+        drop(client_recv);
+        assert!(server_task.await.unwrap().unwrap().is_none());
+        assert_eq!(*services.lock().unwrap(), DAI_SERVICES);
+    }
+
+    #[tokio::test]
+    async fn authorized_with_context_dispatches_dai_requests() {
+        let _lock = TOKEN.lock().await;
+        let channel = channel().await;
+        let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+        let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+        let authorizer = RecordingAuthorizer::default();
+        let services = Arc::clone(&authorizer.0);
+
+        let server_task = tokio::spawn(async move {
+            let mut handler = crate::test::DaiTestHandler {
+                peer: "agent.example.test",
+            };
+            let peer = crate::auth::PeerContext::new("agent.example.test");
+            super::handle_authorized_with_context(
+                &mut handler,
+                &mut server_send,
+                &mut server_recv,
+                &crate::auth::AuthorizationContext::from_peer_context(&peer),
+                &crate::auth::AuthorizerV2Adapter::new(authorizer),
+            )
+            .await
+        });
+        send_dai_requests(&mut client_send, &mut client_recv, true).await;
+
+        drop(client_send);
+        drop(client_recv);
+        assert!(server_task.await.unwrap().unwrap().is_none());
+        assert_eq!(*services.lock().unwrap(), DAI_SERVICES);
+    }
+
+    /// The retired host report codes are unknown: the dispatcher answers
+    /// `unknown request code` and stops.
+    #[tokio::test]
+    async fn retired_host_report_codes_are_unknown() {
+        for code in [37_u32, 38] {
+            let _lock = TOKEN.lock().await;
+            let channel = channel().await;
+            let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
+            let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
+            let server_task = tokio::spawn(async move {
+                let mut handler = crate::test::DaiTestHandler { peer: "test-peer" };
+                super::handle(
+                    &mut handler,
+                    &mut server_send,
+                    &mut server_recv,
+                    "test-peer",
+                )
+                .await
+            });
+            let response: Result<(), String> =
+                crate::unary_request(&mut client_send, &mut client_recv, code, ())
+                    .await
+                    .unwrap();
+            assert_eq!(response, Err(UNKNOWN_REQUEST_CODE.to_string()));
+            let error = server_task.await.unwrap().unwrap_err();
+            assert_eq!(
+                ProtocolErrorKind::of_io_error(&error),
+                ProtocolErrorKind::NotSupported
+            );
+        }
     }
 
     #[tokio::test]

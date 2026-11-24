@@ -949,6 +949,539 @@ pub fn network_list_items() -> Vec<crate::types::NetworkListItem> {
     ]
 }
 
+/// Returns the sensor list the DAI samples request with.
+#[must_use]
+pub fn dai_sensors() -> Vec<String> {
+    vec!["sensor-a".to_string(), "sensor-b".to_string()]
+}
+
+/// Returns a DAI extractor configuration with two sensors.
+#[must_use]
+pub fn dai_extractor_config() -> crate::types::DaiExtractorConfig {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use crate::types::{DaiExtractorConfig, DaiSensorConfig, HostNetworkGroup};
+
+    DaiExtractorConfig {
+        revision: 0x0123_4567_89ab_cdef,
+        sensors: vec![
+            DaiSensorConfig {
+                sensor: "sensor-a".to_string(),
+                config_epoch: 3,
+                network_digest: u64::MAX,
+                customer_id: 7,
+                site: "seoul".to_string(),
+                enabled: true,
+                internal: HostNetworkGroup {
+                    hosts: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))],
+                    networks: vec!["10.0.0.0/8".parse().unwrap()],
+                    ip_ranges: vec![
+                        IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1))
+                            ..=IpAddr::V4(Ipv4Addr::new(192, 168, 0, 9)),
+                    ],
+                },
+                registered: HostNetworkGroup {
+                    hosts: vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
+                    networks: vec!["10.0.0.0/8".parse().unwrap(), "fd00::/8".parse().unwrap()],
+                    ip_ranges: Vec::new(),
+                },
+            },
+            DaiSensorConfig {
+                sensor: "sensor-b".to_string(),
+                config_epoch: 0,
+                network_digest: 0,
+                customer_id: u32::MAX,
+                site: String::new(),
+                enabled: false,
+                internal: HostNetworkGroup::default(),
+                registered: HostNetworkGroup::default(),
+            },
+        ],
+    }
+}
+
+/// Returns DAI cursors with re-extraction marks and range days, both `Some`
+/// and `None` for every optional field.
+#[must_use]
+pub fn dai_cursors() -> crate::types::DaiCursors {
+    use crate::types::{
+        DaiCursorEntry, DaiCursors, DaiObservationKind, DaiRangeDayState, DaiRangeEvidence,
+        DaiReextractMark,
+    };
+
+    DaiCursors {
+        restore_generation: 5,
+        entries: vec![
+            DaiCursorEntry {
+                sensor: "sensor-a".to_string(),
+                kind: DaiObservationKind::DhcpLease,
+                cursor: 1_773_586_800_000_000_000,
+                read_floor: 1_773_500_400_000_000_000,
+                reextract: vec![DaiReextractMark {
+                    kind: DaiObservationKind::DhcpLease,
+                    slot_start: 1_773_586_500_000_000_000,
+                    mark: 11,
+                }],
+            },
+            DaiCursorEntry {
+                sensor: "sensor-a".to_string(),
+                kind: DaiObservationKind::IpActivity,
+                cursor: i64::MIN,
+                read_floor: i64::MAX,
+                reextract: Vec::new(),
+            },
+        ],
+        range_days: vec![
+            DaiRangeDayState {
+                sensor: "sensor-a".to_string(),
+                date: 20_527,
+                evidence: DaiRangeEvidence::Sensor,
+                mark: Some(12),
+                stored_version: Some(2),
+            },
+            DaiRangeDayState {
+                sensor: "sensor-b".to_string(),
+                date: -1,
+                evidence: DaiRangeEvidence::Sensor,
+                mark: None,
+                stored_version: None,
+            },
+        ],
+    }
+}
+
+/// Returns one observation of every `DaiObservationBody` variant, with both
+/// `Some` and `None` for every optional field and every value of the
+/// field-less enums they carry.
+#[allow(clippy::too_many_lines)] // One literal observation per covered shape.
+#[must_use]
+pub fn dai_observations() -> Vec<crate::types::DaiObservation> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use crate::types::{
+        DaiDhcpMsg, DaiObservation, DaiObservationBody, DaiSide, DaiSoftwareSource,
+    };
+
+    const T: i64 = 1_773_586_804_120_000_000;
+    let v4 = |last: u8| IpAddr::V4(Ipv4Addr::new(10, 0, 0, last));
+    let v6 = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
+    let lease = |msg| DaiObservationBody::DhcpLease {
+        time: T,
+        msg,
+        ip: v4(20),
+        chaddr: vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+        xid: 0xdead_beef,
+        server_ip: v4(1),
+        server_id: None,
+        giaddr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        client_id: None,
+        hostname: None,
+        lease_secs: None,
+        subnet_mask: None,
+        routers: Vec::new(),
+    };
+    let one = |body| DaiObservation {
+        first_seen: T,
+        last_seen: T,
+        count: 1,
+        body,
+    };
+    let merged = |body| DaiObservation {
+        first_seen: T,
+        last_seen: T + 299_000_000_000,
+        count: u32::MAX,
+        body,
+    };
+
+    vec![
+        one(DaiObservationBody::DhcpLease {
+            time: T,
+            msg: DaiDhcpMsg::Ack,
+            ip: v4(20),
+            chaddr: vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            xid: 0xdead_beef,
+            server_ip: v4(1),
+            server_id: Some(v4(2)),
+            giaddr: v4(254),
+            client_id: Some(vec![0x01, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+            hostname: Some("laptop-17".to_string()),
+            lease_secs: Some(86_400),
+            subnet_mask: Some(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0))),
+            routers: vec![v4(1), v6],
+        }),
+        one(lease(DaiDhcpMsg::InformAck)),
+        one(lease(DaiDhcpMsg::Release)),
+        one(lease(DaiDhcpMsg::Decline)),
+        merged(DaiObservationBody::DhcpServer {
+            server_ip: v4(1),
+            server_id: Some(v4(2)),
+        }),
+        merged(DaiObservationBody::DhcpServer {
+            server_ip: v6,
+            server_id: None,
+        }),
+        merged(DaiObservationBody::Kerberos {
+            client_ip: v4(20),
+            realm: "EXAMPLE.TEST".to_string(),
+            cname: vec!["alice".to_string()],
+            sname: vec!["krbtgt".to_string(), "EXAMPLE.TEST".to_string()],
+            msg_type: 11,
+            accepted: true,
+            preauth: 2,
+            error_code: None,
+        }),
+        merged(DaiObservationBody::Kerberos {
+            client_ip: v6,
+            realm: String::new(),
+            cname: Vec::new(),
+            sname: Vec::new(),
+            msg_type: 30,
+            accepted: false,
+            preauth: 0,
+            error_code: Some(24),
+        }),
+        merged(DaiObservationBody::Ntlm {
+            ip: v4(20),
+            workstation: "LAPTOP-17".to_string(),
+            user: "alice".to_string(),
+            domain: "EXAMPLE".to_string(),
+            success: true,
+        }),
+        merged(DaiObservationBody::Service {
+            server_ip: v4(5),
+            port: 443,
+            proto: 6,
+            external_client: true,
+        }),
+        merged(DaiObservationBody::Service {
+            server_ip: v6,
+            port: u16::MAX,
+            proto: 17,
+            external_client: false,
+        }),
+        merged(DaiObservationBody::SoftwareString {
+            ip: v4(5),
+            side: DaiSide::Server,
+            source: DaiSoftwareSource::Ssh,
+            text: "SSH-2.0-OpenSSH_9.6".to_string(),
+        }),
+        merged(DaiObservationBody::SoftwareString {
+            ip: v4(20),
+            side: DaiSide::Client,
+            source: DaiSoftwareSource::HttpUserAgent,
+            text: "Mozilla/5.0".to_string(),
+        }),
+        merged(DaiObservationBody::SoftwareString {
+            ip: v4(5),
+            side: DaiSide::Server,
+            source: DaiSoftwareSource::TlsCertSubject,
+            text: "CN=host.example.test".to_string(),
+        }),
+        merged(DaiObservationBody::DnsName {
+            name: "host.example.test".to_string(),
+            ip: v4(5),
+        }),
+        merged(DaiObservationBody::IpActivity {
+            ip: v4(20),
+            side: DaiSide::Client,
+        }),
+        merged(DaiObservationBody::IpActivity {
+            ip: v6,
+            side: DaiSide::Server,
+        }),
+    ]
+}
+
+/// Returns two parts of an observation send: the first carries every
+/// observation of [`dai_observations`] and `Some` for every optional field,
+/// the second none and `None`.
+#[must_use]
+pub fn dai_observation_batches() -> Vec<crate::types::DaiObservationBatch> {
+    use crate::types::{DaiLateSlot, DaiObservationBatch, DaiObservationKind};
+
+    let first = DaiObservationBatch {
+        restore_generation: 5,
+        config_epoch: 3,
+        network_digest: u64::MAX,
+        sensor: "sensor-a".to_string(),
+        kind: DaiObservationKind::DhcpLease,
+        slot_start: 1_773_586_800_000_000_000,
+        slot_len_secs: 300,
+        send_id: 0xfeed_f00d_dead_beef,
+        part: 0,
+        part_count: 2,
+        observations: dai_observations(),
+        last_record_time: Some(1_773_587_099_000_000_000),
+        late_slots: vec![DaiLateSlot {
+            kind: DaiObservationKind::Kerberos,
+            slot_start: 1_773_586_200_000_000_000,
+            delay_ns: 3_600_000_000_000,
+        }],
+        reextract_mark: Some(11),
+        lost_before: Some(1_773_500_000_000_000_000),
+        counted_from: 1_773_586_800_000_000_000,
+    };
+    let second = DaiObservationBatch {
+        part: 1,
+        observations: Vec::new(),
+        last_record_time: None,
+        late_slots: Vec::new(),
+        reextract_mark: None,
+        lost_before: None,
+        ..first.clone()
+    };
+    vec![first, second]
+}
+
+/// Returns one `DaiStoreAck` of every variant; the `Stored` one carries
+/// marks.
+#[must_use]
+pub fn dai_store_acks() -> Vec<crate::types::DaiStoreAck> {
+    use crate::types::{DaiObservationKind, DaiReextractMark, DaiStoreAck};
+
+    vec![
+        DaiStoreAck::Staged {
+            restore_generation: 5,
+            config_revision: 0x0123_4567_89ab_cdef,
+        },
+        DaiStoreAck::Stored {
+            restore_generation: 5,
+            config_revision: 0x0123_4567_89ab_cdef,
+            marks: vec![DaiReextractMark {
+                kind: DaiObservationKind::Kerberos,
+                slot_start: 1_773_586_200_000_000_000,
+                mark: 13,
+            }],
+        },
+        DaiStoreAck::Wait {
+            retry_after_ms: 1_500,
+            restore_generation: 5,
+            config_revision: 0,
+        },
+        DaiStoreAck::Resync {
+            restore_generation: 6,
+            config_revision: u64::MAX,
+        },
+    ]
+}
+
+/// Returns the range day the DAI samples ask for.
+#[must_use]
+pub fn dai_range_unit() -> crate::types::DaiRangeUnit {
+    crate::types::DaiRangeUnit {
+        sensor: "sensor-a".to_string(),
+        date: 20_527,
+        evidence: crate::types::DaiRangeEvidence::Sensor,
+    }
+}
+
+/// Returns one `DaiRangeGrant` of every variant.
+#[must_use]
+pub fn dai_range_grants() -> Vec<crate::types::DaiRangeGrant> {
+    use crate::types::DaiRangeGrant;
+
+    vec![
+        DaiRangeGrant::Granted {
+            version: 3,
+            lease_token: 0x0bad_cafe_0bad_cafe,
+            lease_expires_at: 1_773_587_100_000_000_000,
+        },
+        DaiRangeGrant::InProgress {
+            lease_expires_at: 1_773_587_400_000_000_000,
+        },
+        DaiRangeGrant::Resync,
+    ]
+}
+
+/// Returns two range days: a recollection with a mark and IPv4 and IPv6
+/// blocks, and a first collection with no mark and nothing counted.
+#[must_use]
+pub fn dai_range_days() -> Vec<crate::types::DaiRangeDay> {
+    use crate::types::{DaiRangeBlock, DaiRangeDay};
+
+    let first = DaiRangeDay {
+        restore_generation: 5,
+        config_epoch: 3,
+        network_digest: u64::MAX,
+        unit: dai_range_unit(),
+        version: 3,
+        mark: Some(12),
+        lease_token: 0x0bad_cafe_0bad_cafe,
+        blocks: vec![
+            DaiRangeBlock {
+                block: "172.16.4.0/24".parse().unwrap(),
+                distinct_addrs: 17,
+                conns: 4_096,
+                saturated: false,
+            },
+            DaiRangeBlock {
+                block: "fd12:3456::/64".parse().unwrap(),
+                distinct_addrs: u32::MAX,
+                conns: u64::MAX,
+                saturated: true,
+            },
+        ],
+        subnets: vec![
+            "172.16.4.0/24".parse().unwrap(),
+            "100.64.0.0/10".parse().unwrap(),
+        ],
+    };
+    let second = DaiRangeDay {
+        unit: crate::types::DaiRangeUnit {
+            sensor: "sensor-b".to_string(),
+            date: 0,
+            evidence: crate::types::DaiRangeEvidence::Sensor,
+        },
+        mark: None,
+        blocks: Vec::new(),
+        subnets: Vec::new(),
+        ..first.clone()
+    };
+    vec![first, second]
+}
+
+/// Returns a late range report with late days and subnets.
+#[must_use]
+pub fn dai_range_late() -> crate::types::DaiRangeLate {
+    use crate::types::{DaiLateDay, DaiLateSubnet, DaiRangeEvidence, DaiRangeLate};
+
+    DaiRangeLate {
+        restore_generation: 5,
+        sensor: "sensor-a".to_string(),
+        late_days: vec![DaiLateDay {
+            date: 20_526,
+            evidence: DaiRangeEvidence::Sensor,
+            delay_ns: 7_200_000_000_000,
+        }],
+        late_subnets: vec![DaiLateSubnet {
+            date: 20_526,
+            subnet: "192.168.77.0/24".parse().unwrap(),
+        }],
+    }
+}
+
+/// Returns the marks answered to [`dai_range_late`].
+#[must_use]
+pub fn dai_range_marks() -> Vec<crate::types::DaiRangeMark> {
+    vec![crate::types::DaiRangeMark {
+        date: 20_526,
+        evidence: crate::types::DaiRangeEvidence::Sensor,
+        mark: 14,
+    }]
+}
+
+/// The lease end [`DaiTestHandler`] answers to a renewal.
+pub const DAI_RENEWED_LEASE_END: i64 = 1_773_587_400_000_000_000;
+
+/// A handler that serves every DAI request from `peer` with the DAI samples.
+///
+/// Each method answers only the sample arguments (the sensor list
+/// [`dai_sensors`], the first of [`dai_observation_batches`] and of
+/// [`dai_range_days`], [`dai_range_unit`] with restore generation 5 or lease
+/// token `0x0bad_cafe_0bad_cafe`, and [`dai_range_late`]), and answers
+/// anything else with an error naming what it received, so a dropped or
+/// swapped argument fails the caller. The replies are
+/// [`dai_extractor_config`], [`dai_cursors`], the `Stored` ack of
+/// [`dai_store_acks`] for both sends, the `Granted` grant of
+/// [`dai_range_grants`], `Some(DAI_RENEWED_LEASE_END)`, and
+/// [`dai_range_marks`].
+#[cfg(feature = "server")]
+pub struct DaiTestHandler {
+    /// The peer name every request must carry.
+    pub peer: &'static str,
+}
+
+#[cfg(feature = "server")]
+impl DaiTestHandler {
+    fn check<T: std::fmt::Debug + PartialEq>(
+        &self,
+        peer: &str,
+        received: &T,
+        expected: &T,
+    ) -> Result<(), String> {
+        if peer != self.peer {
+            return Err(format!("unexpected peer: {peer}"));
+        }
+        if received != expected {
+            return Err(format!("unexpected DAI arguments: {received:?}"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "server")]
+#[async_trait::async_trait]
+impl crate::server::Handler for DaiTestHandler {
+    async fn get_dai_extractor_config(
+        &self,
+        peer: &str,
+        sensors: &[String],
+    ) -> Result<crate::types::DaiExtractorConfig, String> {
+        self.check(peer, &sensors, &dai_sensors().as_slice())?;
+        Ok(dai_extractor_config())
+    }
+
+    async fn get_dai_cursors(
+        &self,
+        peer: &str,
+        sensors: &[String],
+    ) -> Result<crate::types::DaiCursors, String> {
+        self.check(peer, &sensors, &dai_sensors().as_slice())?;
+        Ok(dai_cursors())
+    }
+
+    async fn send_dai_observations(
+        &self,
+        peer: &str,
+        batch: crate::types::DaiObservationBatch,
+    ) -> Result<crate::types::DaiStoreAck, String> {
+        self.check(peer, &batch, &dai_observation_batches().remove(0))?;
+        Ok(dai_store_acks().remove(1))
+    }
+
+    async fn begin_dai_range_day(
+        &self,
+        peer: &str,
+        unit: &crate::types::DaiRangeUnit,
+        restore_generation: u64,
+    ) -> Result<crate::types::DaiRangeGrant, String> {
+        self.check(peer, &(unit, restore_generation), &(&dai_range_unit(), 5))?;
+        Ok(dai_range_grants().remove(0))
+    }
+
+    async fn renew_dai_range_day(
+        &self,
+        peer: &str,
+        unit: &crate::types::DaiRangeUnit,
+        lease_token: u64,
+    ) -> Result<Option<i64>, String> {
+        self.check(
+            peer,
+            &(unit, lease_token),
+            &(&dai_range_unit(), 0x0bad_cafe_0bad_cafe),
+        )?;
+        Ok(Some(DAI_RENEWED_LEASE_END))
+    }
+
+    async fn send_dai_range_day(
+        &self,
+        peer: &str,
+        day: crate::types::DaiRangeDay,
+    ) -> Result<crate::types::DaiStoreAck, String> {
+        self.check(peer, &day, &dai_range_days().remove(0))?;
+        Ok(dai_store_acks().remove(1))
+    }
+
+    async fn report_dai_range_late(
+        &self,
+        peer: &str,
+        late: &crate::types::DaiRangeLate,
+    ) -> Result<Vec<crate::types::DaiRangeMark>, String> {
+        self.check(peer, late, &dai_range_late())?;
+        Ok(dai_range_marks())
+    }
+}
+
 #[cfg(all(feature = "client", feature = "server"))]
 #[allow(dead_code)]
 pub(crate) struct TestServerHandler;
@@ -1223,22 +1756,6 @@ impl crate::server::Handler for TestServerHandler {
         } else {
             Ok(vec![])
         }
-    }
-
-    async fn update_host_ports(
-        &self,
-        _peer: &str,
-        _hosts: &std::collections::HashMap<IpAddr, std::collections::HashMap<(u16, u8), u32>>,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    async fn update_host_user_agents(
-        &self,
-        _peer: &str,
-        _hosts: &[(IpAddr, Vec<crate::types::UserAgent>, Vec<String>)],
-    ) -> Result<(), String> {
-        Ok(())
     }
 
     // Accepts `RUN_MODEL` for `RUN_ID` and rejects `REJECTED_RUN_ID`.

@@ -287,14 +287,23 @@ pub(crate) enum RequestCode {
     GetPretrainedModel = 34,
     GetTrustedUserAgentList = 35,
     GetConfig = 36,
-    UpdateHostOpenedPorts = 37,
-    UpdateHostOsAgents = 38,
+    // 37 and 38 were `UpdateHostOpenedPorts` and `UpdateHostOsAgents`,
+    // retired in protocol 0.51.0. They decode as `Unknown`, so an agent that
+    // still sends them gets the unknown-code answer. Never reuse them: an
+    // older agent would have its host report read as another request.
     GetTimeSeriesGenerationPolicyList = 39,
     ReportCustomerDataDeletion = 40,
     UploadRunModel = 41,
     ReportRun = 42,
     ReportActiveRuns = 43,
     ReportDetectorStatus = 44,
+    GetDaiExtractorConfig = 45,
+    GetDaiCursors = 46,
+    SendDaiObservations = 47,
+    BeginDaiRangeDay = 48,
+    RenewDaiRangeDay = 49,
+    SendDaiRangeDay = 50,
+    ReportDaiRangeLate = 51,
 
     /// Unknown request
     #[num_enum(default)]
@@ -328,7 +337,31 @@ mod request_code_tests {
             assert_eq!(u32::from(code), num);
             assert_eq!(RequestCode::from_primitive(num), code);
         }
-        assert_eq!(RequestCode::from_primitive(45), RequestCode::Unknown);
+        assert_eq!(RequestCode::from_primitive(52), RequestCode::Unknown);
+    }
+
+    #[test]
+    fn dai_request_codes() {
+        let cases = [
+            (RequestCode::GetDaiExtractorConfig, 45),
+            (RequestCode::GetDaiCursors, 46),
+            (RequestCode::SendDaiObservations, 47),
+            (RequestCode::BeginDaiRangeDay, 48),
+            (RequestCode::RenewDaiRangeDay, 49),
+            (RequestCode::SendDaiRangeDay, 50),
+            (RequestCode::ReportDaiRangeLate, 51),
+        ];
+        for (code, num) in cases {
+            assert_eq!(u32::from(code), num);
+            assert_eq!(RequestCode::from_primitive(num), code);
+        }
+    }
+
+    /// The retired host report requests decode as unknown codes.
+    #[test]
+    fn retired_host_report_codes_are_unknown() {
+        assert_eq!(RequestCode::from_primitive(37), RequestCode::Unknown);
+        assert_eq!(RequestCode::from_primitive(38), RequestCode::Unknown);
     }
 }
 

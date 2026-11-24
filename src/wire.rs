@@ -118,8 +118,6 @@ mod tests {
             (crate::server::RequestCode::GetPretrainedModel, 34_u32),
             (crate::server::RequestCode::GetTrustedUserAgentList, 35_u32),
             (crate::server::RequestCode::GetConfig, 36_u32),
-            (crate::server::RequestCode::UpdateHostOpenedPorts, 37_u32),
-            (crate::server::RequestCode::UpdateHostOsAgents, 38_u32),
             (
                 crate::server::RequestCode::GetTimeSeriesGenerationPolicyList,
                 39_u32,
@@ -132,6 +130,13 @@ mod tests {
             (crate::server::RequestCode::ReportRun, 42_u32),
             (crate::server::RequestCode::ReportActiveRuns, 43_u32),
             (crate::server::RequestCode::ReportDetectorStatus, 44_u32),
+            (crate::server::RequestCode::GetDaiExtractorConfig, 45_u32),
+            (crate::server::RequestCode::GetDaiCursors, 46_u32),
+            (crate::server::RequestCode::SendDaiObservations, 47_u32),
+            (crate::server::RequestCode::BeginDaiRangeDay, 48_u32),
+            (crate::server::RequestCode::RenewDaiRangeDay, 49_u32),
+            (crate::server::RequestCode::SendDaiRangeDay, 50_u32),
+            (crate::server::RequestCode::ReportDaiRangeLate, 51_u32),
             (crate::server::RequestCode::Unknown, u32::MAX),
         ] {
             assert_eq!(u32::from(code), expected);
