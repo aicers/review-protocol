@@ -5325,6 +5325,47 @@ mod tests {
 
     #[cfg(any(feature = "client", feature = "server"))]
     #[test]
+    fn column_statistics_update_wire_bytes_are_pinned() {
+        use structured::{ColumnStatistics, Description, Element, ElementCount, NLargestCount};
+
+        let stats = ColumnStatistics {
+            description: Description::new(
+                2,
+                Some(10.5),
+                Some(1.5),
+                Some(Element::Int(1)),
+                Some(Element::Int(9)),
+            ),
+            n_largest_count: NLargestCount::new(
+                2,
+                vec![ElementCount {
+                    value: Element::Int(1),
+                    count: 2,
+                }],
+                Some(Element::Int(1)),
+            ),
+        };
+        let update = ColumnStatisticsUpdate {
+            cluster_id: 7,
+            column_statistics: vec![stats],
+        };
+        let config = bincode::config::standard();
+        let encoded =
+            bincode::serde::encode_to_vec(&update, config).expect("serialization should succeed");
+        let expected = [
+            7, 1, 2, 1, 0, 0, 0, 0, 0, 0, 37, 64, 1, 0, 0, 0, 0, 0, 0, 248, 63, 1, 0, 2, 1, 0, 18,
+            2, 1, 0, 2, 2, 1, 0, 2,
+        ];
+        assert_eq!(encoded, expected, "{encoded:?}");
+        let (decoded, len): (ColumnStatisticsUpdate, usize) =
+            bincode::serde::decode_from_slice(&encoded, config).expect("decoding should succeed");
+        assert_eq!(len, encoded.len());
+        assert_eq!(decoded.cluster_id, update.cluster_id);
+        assert_eq!(decoded.column_statistics, update.column_statistics);
+    }
+
+    #[cfg(any(feature = "client", feature = "server"))]
+    #[test]
     fn audit_health_round_trip() {
         use super::AuditHealth;
 
