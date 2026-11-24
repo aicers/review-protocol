@@ -115,7 +115,7 @@ below.
 
 <!-- markdownlint-enable MD013 -->
 
-The request and response streams exercise all 32 built-in operations,
+The request and response streams exercise all 30 built-in operations,
 including default `not supported` responses, a handler refusal, and success
 responses of several shapes. Certificate renewal includes ignored argument
 bytes. After every handler result the dispatcher reads the next frame. Clean
@@ -173,3 +173,16 @@ handler answers them `not supported`, so neither their requests nor their
 responses changed. The session runner replays the request stream for an agent
 that advertised protocol 0.50.0: it answers these two pulls from an agent that
 advertised an earlier version with its own error, without the handler.
+
+## Re-composed for protocol 0.51.0
+
+Protocol 0.51.0 retired the host report requests 37 (`UpdateHostOpenedPorts`)
+and 38 (`UpdateHostOsAgents`), which now decode as unknown codes. Their two
+frames were removed from `server-requests.bin`, and the two `not supported`
+response frames at the same positions, the 25th and 26th, from
+`server-responses.bin`; a dispatcher would otherwise answer the first of them
+`unknown request code` and stop. Every other byte of both files is unchanged.
+The table above still lists the two requests as they were captured.
+
+The device identification requests that 0.51.0 adds, codes 45 through 51, are
+not part of these fixtures; their own tests cover them.

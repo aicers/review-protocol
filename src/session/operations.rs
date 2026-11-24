@@ -1,9 +1,6 @@
 //! Typed protocol adapters sharing bounded exchange machinery.
 #[cfg(feature = "server")]
-use std::{
-    collections::{HashMap, HashSet},
-    net::IpAddr,
-};
+use std::collections::HashSet;
 use std::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
@@ -40,8 +37,10 @@ use crate::{
     auth::{AuthorizationContext, AuthorizerV2},
     server::{Handler, RequestCode as ServerCode},
     types::{
-        ColumnStatisticsUpdate, DataSource, DataSourceKey, DetectionEvent, HostNetworkGroup,
-        OutlierInfo, TimeSeriesGenerationPolicy, TimeSeriesUpdate, UpdateClusterRequest, UserAgent,
+        ColumnStatisticsUpdate, DaiCursors, DaiExtractorConfig, DaiObservationBatch, DaiRangeDay,
+        DaiRangeGrant, DaiRangeLate, DaiRangeMark, DaiRangeUnit, DaiStoreAck, DataSource,
+        DataSourceKey, DetectionEvent, HostNetworkGroup, OutlierInfo, TimeSeriesGenerationPolicy,
+        TimeSeriesUpdate, UpdateClusterRequest,
     },
 };
 
@@ -899,12 +898,22 @@ server_operations! {
             => |h, peer, ()| h.get_internal_network_list(peer).await,
         GetTrustedUserAgentList(()) -> Vec<String>
             => |h, _peer, ()| h.get_trusted_user_agent_list().await,
-        UpdateHostOpenedPorts(HashMap<IpAddr, HashMap<(u16, u8), u32>>) -> ()
-            => |h, peer, hosts| h.update_host_ports(peer, &hosts).await,
-        UpdateHostOsAgents(Vec<(IpAddr, Vec<UserAgent>, Vec<String>)>) -> ()
-            => |h, peer, hosts| h.update_host_user_agents(peer, &hosts).await,
         GetTimeSeriesGenerationPolicyList(()) -> Vec<TimeSeriesGenerationPolicy>
             => |h, peer, ()| h.get_time_series_generation_policy_list(peer).await,
+        GetDaiExtractorConfig(Vec<String>) -> DaiExtractorConfig
+            => |h, peer, sensors| h.get_dai_extractor_config(peer, &sensors).await,
+        GetDaiCursors(Vec<String>) -> DaiCursors
+            => |h, peer, sensors| h.get_dai_cursors(peer, &sensors).await,
+        SendDaiObservations(DaiObservationBatch) -> DaiStoreAck
+            => |h, peer, batch| h.send_dai_observations(peer, batch).await,
+        BeginDaiRangeDay((DaiRangeUnit, u64)) -> DaiRangeGrant
+            => |h, peer, (unit, restore_generation)| h.begin_dai_range_day(peer, &unit, restore_generation).await,
+        RenewDaiRangeDay((DaiRangeUnit, u64)) -> Option<i64>
+            => |h, peer, (unit, lease_token)| h.renew_dai_range_day(peer, &unit, lease_token).await,
+        SendDaiRangeDay(DaiRangeDay) -> DaiStoreAck
+            => |h, peer, day| h.send_dai_range_day(peer, day).await,
+        ReportDaiRangeLate(DaiRangeLate) -> Vec<DaiRangeMark>
+            => |h, peer, late| h.report_dai_range_late(peer, &late).await,
     }
 }
 

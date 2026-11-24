@@ -279,9 +279,13 @@
 //! compatibility. Request codes and representative responses have independently
 //! captured release/current fixtures in `tests/fixtures`.
 //!
-//! The protocol is `0.50.0`, and the library's `>=0.49.0` suggested floor is
-//! unchanged. `0.50.0` replaces the detection event, allowlist, blocklist and
-//! detector status payloads, with no path that reads the earlier shapes.
+//! The protocol is `0.51.0`, and the library's `>=0.49.0` suggested floor is
+//! unchanged. `0.51.0` adds the device identification (DAI) requests, codes 45
+//! through 51, and retires the host report requests 37 and 38, which now
+//! decode as unknown codes and draw the unknown-code answer; a manager that
+//! predates `0.51.0` answers the DAI requests the same way. `0.50.0` replaced
+//! the detection event, allowlist, blocklist and detector status payloads,
+//! with no path that reads the earlier shapes.
 //! The floor still admits `0.49.0` peers. Because some `0.49.0` allowlists and
 //! blocklists decode as valid `0.50.0` item lists with their hosts lost, the
 //! list pulls check the handshake: `AgentHandle::get_allowlist` and

@@ -228,7 +228,7 @@ use crate::types::{AuditHealth, ManifestFormatRange, ProvisioningFingerprint, St
 ///
 /// The value is maintained by hand, and nothing in this crate can check it
 /// against the deployed fleet.
-pub const PROTOCOL_VERSION: &str = "0.50.0";
+pub const PROTOCOL_VERSION: &str = "0.51.0";
 
 /// The protocol version requirement a manager that intends to route the
 /// `node.package` (code 109) and `node.enroll` (code 110) request families
@@ -1275,14 +1275,16 @@ mod tests {
     }
 
     /// The two constants sit in the protocol namespace: the current protocol
-    /// is `0.50.0`, and the suggested floor still admits `0.49.0` and refuses
-    /// the deployed `0.48.0`. Gated on the features that pull `semver` in.
+    /// is `0.51.0`, which adds the DAI requests 45 through 51 and retires the
+    /// host report requests 37 and 38, and the suggested floor still admits
+    /// `0.49.0` and refuses the deployed `0.48.0`. Gated on the features that
+    /// pull `semver` in.
     #[test]
     #[cfg(any(feature = "client", feature = "server"))]
     fn protocol_version_constants() {
         let version = semver::Version::parse(crate::PROTOCOL_VERSION).unwrap();
-        assert_eq!(crate::PROTOCOL_VERSION, "0.50.0");
-        assert_eq!(version, semver::Version::new(0, 50, 0));
+        assert_eq!(crate::PROTOCOL_VERSION, "0.51.0");
+        assert_eq!(version, semver::Version::new(0, 51, 0));
 
         let req = semver::VersionReq::parse(crate::MIN_PROTOCOL_VERSION_REQ).unwrap();
         assert_eq!(crate::MIN_PROTOCOL_VERSION_REQ, ">=0.49.0");
