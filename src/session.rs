@@ -16,15 +16,38 @@
 //! expose domain operations, identity, handshake metadata, certificates, and closure.
 //! They do not expose protocol streams.
 //!
-//! Construct an oinq `Endpoint` with the application's rustls configuration and
-//! `TransportOptions`, establish a `Connection`, and pass it to the appropriate
-//! `from_transport` constructor. The caller supplies the agent's complete
-//! `AgentInfo`, or the manager's version requirement and ceiling. Constructors return
-//! one handle and one non-cloneable incoming owner. Complete listener/connector
-//! policy, acceptance loops, reconnects, and application draining are outside this
-//! foundation's scope. Endpoint, owned awaitable `Incoming`, connection, options,
-//! checked `ApplicationCode`, and structured transport errors are re-exported from
-//! `session` for callers that do not otherwise depend on oinq.
+//! With the server feature, use `ServerListener::bind` or
+//! `ServerListener::from_socket` with application-supplied rustls configuration,
+//! transport options, frame budgets, an explicit protocol window, and a handshake
+//! deadline. The application owns certificate verification policy and interprets
+//! peer identities, including SANs. `ServerListener::reload_tls` replaces TLS
+//! policy for future connections on the same socket.
+//!
+//! Acquire a pending-work permit before `ServerListener::accept`, then supervise
+//! each `PendingSession::handshake` independently. The deadline covers both TLS
+//! and the protocol handshake from the moment the listener returns the pending
+//! owner. `UnadmittedSession` provides agent claims, the verified certificate
+//! chain where present, and `ServerSessionControl`. Dropping the owner aborts
+//! the connection. `UnadmittedSession::admit` consumes it and binds the
+//! application's authorization context and policy to incoming requests. Admission
+//! sends no wire frame. The peer can attempt traffic once it reads the protocol
+//! success reply, and the application can dispatch only after admitting it.
+//!
+//! To shut down, call `ServerListener::shutdown` to end listener acceptance.
+//! Already accepted work retains its endpoint resources even after listener
+//! drop. Use `ServerSessionControl::drain` to stop receiving new streams while
+//! accepted work completes, then close each connection after joining the work.
+//! A listener or session abort immediately closes transport. The application
+//! owns task cancellation and joins. The listener and incoming accept futures
+//! are cancel-safe. `ServerIncoming::accept_next` reports clean exhaustion as
+//! `None`. `ServerListener::wait_idle` waits for transport shutdown.
+//!
+//! The lower-level `from_transport` constructors still take an established
+//! `Connection`. To use them, construct an oinq `Endpoint` with the application's
+//! rustls configuration and `TransportOptions`. Endpoint, owned awaitable
+//! `Incoming`, connection, options, checked `ApplicationCode`, and structured
+//! transport errors remain re-exported from `session`.
+//!
 //!
 //! With `server`, `ServerIncoming::accept` returns a `ServerStream` containing
 //! either a request stream or an event receiver. With `client`, `AgentIncoming::accept`
@@ -46,7 +69,7 @@
 //! its streams; dropping an unfinished response also aborts the borrowed stream.
 //! On shutdown, stop acceptance, finish the active invocation, then call `finish`
 //! before reading another request. Applications supervise, cancel, and join tasks;
-//! these objects do not spawn background runners or provide application draining.
+//! these objects do not spawn background runners or join application tasks.
 //! FIN and transport acknowledgment do not prove application processing.
 //!
 //! Package installs use `preflight`; terminal verdicts complete the invocation,
@@ -305,6 +328,8 @@ pub use events::DetectionEventReceiver;
 pub use events::DetectionEventSender;
 mod decode;
 mod handshake;
+#[cfg(feature = "server")]
+mod listener;
 mod operations;
 
 use std::{
@@ -315,6 +340,11 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "server")]
+pub use listener::{
+    PendingSession, ProtocolWindow, ServerListener, ServerListenerOptions, ServerSessionClose,
+    ServerSessionControl, ServerTransportOptions, UnadmittedSession,
+};
 pub use oinq::frame::{FrameError, FrameLimit};
 pub use oinq::{
     ApplicationCode, CloseInfo as CloseReason, Connection, Endpoint, Incoming, TransportError,

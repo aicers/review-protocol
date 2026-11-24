@@ -23,42 +23,11 @@ impl super::ServerHandle {
         version_req: &str,
         highest_protocol_version: &str,
     ) -> Result<(Self, super::ServerIncoming), SessionError> {
-        let requirement =
-            semver::VersionReq::parse(version_req).map_err(SessionError::malformed)?;
-        let highest =
-            semver::Version::parse(highest_protocol_version).map_err(SessionError::malformed)?;
+        let window = super::ProtocolWindow::new(version_req, highest_protocol_version)?;
         let operation = async {
-            let (send, recv) = connection
-                .accept_bi()
-                .await
-                .map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent))?;
-            let mut exchange = Exchange::new(send, recv, options.handshake);
-            let frame = exchange.frame().await?;
-            let mut agent = decode_agent(frame.as_bytes(), options.handshake.get())?;
-            exchange.recycle(frame)?;
-            agent.addr = connection.remote_addr();
-            if semver::Version::parse(&agent.protocol_version)
-                .is_ok_and(|v| requirement.matches(&v) && v <= highest)
-            {
-                exchange.start(Ok::<_, &str>(highest_protocol_version))?;
-                exchange.flush().await?;
-                exchange.finish()?;
-                Ok(agent)
-            } else {
-                let required = format!("{requirement}, <={highest}");
-                exchange.start(Err::<&str, _>(&required))?;
-                exchange.flush().await?;
-                // Retain endpoint resources until the rejection bytes/FIN are
-                // acknowledged; this constructor returns no handle on failure.
-                // A rejected agent may close the connection as soon as it reads
-                // the rejection, so a failure here must not replace the version
-                // error, as the legacy handshake ignores it too.
-                let _ = exchange.finish_and_wait().await;
-                Err(SessionError::IncompatibleProtocol {
-                    version: agent.protocol_version,
-                    required,
-                })
-            }
+            let (agent, mut exchange) = server_handshake(&connection, &options, &window).await?;
+            exchange.finish()?;
+            Ok::<_, SessionError>(agent)
         };
         let agent = if let Some(timeout) = options.operation_timeout {
             tokio::time::timeout(timeout, operation)
@@ -70,16 +39,61 @@ impl super::ServerHandle {
         } else {
             operation.await?
         };
-        let network_list_blocker =
-            crate::network_list_blocker([agent.protocol_version.as_str()]).map(str::to_owned);
-        let shared = Shared::new(
-            connection,
-            options,
-            HandshakeMetadata::Agent(agent),
-            network_list_blocker,
-        );
+        let shared = server_shared(connection, options, agent);
         Ok((Self(shared.clone()), super::ServerIncoming::new(shared)))
     }
+}
+
+#[cfg(feature = "server")]
+pub(super) async fn server_handshake(
+    connection: &Connection,
+    options: &SessionOptions,
+    window: &super::ProtocolWindow,
+) -> Result<(crate::AgentInfo, Exchange), SessionError> {
+    let (send, recv) = connection
+        .accept_bi()
+        .await
+        .map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent))?;
+    let mut exchange = Exchange::new(send, recv, options.handshake);
+    let frame = exchange.frame().await?;
+    let mut agent = decode_agent(frame.as_bytes(), options.handshake.get())?;
+    exchange.recycle(frame)?;
+    agent.addr = connection.remote_addr();
+    if window.accepts(&agent.protocol_version) {
+        exchange.start(Ok::<_, &str>(window.advertised_version()))?;
+        exchange.flush().await?;
+        Ok((agent, exchange))
+    } else {
+        let required = window.accepted_range();
+        exchange.start(Err::<&str, _>(&required))?;
+        exchange.flush().await?;
+        // Retain endpoint resources until the rejection bytes/FIN are
+        // acknowledged; this constructor returns no handle on failure.
+        // A rejected agent may close the connection as soon as it reads
+        // the rejection, so a failure here must not replace the version
+        // error, as the legacy handshake ignores it too.
+        let _ = exchange.finish_and_wait().await;
+        Err(SessionError::IncompatibleProtocol {
+            version: agent.protocol_version,
+            required,
+        })
+    }
+}
+
+#[cfg(feature = "server")]
+pub(super) fn server_shared(
+    connection: Connection,
+    options: SessionOptions,
+    agent: crate::AgentInfo,
+) -> std::sync::Arc<Shared> {
+    let network_list_blocker =
+        crate::network_list_blocker([agent.protocol_version.as_str()]).map(str::to_owned);
+    Shared::new(
+        connection,
+        options,
+        HandshakeMetadata::Agent(agent),
+        network_list_blocker,
+    )
 }
 
 #[cfg(feature = "client")]

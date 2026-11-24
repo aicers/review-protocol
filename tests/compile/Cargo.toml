@@ -8,7 +8,7 @@ publish = false
 
 [features]
 client = ["review-protocol/client"]
-server = ["review-protocol/server"]
+server = ["review-protocol/server", "dep:rustls"]
 test-support = ["client", "server", "review-protocol/test-support"]
 legacy = ["client", "server", "dep:quinn", "dep:anyhow"]
 
@@ -16,3 +16,4 @@ legacy = ["client", "server", "dep:quinn", "dep:anyhow"]
 review-protocol = { path = "../..", default-features = false }
 quinn = { version = "0.11", optional = true, default-features = false }
 anyhow = { version = "1", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false }
