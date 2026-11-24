@@ -339,7 +339,7 @@ impl Detail {
 /// The detail of a [`DetectionModel::WatchlistMatch`] detection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WatchlistMatchDetail {
-    /// The id of the matched watchlist (blocklist) entry.
+    /// The id of the matched watchlist entry.
     pub entry_id: u64,
     /// Which endpoint of the raw events matched the entry.
     pub matched_side: EndpointRole,

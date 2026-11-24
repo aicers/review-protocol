@@ -24,7 +24,7 @@ pub(crate) async fn unary<I: serde::Serialize, O: serde::de::DeserializeOwned>(
 
 /// Decodes `bytes` as one `T` and rejects any bytes left over.
 ///
-/// The allowlist and blocklist payloads use this instead of the prefix
+/// The exclusion-list and watchlist payloads use this instead of the prefix
 /// decoding above: a `0.49.0` peer's `HostNetworkGroup` with no explicit hosts
 /// starts with the same zero count as an empty `Vec<NetworkListItem>`, and
 /// prefix decoding would read it as an empty list and silently clear a

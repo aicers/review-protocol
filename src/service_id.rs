@@ -319,8 +319,8 @@ pub const COMMON_DELETE_TIME_SERIES_GENERATION_POLICY: ServiceId =
 pub const COMMON_RELOAD_FILTER_RULE: ServiceId = ServiceId::new("common", "reload_filter_rule");
 pub const COMMON_INTERNAL_NETWORK_LIST: ServiceId =
     ServiceId::new("common", "internal_network_list");
-pub const COMMON_ALLOWLIST: ServiceId = ServiceId::new("common", "allowlist");
-pub const COMMON_BLOCKLIST: ServiceId = ServiceId::new("common", "blocklist");
+pub const COMMON_EXCLUSION_LIST: ServiceId = ServiceId::new("common", "exclusion_list");
+pub const COMMON_WATCHLIST: ServiceId = ServiceId::new("common", "watchlist");
 pub const COMMON_ECHO: ServiceId = ServiceId::new("common", "echo");
 pub const COMMON_TRUSTED_USER_AGENT_LIST: ServiceId =
     ServiceId::new("common", "trusted_user_agent_list");
@@ -399,8 +399,8 @@ pub const SERVER_LIST_TRUSTED_DOMAIN: ServiceId = ServiceId::new("server.list", 
 pub const SERVER_LIST_TOR_EXIT_NODE: ServiceId = ServiceId::new("server.list", "tor_exit_node");
 pub const SERVER_LIST_INTERNAL_NETWORK: ServiceId =
     ServiceId::new("server.list", "internal_network");
-pub const SERVER_LIST_ALLOWLIST: ServiceId = ServiceId::new("server.list", "allowlist");
-pub const SERVER_LIST_BLOCKLIST: ServiceId = ServiceId::new("server.list", "blocklist");
+pub const SERVER_LIST_EXCLUSION_LIST: ServiceId = ServiceId::new("server.list", "exclusion_list");
+pub const SERVER_LIST_WATCHLIST: ServiceId = ServiceId::new("server.list", "watchlist");
 pub const SERVER_LIST_TRUSTED_USER_AGENT: ServiceId =
     ServiceId::new("server.list", "trusted_user_agent");
 pub const SERVER_LIST_TIME_SERIES_GENERATION_POLICY: ServiceId =
@@ -421,6 +421,13 @@ pub const SERVER_RUN_REPORT_ACTIVE: ServiceId = ServiceId::new("server.run", "re
 
 pub const SERVER_DETECTOR_REPORT_STATUS: ServiceId =
     ServiceId::new("server.detector", "report_status");
+
+// ── server.exclusion_list ─────────────────────────────────────
+//
+// What a Semi-supervised Engine reports about its exclusion list.
+
+pub const SERVER_EXCLUSION_LIST_REPORT_COUNTS: ServiceId =
+    ServiceId::new("server.exclusion_list", "report_counts");
 
 // ── server.dai ────────────────────────────────────────────────
 //
@@ -632,8 +639,8 @@ pub(crate) fn from_client_request_code(code: ClientRequestCode) -> Option<Servic
             Some(COMMON_DELETE_TIME_SERIES_GENERATION_POLICY)
         }
         ClientRequestCode::InternalNetworkList => Some(COMMON_INTERNAL_NETWORK_LIST),
-        ClientRequestCode::Allowlist => Some(COMMON_ALLOWLIST),
-        ClientRequestCode::Blocklist => Some(COMMON_BLOCKLIST),
+        ClientRequestCode::ExclusionList => Some(COMMON_EXCLUSION_LIST),
+        ClientRequestCode::Watchlist => Some(COMMON_WATCHLIST),
         ClientRequestCode::EchoRequest => Some(COMMON_ECHO),
         ClientRequestCode::TrustedUserAgentList => Some(COMMON_TRUSTED_USER_AGENT_LIST),
         ClientRequestCode::TrustedDomainList => Some(COMMON_TRUSTED_DOMAIN_LIST),
@@ -701,8 +708,8 @@ pub(crate) fn from_server_request_code(code: ServerRequestCode) -> Option<Servic
         ServerRequestCode::GetTrustedDomainList => Some(SERVER_LIST_TRUSTED_DOMAIN),
         ServerRequestCode::GetTorExitNodeList => Some(SERVER_LIST_TOR_EXIT_NODE),
         ServerRequestCode::GetInternalNetworkList => Some(SERVER_LIST_INTERNAL_NETWORK),
-        ServerRequestCode::GetAllowlist => Some(SERVER_LIST_ALLOWLIST),
-        ServerRequestCode::GetBlocklist => Some(SERVER_LIST_BLOCKLIST),
+        ServerRequestCode::GetExclusionList => Some(SERVER_LIST_EXCLUSION_LIST),
+        ServerRequestCode::GetWatchlist => Some(SERVER_LIST_WATCHLIST),
         ServerRequestCode::GetTrustedUserAgentList => Some(SERVER_LIST_TRUSTED_USER_AGENT),
         ServerRequestCode::GetTimeSeriesGenerationPolicyList => {
             Some(SERVER_LIST_TIME_SERIES_GENERATION_POLICY)
@@ -719,6 +726,7 @@ pub(crate) fn from_server_request_code(code: ServerRequestCode) -> Option<Servic
         ServerRequestCode::RenewDaiRangeDay => Some(SERVER_DAI_RENEW_RANGE_DAY),
         ServerRequestCode::SendDaiRangeDay => Some(SERVER_DAI_SEND_RANGE_DAY),
         ServerRequestCode::ReportDaiRangeLate => Some(SERVER_DAI_REPORT_RANGE_LATE),
+        ServerRequestCode::ReportExclusionCounts => Some(SERVER_EXCLUSION_LIST_REPORT_COUNTS),
         ServerRequestCode::Unknown => None,
     }
 }
@@ -818,8 +826,8 @@ pub fn all() -> &'static [ServiceId] {
         COMMON_DELETE_TIME_SERIES_GENERATION_POLICY,
         COMMON_RELOAD_FILTER_RULE,
         COMMON_INTERNAL_NETWORK_LIST,
-        COMMON_ALLOWLIST,
-        COMMON_BLOCKLIST,
+        COMMON_EXCLUSION_LIST,
+        COMMON_WATCHLIST,
         COMMON_ECHO,
         COMMON_TRUSTED_USER_AGENT_LIST,
         COMMON_SEMI_SUPERVISED_MODELS,
@@ -837,6 +845,8 @@ pub fn all() -> &'static [ServiceId] {
         SERVER_RUN_REPORT_ACTIVE,
         // server.detector
         SERVER_DETECTOR_REPORT_STATUS,
+        // server.exclusion_list
+        SERVER_EXCLUSION_LIST_REPORT_COUNTS,
         // server.dai
         SERVER_DAI_GET_EXTRACTOR_CONFIG,
         SERVER_DAI_GET_CURSORS,
@@ -880,8 +890,8 @@ pub fn all() -> &'static [ServiceId] {
         SERVER_LIST_TRUSTED_DOMAIN,
         SERVER_LIST_TOR_EXIT_NODE,
         SERVER_LIST_INTERNAL_NETWORK,
-        SERVER_LIST_ALLOWLIST,
-        SERVER_LIST_BLOCKLIST,
+        SERVER_LIST_EXCLUSION_LIST,
+        SERVER_LIST_WATCHLIST,
         SERVER_LIST_TRUSTED_USER_AGENT,
         SERVER_LIST_TIME_SERIES_GENERATION_POLICY,
     ]
@@ -1059,8 +1069,8 @@ mod tests {
             ClientRequestCode::DeleteCustomerData,
             ClientRequestCode::DeleteTimeSeriesGenerationPolicy,
             ClientRequestCode::InternalNetworkList,
-            ClientRequestCode::Allowlist,
-            ClientRequestCode::Blocklist,
+            ClientRequestCode::ExclusionList,
+            ClientRequestCode::Watchlist,
             ClientRequestCode::EchoRequest,
             ClientRequestCode::TrustedUserAgentList,
             ClientRequestCode::TrustedDomainList,
@@ -1118,8 +1128,8 @@ mod tests {
             ServerRequestCode::GetOutliers,
             ServerRequestCode::GetTorExitNodeList,
             ServerRequestCode::GetInternalNetworkList,
-            ServerRequestCode::GetAllowlist,
-            ServerRequestCode::GetBlocklist,
+            ServerRequestCode::GetExclusionList,
+            ServerRequestCode::GetWatchlist,
             ServerRequestCode::GetPretrainedModel,
             ServerRequestCode::GetTrustedUserAgentList,
             ServerRequestCode::GetConfig,
@@ -1136,6 +1146,7 @@ mod tests {
             ServerRequestCode::RenewDaiRangeDay,
             ServerRequestCode::SendDaiRangeDay,
             ServerRequestCode::ReportDaiRangeLate,
+            ServerRequestCode::ReportExclusionCounts,
         ];
         for &code in codes {
             assert!(
@@ -1299,6 +1310,75 @@ mod tests {
             assert!(ids.contains(&id));
             assert_eq!(id.to_string(), string);
         }
+    }
+
+    /// The renamed list requests keep their categories and take the new
+    /// names as their service ID strings, and `all()` lists them.
+    #[test]
+    fn network_list_request_codes_map_to_their_ids() {
+        let client_cases = [
+            (
+                ClientRequestCode::ExclusionList,
+                COMMON_EXCLUSION_LIST,
+                "common.exclusion_list",
+            ),
+            (
+                ClientRequestCode::Watchlist,
+                COMMON_WATCHLIST,
+                "common.watchlist",
+            ),
+        ];
+        let ids = all();
+        for (code, id, string) in client_cases {
+            assert_eq!(from_client_request_code(code), Some(id));
+            assert!(ids.contains(&id));
+            assert_eq!(id.to_string(), string);
+        }
+        let server_cases = [
+            (
+                ServerRequestCode::GetExclusionList,
+                SERVER_LIST_EXCLUSION_LIST,
+                "server.list.exclusion_list",
+            ),
+            (
+                ServerRequestCode::GetWatchlist,
+                SERVER_LIST_WATCHLIST,
+                "server.list.watchlist",
+            ),
+        ];
+        for (code, id, string) in server_cases {
+            assert_eq!(from_server_request_code(code), Some(id));
+            assert!(ids.contains(&id));
+            assert_eq!(id.to_string(), string);
+        }
+        assert_eq!(COMMON_EXCLUSION_LIST.family, "common");
+        assert_eq!(COMMON_EXCLUSION_LIST.method, "exclusion_list");
+        assert_eq!(SERVER_LIST_EXCLUSION_LIST.family, "server.list");
+        assert_eq!(SERVER_LIST_EXCLUSION_LIST.method, "exclusion_list");
+        assert_eq!(COMMON_WATCHLIST.method, "watchlist");
+        assert_eq!(SERVER_LIST_WATCHLIST.method, "watchlist");
+    }
+
+    /// Request 52 maps to its own service ID, whose category and name are
+    /// pinned, and `all()` lists it.
+    #[test]
+    fn exclusion_count_report_maps_to_its_id() {
+        let code = ServerRequestCode::from(52_u32);
+        assert_eq!(code, ServerRequestCode::ReportExclusionCounts);
+        assert_eq!(
+            from_server_request_code(code),
+            Some(SERVER_EXCLUSION_LIST_REPORT_COUNTS)
+        );
+        assert!(all().contains(&SERVER_EXCLUSION_LIST_REPORT_COUNTS));
+        assert_eq!(
+            SERVER_EXCLUSION_LIST_REPORT_COUNTS.family,
+            "server.exclusion_list"
+        );
+        assert_eq!(SERVER_EXCLUSION_LIST_REPORT_COUNTS.method, "report_counts");
+        assert_eq!(
+            SERVER_EXCLUSION_LIST_REPORT_COUNTS.to_string(),
+            "server.exclusion_list.report_counts"
+        );
     }
 
     /// The retired host report requests decode as unknown codes, which map

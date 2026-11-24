@@ -29,8 +29,8 @@ use crate::types::node::{
     NodeTimeSyncResponse, NodeVersionRequest, NodeVersionResponse,
 };
 use crate::types::{
-    CloneModelRequest, CustomerDataDeletionReport, DetectorStatusReport, NetworkListItem,
-    ReportedRunState, TrainModelRequest,
+    CloneModelRequest, CustomerDataDeletionReport, DetectorStatusReport, EngineExclusionReport,
+    NetworkListItem, ReportedRunState, TrainModelRequest,
 };
 #[cfg(feature = "server")]
 use crate::{
@@ -256,7 +256,7 @@ fn server_network_list_refusal(code: u32, blocker: Option<&str>) -> Option<Strin
     let version = blocker?;
     matches!(
         ServerCode::from(code),
-        ServerCode::GetAllowlist | ServerCode::GetBlocklist
+        ServerCode::GetExclusionList | ServerCode::GetWatchlist
     )
     .then(|| {
         format!(
@@ -463,8 +463,8 @@ struct ServerAuthorization {
 pub struct ServerRequestStream {
     owner: RequestOwner,
     authorization: Option<Arc<ServerAuthorization>>,
-    /// The agent's advertised version when it is earlier than the allowlist
-    /// and blocklist item lists.
+    /// The agent's advertised version when it is earlier than the exclusion-list
+    /// and watchlist item lists.
     network_list_blocker: Option<String>,
 }
 
@@ -485,7 +485,7 @@ impl ServerRequestStream {
     /// continues. Use [`Self::run`] for the authorized legacy dispatcher, including
     /// its caller handoff and terminal unknown-code behavior.
     ///
-    /// An allowlist or blocklist pull from an agent that advertised a protocol
+    /// An exclusion-list or watchlist pull from an agent that advertised a protocol
     /// earlier than `0.50.0` is answered with an error the same way, and is not
     /// returned: its reply would be an item list the agent can misread.
     ///
@@ -517,7 +517,7 @@ impl ServerRequestStream {
     /// the identity in the authorization context. Handler error strings are
     /// sent unchanged and the stream continues. At clean EOF the response
     /// direction is finished. A delegated request returns ownership to the caller.
-    /// An authorized allowlist or blocklist pull from an agent that advertised
+    /// An authorized exclusion-list or watchlist pull from an agent that advertised
     /// a protocol earlier than `0.50.0` is answered with an error without
     /// invoking the handler, and the stream continues.
     ///
@@ -848,6 +848,8 @@ server_operations! {
             => |h, peer, run_ids| h.report_active_runs(peer, &run_ids).await,
         ReportDetectorStatus(DetectorStatusReport) -> ()
             => |h, peer, report| h.report_detector_status(peer, &report).await,
+        ReportExclusionCounts(EngineExclusionReport) -> ()
+            => |h, peer, report| h.report_exclusion_counts(peer, &report).await,
         GetConfig(()) -> String
             => |h, peer, ()| h.get_config(peer).await,
         GetModel(String) -> Vec<u8>
@@ -856,10 +858,10 @@ server_operations! {
             => |h, _peer, name| h.get_pretrained_model(&name).await,
         GetModelNames(()) -> Vec<String>
             => |h, _peer, ()| h.get_model_names().await,
-        GetAllowlist(()) -> Vec<NetworkListItem>
-            => |h, peer, ()| h.get_allowlist(peer).await,
-        GetBlocklist(()) -> Vec<NetworkListItem>
-            => |h, peer, ()| h.get_blocklist(peer).await,
+        GetExclusionList(()) -> Vec<NetworkListItem>
+            => |h, peer, ()| h.get_exclusion_list(peer).await,
+        GetWatchlist(()) -> Vec<NetworkListItem>
+            => |h, peer, ()| h.get_watchlist(peer).await,
         InsertModel(Vec<u8>) -> u32
             => |h, _peer, model| h.insert_model(&model).await,
         UpdateModel(Vec<u8>) -> u32
@@ -1256,7 +1258,7 @@ pub enum AgentRequest<'a> {
 
 #[cfg(feature = "client")]
 impl super::AgentHandle {
-    /// Refuses an allowlist or blocklist pull, before anything is sent, on a
+    /// Refuses an exclusion-list or watchlist pull, before anything is sent, on a
     /// session whose handshake shows a side earlier than the item lists.
     fn check_network_lists(&self) -> Result<(), SessionError> {
         match &self.0.network_list_blocker {
@@ -1328,6 +1330,24 @@ impl super::AgentHandle {
         .await
     }
 
+    /// Sends the `report_exclusion_counts` engine operation, the raw events
+    /// a Semi-supervised Engine skipped before detection because they matched
+    /// an exclusion-list entry.
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn report_exclusion_counts(
+        &self,
+        report: &EngineExclusionReport,
+    ) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::ReportExclusionCounts),
+            report,
+        )
+        .await
+    }
+
     /// Sends the `get_config` domain operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
@@ -1376,7 +1396,7 @@ impl super::AgentHandle {
         )
         .await
     }
-    /// Sends the `get_allowlist` domain operation.
+    /// Sends the `get_exclusion_list` domain operation.
     ///
     /// Both the protocol version this agent advertised and the manager's
     /// handshake reply must be `0.50.0` or later: a `0.49.0` payload can decode
@@ -1386,18 +1406,18 @@ impl super::AgentHandle {
     /// Returns [`SessionError::IncompatibleProtocol`] when either handshake
     /// version is earlier than `0.50.0`, and classified transport, malformed
     /// data, remote rejection, limit, or deadline errors.
-    pub async fn get_allowlist(&self) -> Result<Vec<NetworkListItem>, SessionError> {
+    pub async fn get_exclusion_list(&self) -> Result<Vec<NetworkListItem>, SessionError> {
         self.check_network_lists()?;
         unary_as(
             &self.0.connection,
             &self.0.options,
-            u32::from(crate::server::RequestCode::GetAllowlist),
+            u32::from(crate::server::RequestCode::GetExclusionList),
             (),
             Decoding::Exact,
         )
         .await
     }
-    /// Sends the `get_blocklist` domain operation.
+    /// Sends the `get_watchlist` domain operation.
     ///
     /// Both the protocol version this agent advertised and the manager's
     /// handshake reply must be `0.50.0` or later: a `0.49.0` payload can decode
@@ -1407,12 +1427,12 @@ impl super::AgentHandle {
     /// Returns [`SessionError::IncompatibleProtocol`] when either handshake
     /// version is earlier than `0.50.0`, and classified transport, malformed
     /// data, remote rejection, limit, or deadline errors.
-    pub async fn get_blocklist(&self) -> Result<Vec<NetworkListItem>, SessionError> {
+    pub async fn get_watchlist(&self) -> Result<Vec<NetworkListItem>, SessionError> {
         self.check_network_lists()?;
         unary_as(
             &self.0.connection,
             &self.0.options,
-            u32::from(crate::server::RequestCode::GetBlocklist),
+            u32::from(crate::server::RequestCode::GetWatchlist),
             (),
             Decoding::Exact,
         )

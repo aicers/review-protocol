@@ -244,13 +244,13 @@ pub const PROTOCOL_VERSION: &str = "0.51.0";
 /// requirement is unaffected.
 pub const MIN_PROTOCOL_VERSION_REQ: &str = ">=0.49.0";
 
-/// The protocol requirement of the allowlist and blocklist exchanges, which
+/// The protocol requirement of the exclusion-list and watchlist exchanges, which
 /// carry `types::NetworkListItem` lists from `0.50.0` on.
 #[cfg(any(feature = "client", feature = "server"))]
 pub(crate) const NETWORK_LIST_ITEMS_REQ: &str = ">=0.50.0";
 
 /// Returns the first of `versions` that is not a protocol version of at least
-/// `0.50.0`, the one that keeps a connection off the allowlist and blocklist
+/// `0.50.0`, the one that keeps a connection off the exclusion-list and watchlist
 /// exchanges, or `None` when every one of them speaks the item lists.
 ///
 /// A version that does not parse is returned too: nothing shows that it
@@ -1275,10 +1275,10 @@ mod tests {
     }
 
     /// The two constants sit in the protocol namespace: the current protocol
-    /// is `0.51.0`, which adds the DAI requests 45 through 51 and retires the
-    /// host report requests 37 and 38, and the suggested floor still admits
-    /// `0.49.0` and refuses the deployed `0.48.0`. Gated on the features that
-    /// pull `semver` in.
+    /// is `0.51.0`, which adds the DAI requests 45 through 51 and the
+    /// exclusion-count report 52 and retires the host report requests 37 and
+    /// 38, and the suggested floor still admits `0.49.0` and refuses the
+    /// deployed `0.48.0`. Gated on the features that pull `semver` in.
     #[test]
     #[cfg(any(feature = "client", feature = "server"))]
     fn protocol_version_constants() {

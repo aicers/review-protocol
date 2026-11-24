@@ -903,7 +903,48 @@ pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
     ]
 }
 
-/// Returns synthetic allowlist or blocklist items, listed out of id order.
+/// Returns synthetic exclusion-count reports, as a Semi-supervised Engine
+/// sends them with request 52.
+///
+/// The first holds several counts, listed out of entry order, with an entry
+/// id above 2^53, two counts for one entry on different dates and a count of
+/// `u64::MAX`; the second has no counts; the third has one.
+#[must_use]
+pub fn engine_exclusion_reports() -> Vec<crate::types::EngineExclusionReport> {
+    use crate::types::{EngineExclusionReport, ExcludedCount};
+
+    vec![
+        EngineExclusionReport {
+            counts: vec![
+                ExcludedCount {
+                    entry: (1 << 53) + 3,
+                    day: jiff::civil::date(2026, 3, 14),
+                    count: 17,
+                },
+                ExcludedCount {
+                    entry: 7,
+                    day: jiff::civil::date(2026, 3, 15),
+                    count: u64::MAX,
+                },
+                ExcludedCount {
+                    entry: 7,
+                    day: jiff::civil::date(2026, 3, 14),
+                    count: 2,
+                },
+            ],
+        },
+        EngineExclusionReport { counts: Vec::new() },
+        EngineExclusionReport {
+            counts: vec![ExcludedCount {
+                entry: 0,
+                day: jiff::civil::date(1970, 1, 1),
+                count: 1,
+            }],
+        },
+    ]
+}
+
+/// Returns synthetic exclusion-list or watchlist items, listed out of id order.
 ///
 /// One id is above 2^53, and items with distinct ids have groups that
 /// overlap or are equal.
@@ -1565,7 +1606,7 @@ impl crate::server::Handler for TestServerHandler {
     }
 
     // Returns `network_list_items()`.
-    async fn get_allowlist(&self, peer: &str) -> Result<Vec<NetworkListItem>, String> {
+    async fn get_exclusion_list(&self, peer: &str) -> Result<Vec<NetworkListItem>, String> {
         if peer != "test-peer" {
             return Err(format!("unexpected peer: {peer}"));
         }
@@ -1573,7 +1614,7 @@ impl crate::server::Handler for TestServerHandler {
     }
 
     // Returns `network_list_items()` in reverse order.
-    async fn get_blocklist(&self, peer: &str) -> Result<Vec<NetworkListItem>, String> {
+    async fn get_watchlist(&self, peer: &str) -> Result<Vec<NetworkListItem>, String> {
         if peer != "test-peer" {
             return Err(format!("unexpected peer: {peer}"));
         }
@@ -1824,6 +1865,22 @@ impl crate::server::Handler for TestServerHandler {
             Ok(())
         } else {
             Err(format!("unexpected detector status report: {report:?}"))
+        }
+    }
+
+    // Accepts each of `engine_exclusion_reports()` and rejects anything else.
+    async fn report_exclusion_counts(
+        &self,
+        peer: &str,
+        report: &crate::types::EngineExclusionReport,
+    ) -> Result<(), String> {
+        if peer != "test-peer" {
+            return Err(format!("unexpected peer: {peer}"));
+        }
+        if engine_exclusion_reports().contains(report) {
+            Ok(())
+        } else {
+            Err("report rejected".to_string())
         }
     }
 }

@@ -282,8 +282,8 @@ pub(crate) enum RequestCode {
     GetOutliers = 25,
     GetTorExitNodeList = 26,
     GetInternalNetworkList = 31,
-    GetAllowlist = 32,
-    GetBlocklist = 33,
+    GetExclusionList = 32,
+    GetWatchlist = 33,
     GetPretrainedModel = 34,
     GetTrustedUserAgentList = 35,
     GetConfig = 36,
@@ -304,6 +304,7 @@ pub(crate) enum RequestCode {
     RenewDaiRangeDay = 49,
     SendDaiRangeDay = 50,
     ReportDaiRangeLate = 51,
+    ReportExclusionCounts = 52,
 
     /// Unknown request
     #[num_enum(default)]
@@ -337,7 +338,27 @@ mod request_code_tests {
             assert_eq!(u32::from(code), num);
             assert_eq!(RequestCode::from_primitive(num), code);
         }
-        assert_eq!(RequestCode::from_primitive(52), RequestCode::Unknown);
+    }
+
+    #[test]
+    fn semi_supervised_engine_report_codes() {
+        assert_eq!(u32::from(RequestCode::ReportExclusionCounts), 52);
+        assert_eq!(
+            RequestCode::from_primitive(52),
+            RequestCode::ReportExclusionCounts
+        );
+        assert_eq!(RequestCode::from_primitive(53), RequestCode::Unknown);
+    }
+
+    #[test]
+    fn network_list_codes() {
+        assert_eq!(u32::from(RequestCode::GetExclusionList), 32);
+        assert_eq!(u32::from(RequestCode::GetWatchlist), 33);
+        assert_eq!(
+            RequestCode::from_primitive(32),
+            RequestCode::GetExclusionList
+        );
+        assert_eq!(RequestCode::from_primitive(33), RequestCode::GetWatchlist);
     }
 
     #[test]

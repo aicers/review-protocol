@@ -319,7 +319,7 @@ pub struct DetectorStatusReport {
     /// The status of each detection model in the last round.
     pub detection_models: Vec<DetectionModelStatus>,
     /// The raw events the last round skipped because they matched an
-    /// exclusion-list (allowlist) entry, counted per entry and UTC date.
+    /// exclusion-list entry, counted per entry and UTC date.
     pub excluded: Vec<ExcludedCount>,
 }
 
@@ -335,15 +335,26 @@ pub struct DetectionModelStatus {
 }
 
 /// The number of raw events skipped on one UTC date because they matched one
-/// exclusion-list (allowlist) entry.
+/// exclusion-list entry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExcludedCount {
-    /// The id of the matched exclusion-list (allowlist) entry.
+    /// The id of the matched exclusion-list entry.
     pub entry: u64,
     /// The UTC date the skipped raw events fall on.
     pub day: jiff::civil::Date,
     /// The number of raw events skipped.
     pub count: u64,
+}
+
+/// The raw events a Semi-supervised Engine skipped before detection because
+/// they matched an exclusion-list entry.
+///
+/// The engine sends it with request 52. Each count covers one exclusion-list
+/// entry and one UTC date.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineExclusionReport {
+    /// The skipped raw events, counted per entry and UTC date.
+    pub counts: Vec<ExcludedCount>,
 }
 
 /// Why a detector does or does not run.
@@ -461,13 +472,13 @@ pub struct HostNetworkGroup {
     pub ip_ranges: Vec<RangeInclusive<IpAddr>>,
 }
 
-/// An entry of the allowlist or the blocklist.
+/// An entry of the exclusion list or the watchlist.
 ///
 /// Every list surface delivers every item in the order supplied, without
-/// sorting, merging or deduplicating. A receiver of the allowlist attributes
+/// sorting, merging or deduplicating. A receiver of the exclusion list attributes
 /// a skipped raw event to the first matching entry in received order.
 ///
-/// Protocol `0.50.0` replaced the `0.49.0` allowlist and blocklist payload, a
+/// Protocol `0.50.0` replaced the `0.49.0` exclusion-list and watchlist payload, a
 /// bare [`HostNetworkGroup`], with a list of these items, and bincode 2 does
 /// not describe its own layout. The list surfaces refuse a payload that leaves
 /// bytes over, which catches a `0.49.0` group with no explicit hosts, but some
@@ -478,18 +489,18 @@ pub struct HostNetworkGroup {
 /// The library's suggested floor, `MIN_PROTOCOL_VERSION_REQ`, still admits
 /// `0.49.0`, so the list surfaces that hold the handshake versions check them:
 ///
-/// - The session agent's `get_allowlist` and `get_blocklist`, and the legacy
+/// - The session agent's `get_exclusion_list` and `get_watchlist`, and the legacy
 ///   `client::Connection`'s, refuse locally, sending nothing, unless both the
 ///   protocol version the agent advertised and the manager's handshake reply
 ///   are `0.50.0` or later.
 /// - A session manager's request stream, in both its runner and its
-///   low-level `next`, answers an allowlist or blocklist pull from an agent
+///   low-level `next`, answers an exclusion-list or watchlist pull from an agent
 ///   that advertised an earlier version with an error and does not invoke the
 ///   handler.
 ///
 /// The other surfaces hold no handshake version, and keeping `0.49.0` peers
 /// away from them is the caller's responsibility: the legacy
-/// `server::Connection`'s `send_allowlist` and `send_blocklist`, the legacy
+/// `server::Connection`'s `send_exclusion_list` and `send_watchlist`, the legacy
 /// server dispatcher's pull handlers and the legacy agent request
 /// dispatcher's push handlers. A manager admits only agents that advertise
 /// `0.50.0` or later, by passing a `>=0.50.0` requirement to its handshake, or
