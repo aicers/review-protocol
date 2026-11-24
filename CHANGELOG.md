@@ -5,6 +5,13 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.0](https://github.com/aicers/review-protocol/compare/0.30.0...0.31.0) - 2026-11-24
+
+### Added
+
+- *(server)* [**breaking**] add DAI observation and extractor requests and retire the host report requests ([#365](https://github.com/aicers/review-protocol/pull/365))
+- *(server)* add listener, pending-handshake and admission lifecycle APIs ([#349](https://github.com/aicers/review-protocol/pull/349))
+
 ## [0.30.0](https://github.com/aicers/review-protocol/compare/0.29.0...0.30.0) - 2026-11-23
 
 ### Added
