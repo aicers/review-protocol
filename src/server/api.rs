@@ -64,7 +64,7 @@ const PACKAGE_TRANSFER_ABORTED: u32 = 1;
 /// - **Legacy flat methods** provide a simpler,
 ///   backward-compatible surface.  They do not expose `ServiceId`
 ///   and cannot participate in `Authorizer`-based access control.
-///   Some (e.g. [`send_allowlist`](Self::send_allowlist)) still use
+///   Some (e.g. [`send_exclusion_list`](Self::send_exclusion_list)) still use
 ///   their own request path.
 ///
 /// ## Migrating from flat to `node_*`
@@ -78,10 +78,10 @@ const PACKAGE_TRANSFER_ABORTED: u32 = 1;
 ///   [`Authorizer`](crate::auth::Authorizer).  Legacy methods
 ///   perform no authorization check.
 /// - Some legacy methods have no `node_*` equivalent (e.g.
-///   [`send_allowlist`](Self::send_allowlist),
+///   [`send_exclusion_list`](Self::send_exclusion_list),
 ///   [`send_ping`](Self::send_ping)); continue using them as-is.
 impl Connection {
-    /// Sends the allowlist entries.
+    /// Sends the exclusion-list entries.
     ///
     /// Every item is sent in the order given, without sorting, merging or
     /// deduplicating; the agent attributes a skipped raw event to the first
@@ -94,12 +94,15 @@ impl Connection {
     /// # Errors
     ///
     /// Returns an error if serialization failed or communication with the client failed.
-    pub async fn send_allowlist(&self, allowlist: &[NetworkListItem]) -> anyhow::Result<()> {
-        self.send_request(client::RequestCode::Allowlist, allowlist)
+    pub async fn send_exclusion_list(
+        &self,
+        exclusion_list: &[NetworkListItem],
+    ) -> anyhow::Result<()> {
+        self.send_request(client::RequestCode::ExclusionList, exclusion_list)
             .await
     }
 
-    /// Sends the blocklist entries.
+    /// Sends the watchlist entries.
     ///
     /// Every item is sent in the order given, without sorting, merging or
     /// deduplicating.
@@ -111,8 +114,8 @@ impl Connection {
     /// # Errors
     ///
     /// Returns an error if serialization failed or communication with the client failed.
-    pub async fn send_blocklist(&self, blocklist: &[NetworkListItem]) -> anyhow::Result<()> {
-        self.send_request(client::RequestCode::Blocklist, blocklist)
+    pub async fn send_watchlist(&self, watchlist: &[NetworkListItem]) -> anyhow::Result<()> {
+        self.send_request(client::RequestCode::Watchlist, watchlist)
             .await
     }
 
@@ -1888,7 +1891,7 @@ mod tests {
             }
         }
 
-        async fn allowlist(&mut self, list: Vec<NetworkListItem>) -> Result<(), String> {
+        async fn exclusion_list(&mut self, list: Vec<NetworkListItem>) -> Result<(), String> {
             if list == crate::test::network_list_items() {
                 Ok(())
             } else {
@@ -1896,13 +1899,13 @@ mod tests {
             }
         }
 
-        async fn blocklist(&mut self, list: Vec<NetworkListItem>) -> Result<(), String> {
+        async fn watchlist(&mut self, list: Vec<NetworkListItem>) -> Result<(), String> {
             let mut expected = crate::test::network_list_items();
             expected.reverse();
             if list == expected {
                 Ok(())
             } else {
-                Err("unexpected blocklist".to_string())
+                Err("unexpected watchlist".to_string())
             }
         }
 
@@ -1982,11 +1985,11 @@ mod tests {
 
     #[cfg(all(feature = "client", feature = "server"))]
     #[tokio::test]
-    async fn send_allowlist() {
+    async fn send_exclusion_list() {
         let test_env = TEST_ENV.lock().await;
         let (server_conn, client_conn) = test_env.setup().await;
 
-        let allowlist_to_send = crate::test::network_list_items();
+        let exclusion_list_to_send = crate::test::network_list_items();
 
         let mut handler = TestHandler;
         let handler_conn = client_conn.clone();
@@ -1995,7 +1998,9 @@ mod tests {
 
             crate::request::handle(&mut handler, &mut send, &mut recv).await
         });
-        let server_res = server_conn.send_allowlist(&allowlist_to_send).await;
+        let server_res = server_conn
+            .send_exclusion_list(&exclusion_list_to_send)
+            .await;
         assert!(server_res.is_ok());
         let client_res = client_handle.await.unwrap();
         assert!(client_res.is_ok());
@@ -2005,12 +2010,12 @@ mod tests {
 
     #[cfg(all(feature = "client", feature = "server"))]
     #[tokio::test]
-    async fn send_blocklist() {
+    async fn send_watchlist() {
         let test_env = TEST_ENV.lock().await;
         let (server_conn, client_conn) = test_env.setup().await;
 
-        let mut blocklist_to_send = crate::test::network_list_items();
-        blocklist_to_send.reverse();
+        let mut watchlist_to_send = crate::test::network_list_items();
+        watchlist_to_send.reverse();
 
         let mut handler = TestHandler;
         let handler_conn = client_conn.clone();
@@ -2019,7 +2024,7 @@ mod tests {
 
             crate::request::handle(&mut handler, &mut send, &mut recv).await
         });
-        let server_res = server_conn.send_blocklist(&blocklist_to_send).await;
+        let server_res = server_conn.send_watchlist(&watchlist_to_send).await;
         assert!(server_res.is_ok());
         let client_res = client_handle.await.unwrap();
         assert!(client_res.is_ok());

@@ -13,6 +13,10 @@ created is
 assignments from that tag are in `agent-request-codes.txt` and
 `server-request-codes.txt`. These declarations and assignments are unchanged in
 that inspected source, so both sets of binary snapshots are identical.
+The names in those two listings were later updated to the current names:
+agent requests 15 and 16 are `ExclusionList` and `Watchlist`, and server
+requests 32 and 33 are `GetExclusionList` and `GetWatchlist`. Their numbers,
+and so their encoded bytes, are as captured.
 The protocol constants in both are `0.49.0` and `>=0.49.0`.
 
 The session foundation now builds on `0.26.0`. The captured handshake and
@@ -98,8 +102,8 @@ below.
 | 25 | GetOutliers | `get_outliers` | Names and lists of IDs |
 | 26 | GetTorExitNodeList | `get_tor_exit_node_list` | Node strings |
 | 31 | GetInternalNetworkList | `get_internal_network_list` | Network group |
-| 32 | GetAllowlist | `get_allowlist` | Network list items |
-| 33 | GetBlocklist | `get_blocklist` | Network list items |
+| 32 | GetExclusionList | `get_exclusion_list` | Network list items |
+| 33 | GetWatchlist | `get_watchlist` | Network list items |
 | 34 | GetPretrainedModel | `get_pretrained_model` | Model bytes |
 | 35 | GetTrustedUserAgentList | `get_trusted_user_agent_list` | User agents |
 | 36 | GetConfig | `get_config` | Configuration string |
@@ -185,4 +189,6 @@ response frames at the same positions, the 25th and 26th, from
 The table above still lists the two requests as they were captured.
 
 The device identification requests that 0.51.0 adds, codes 45 through 51, are
-not part of these fixtures; their own tests cover them.
+not part of these fixtures; their own tests cover them. Neither is request 52,
+`ReportExclusionCounts`, the exclusion-count report of a Semi-supervised
+Engine; its own tests cover it as well.

@@ -281,16 +281,17 @@
 //!
 //! The protocol is `0.51.0`, and the library's `>=0.49.0` suggested floor is
 //! unchanged. `0.51.0` adds the device identification (DAI) requests, codes 45
-//! through 51, and retires the host report requests 37 and 38, which now
-//! decode as unknown codes and draw the unknown-code answer; a manager that
-//! predates `0.51.0` answers the DAI requests the same way. `0.50.0` replaced
-//! the detection event, allowlist, blocklist and detector status payloads,
-//! with no path that reads the earlier shapes.
-//! The floor still admits `0.49.0` peers. Because some `0.49.0` allowlists and
-//! blocklists decode as valid `0.50.0` item lists with their hosts lost, the
-//! list pulls check the handshake: `AgentHandle::get_allowlist` and
-//! `get_blocklist` refuse locally, sending nothing, unless both the version the
-//! agent advertised and the manager's reply are `0.50.0` or later, and a
+//! through 51, and a Semi-supervised Engine's exclusion-count report, code 52,
+//! and retires the host report requests 37 and 38, which now decode as unknown
+//! codes and draw the unknown-code answer; a manager that predates `0.51.0`
+//! answers the DAI requests and the exclusion-count report the same way.
+//! `0.50.0` replaced the detection event, exclusion-list, watchlist and
+//! detector status payloads, with no path that reads the earlier shapes.
+//! The floor still admits `0.49.0` peers. Because some `0.49.0` exclusion
+//! lists and watchlists decode as valid `0.50.0` item lists with their hosts
+//! lost, the list pulls check the handshake: `AgentHandle::get_exclusion_list`
+//! and `get_watchlist` refuse locally, sending nothing, unless both the version
+//! the agent advertised and the manager's reply are `0.50.0` or later, and a
 //! manager's request stream answers those pulls with an error, without
 //! reaching its handler, when the agent advertised an earlier version. No other
 //! operation checks the peer's version, so a manager that exchanges the other
@@ -604,8 +605,8 @@ struct Shared {
     id: SessionId,
     metadata: HandshakeMetadata,
     certificates: Option<PeerCertificates>,
-    /// The handshake version that keeps this session off the allowlist and
-    /// blocklist exchanges, or `None` when both sides speak the item lists.
+    /// The handshake version that keeps this session off the exclusion-list and
+    /// watchlist exchanges, or `None` when both sides speak the item lists.
     network_list_blocker: Option<String>,
 }
 

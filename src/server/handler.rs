@@ -33,9 +33,9 @@ use crate::protocol_error::{DispatchError, ProtocolErrorKind};
 use crate::types::{
     ColumnStatisticsUpdate, CustomerDataDeletionReport, DaiCursors, DaiExtractorConfig,
     DaiObservationBatch, DaiRangeDay, DaiRangeGrant, DaiRangeLate, DaiRangeMark, DaiRangeUnit,
-    DaiStoreAck, DataSource, DataSourceKey, DetectionEvent, DetectorStatusReport, HostNetworkGroup,
-    LabelDb, NetworkListItem, OutlierInfo, ReportedRunState, TimeSeriesGenerationPolicy,
-    TimeSeriesUpdate, UpdateClusterRequest,
+    DaiStoreAck, DataSource, DataSourceKey, DetectionEvent, DetectorStatusReport,
+    EngineExclusionReport, HostNetworkGroup, LabelDb, NetworkListItem, OutlierInfo,
+    ReportedRunState, TimeSeriesGenerationPolicy, TimeSeriesUpdate, UpdateClusterRequest,
 };
 
 /// A request handler that can handle a request to the server.
@@ -48,21 +48,21 @@ pub trait Handler {
         Err("not supported".to_string())
     }
 
-    /// Answers request 32, the allowlist entries in the order to send them.
+    /// Answers request 32, the exclusion-list entries in the order to send them.
     ///
     /// The session layer's request stream calls this only for an agent that
     /// advertised protocol `0.50.0` or later. The legacy dispatchers hold no
     /// handshake version, so their caller checks it; see [`NetworkListItem`].
-    async fn get_allowlist(&self, _peer: &str) -> Result<Vec<NetworkListItem>, String> {
+    async fn get_exclusion_list(&self, _peer: &str) -> Result<Vec<NetworkListItem>, String> {
         Err("not supported".to_string())
     }
 
-    /// Answers request 33, the blocklist entries in the order to send them.
+    /// Answers request 33, the watchlist entries in the order to send them.
     ///
     /// The session layer's request stream calls this only for an agent that
     /// advertised protocol `0.50.0` or later. The legacy dispatchers hold no
     /// handshake version, so their caller checks it; see [`NetworkListItem`].
-    async fn get_blocklist(&self, _peer: &str) -> Result<Vec<NetworkListItem>, String> {
+    async fn get_watchlist(&self, _peer: &str) -> Result<Vec<NetworkListItem>, String> {
         Err("not supported".to_string())
     }
 
@@ -391,6 +391,22 @@ pub trait Handler {
     ) -> Result<(), String> {
         Err("not supported".to_string())
     }
+
+    /// Records the raw events the Semi-supervised Engine `peer` skipped
+    /// before detection because they matched an exclusion-list entry, counted
+    /// per entry and UTC date.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or the
+    /// Central Manager refuses it.
+    async fn report_exclusion_counts(
+        &self,
+        _peer: &str,
+        _report: &EngineExclusionReport,
+    ) -> Result<(), String> {
+        Err("not supported".to_string())
+    }
 }
 
 /// Handles requests to the server.
@@ -485,14 +501,14 @@ where
         }
 
         match req_code {
-            RequestCode::GetAllowlist => {
+            RequestCode::GetExclusionList => {
                 parse_args::<()>(body)?;
-                let result = handler.get_allowlist(peer_name).await;
+                let result = handler.get_exclusion_list(peer_name).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
-            RequestCode::GetBlocklist => {
+            RequestCode::GetWatchlist => {
                 parse_args::<()>(body)?;
-                let result = handler.get_blocklist(peer_name).await;
+                let result = handler.get_watchlist(peer_name).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
             RequestCode::GetDataSource => {
@@ -688,6 +704,11 @@ where
             RequestCode::ReportDetectorStatus => {
                 let report = parse_args::<DetectorStatusReport>(body)?;
                 let result = handler.report_detector_status(peer_name, &report).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportExclusionCounts => {
+                let report = parse_args::<EngineExclusionReport>(body)?;
+                let result = handler.report_exclusion_counts(peer_name, &report).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
             RequestCode::Unknown => {
@@ -771,14 +792,14 @@ where
         }
 
         match req_code {
-            RequestCode::GetAllowlist => {
+            RequestCode::GetExclusionList => {
                 parse_args::<()>(body)?;
-                let result = handler.get_allowlist(peer_name).await;
+                let result = handler.get_exclusion_list(peer_name).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
-            RequestCode::GetBlocklist => {
+            RequestCode::GetWatchlist => {
                 parse_args::<()>(body)?;
-                let result = handler.get_blocklist(peer_name).await;
+                let result = handler.get_watchlist(peer_name).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
             RequestCode::GetDataSource => {
@@ -978,6 +999,11 @@ where
             RequestCode::ReportDetectorStatus => {
                 let report = parse_args::<DetectorStatusReport>(body)?;
                 let result = handler.report_detector_status(peer_name, &report).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportExclusionCounts => {
+                let report = parse_args::<EngineExclusionReport>(body)?;
+                let result = handler.report_exclusion_counts(peer_name, &report).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
             RequestCode::Unknown => {
@@ -1175,14 +1201,15 @@ mod tests {
         assert_eq!(*reports.lock().unwrap(), vec![report]);
     }
 
-    /// A request from an Unsupervised Engine, as the server handler
-    /// received it, with the caller's peer name.
+    /// A report request from an Unsupervised or a Semi-supervised Engine, as
+    /// the server handler received it, with the caller's peer name.
     #[derive(Debug, PartialEq)]
     enum EngineReport {
         UploadRunModel(String, u32, Vec<u8>),
         ReportRun(String, u32, ReportedRunState, Option<String>),
         ReportActiveRuns(String, Vec<u32>),
         ReportDetectorStatus(String, DetectorStatusReport),
+        ReportExclusionCounts(String, EngineExclusionReport),
     }
 
     struct EngineReportHandler {
@@ -1250,11 +1277,27 @@ mod tests {
                 ));
             self.response.clone()
         }
+
+        async fn report_exclusion_counts(
+            &self,
+            peer: &str,
+            report: &EngineExclusionReport,
+        ) -> Result<(), String> {
+            self.received
+                .lock()
+                .unwrap()
+                .push(EngineReport::ReportExclusionCounts(
+                    peer.to_string(),
+                    report.clone(),
+                ));
+            self.response.clone()
+        }
     }
 
-    /// Sends each Unsupervised Engine request once over `client_send`,
-    /// asserting every answer equals `expected`, and returns what the
-    /// handler should have received from `peer`.
+    /// Sends each engine report request once over `client_send`, the
+    /// Unsupervised Engine's requests 41 through 44 and the Semi-supervised
+    /// Engine's request 52, asserting every answer equals `expected`, and
+    /// returns what the handler should have received from `peer`.
     async fn send_engine_reports(
         client_send: &mut quinn::SendStream,
         client_recv: &mut quinn::RecvStream,
@@ -1306,6 +1349,19 @@ mod tests {
             assert_eq!(&response, expected);
         }
 
+        let exclusion_reports = crate::test::engine_exclusion_reports();
+        for report in &exclusion_reports {
+            let response: Result<(), String> = crate::unary_request(
+                client_send,
+                client_recv,
+                u32::from(RequestCode::ReportExclusionCounts),
+                report,
+            )
+            .await
+            .unwrap();
+            assert_eq!(&response, expected);
+        }
+
         let mut sent = vec![
             EngineReport::UploadRunModel(peer.to_string(), 7, model),
             EngineReport::ReportRun(
@@ -1320,6 +1376,11 @@ mod tests {
             reports
                 .into_iter()
                 .map(|report| EngineReport::ReportDetectorStatus(peer.to_string(), report)),
+        );
+        sent.extend(
+            exclusion_reports
+                .into_iter()
+                .map(|report| EngineReport::ReportExclusionCounts(peer.to_string(), report)),
         );
         sent
     }
@@ -1348,6 +1409,13 @@ mod tests {
         );
         assert_eq!(
             DefaultHandler.report_detector_status("peer", &report).await,
+            not_supported
+        );
+        let exclusion_report = crate::test::engine_exclusion_reports().remove(0);
+        assert_eq!(
+            DefaultHandler
+                .report_exclusion_counts("peer", &exclusion_report)
+                .await,
             not_supported
         );
 

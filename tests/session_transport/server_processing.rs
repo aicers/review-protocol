@@ -37,8 +37,8 @@ const EVENTS: &[u8] = include_bytes!("../fixtures/current/server-events.bin");
 const TRUNCATED_EVENT: &[u8] = include_bytes!("../fixtures/current/server-truncated-event.bin");
 
 const GET_CONFIG: &[u8] = &[0, 0, 0, 4, 36, 0, 0, 0];
-const GET_ALLOWLIST: &[u8] = &[0, 0, 0, 4, 32, 0, 0, 0];
-const GET_BLOCKLIST: &[u8] = &[0, 0, 0, 4, 33, 0, 0, 0];
+const GET_EXCLUSION_LIST: &[u8] = &[0, 0, 0, 4, 32, 0, 0, 0];
+const GET_WATCHLIST: &[u8] = &[0, 0, 0, 4, 33, 0, 0, 0];
 const GET_LABEL_DB_PATTERNS: u32 = 15;
 
 /// Returns the detection event a fixture frame carries: a `LockyRansomware`
@@ -253,14 +253,14 @@ impl Handler for FixtureHandler {
         self.unsupported(service_id::SERVER_LIST_INTERNAL_NETWORK)
     }
 
-    async fn get_allowlist(&self, peer: &str) -> Result<Vec<NetworkListItem>, String> {
+    async fn get_exclusion_list(&self, peer: &str) -> Result<Vec<NetworkListItem>, String> {
         assert_eq!(peer, "verified-peer");
-        self.unsupported(service_id::SERVER_LIST_ALLOWLIST)
+        self.unsupported(service_id::SERVER_LIST_EXCLUSION_LIST)
     }
 
-    async fn get_blocklist(&self, peer: &str) -> Result<Vec<NetworkListItem>, String> {
+    async fn get_watchlist(&self, peer: &str) -> Result<Vec<NetworkListItem>, String> {
         assert_eq!(peer, "verified-peer");
-        self.unsupported(service_id::SERVER_LIST_BLOCKLIST)
+        self.unsupported(service_id::SERVER_LIST_WATCHLIST)
     }
 
     async fn get_pretrained_model(&self, name: &str) -> Result<Vec<u8>, String> {
@@ -539,8 +539,8 @@ async fn runner_dispatches_every_built_in_on_one_stream() {
         SERVER_OUTLIER_GET,
         SERVER_LIST_TOR_EXIT_NODE,
         SERVER_LIST_INTERNAL_NETWORK,
-        SERVER_LIST_ALLOWLIST,
-        SERVER_LIST_BLOCKLIST,
+        SERVER_LIST_EXCLUSION_LIST,
+        SERVER_LIST_WATCHLIST,
         SERVER_MODEL_GET_PRETRAINED,
         SERVER_LIST_TRUSTED_USER_AGENT,
         SERVER_CONFIG_GET,
@@ -1247,15 +1247,15 @@ fn response_frames(mut bytes: &[u8]) -> Vec<&[u8]> {
     frames
 }
 
-/// Checks that the answers to an allowlist pull, a blocklist pull and
+/// Checks that the answers to an exclusion-list pull, a watchlist pull and
 /// `get_config`, in that order, refuse both pulls for the advertised `0.49.0`
 /// and answer `get_config`.
 fn assert_list_pulls_refused(responses: &[u8]) {
     let frames = response_frames(responses);
-    let [allowlist, blocklist, config] = frames.as_slice() else {
+    let [exclusion_list, watchlist, config] = frames.as_slice() else {
         panic!("expected three responses, got {}", frames.len());
     };
-    for (code, frame) in [(32, allowlist), (33, blocklist)] {
+    for (code, frame) in [(32, exclusion_list), (33, watchlist)] {
         let (answer, _) = bincode::serde::decode_from_slice::<
             Result<Vec<NetworkListItem>, String>,
             _,
@@ -1276,7 +1276,7 @@ fn assert_list_pulls_refused(responses: &[u8]) {
     assert_eq!(answer, Ok("configuration".to_string()));
 }
 
-/// The runner answers an allowlist or blocklist pull from an agent that
+/// The runner answers an exclusion-list or watchlist pull from an agent that
 /// advertised `0.49.0` with an error, without invoking the handler, and
 /// continues: the `0.50.0` item list it would send can decode on that agent as
 /// a different list.
@@ -1291,7 +1291,7 @@ async fn runner_refuses_list_pulls_from_an_agent_before_item_lists() {
     };
     let mut incoming = incoming.with_authorization(context(), Arc::new(policy));
 
-    let requests = [GET_ALLOWLIST, GET_BLOCKLIST, GET_CONFIG].concat();
+    let requests = [GET_EXCLUSION_LIST, GET_WATCHLIST, GET_CONFIG].concat();
     let (mut send, mut recv) = open_requests(&node, &requests).await;
     send.finish().unwrap();
     assert!(matches!(
@@ -1305,8 +1305,8 @@ async fn runner_refuses_list_pulls_from_an_agent_before_item_lists() {
     assert_eq!(
         *trace.lock().unwrap(),
         [
-            Observation::Authorization(service_id::SERVER_LIST_ALLOWLIST),
-            Observation::Authorization(service_id::SERVER_LIST_BLOCKLIST),
+            Observation::Authorization(service_id::SERVER_LIST_EXCLUSION_LIST),
+            Observation::Authorization(service_id::SERVER_LIST_WATCHLIST),
             Observation::Authorization(service_id::SERVER_CONFIG_GET),
             Observation::Handler(service_id::SERVER_CONFIG_GET),
         ]
@@ -1320,7 +1320,7 @@ async fn low_level_stream_refuses_list_pulls_from_an_agent_before_item_lists() {
     use review_protocol::session::ServerRequest;
 
     let (mut incoming, _, _, node) = raw_sessions(SessionOptions::legacy_compatible()).await;
-    let requests = [GET_ALLOWLIST, GET_BLOCKLIST, GET_CONFIG].concat();
+    let requests = [GET_EXCLUSION_LIST, GET_WATCHLIST, GET_CONFIG].concat();
     let (mut send, mut recv) = open_requests(&node, &requests).await;
     send.finish().unwrap();
     let mut stream = request_stream(&mut incoming).await;
@@ -1449,6 +1449,150 @@ async fn runner_serves_every_dai_request() {
             service_id::SERVER_DAI_REPORT_RANGE_LATE,
         ]
         .map(Observation::Authorization)
+    );
+}
+
+/// The owned runner serves request 52 through the handler's
+/// `report_exclusion_counts`, passes each report to it intact (one with no
+/// counts among them), returns the handler's replies, and authorizes each
+/// request as `SERVER_EXCLUSION_LIST_REPORT_COUNTS`.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn runner_serves_exclusion_count_reports() {
+    use review_protocol::{test::engine_exclusion_reports, types::EngineExclusionReport};
+
+    #[derive(Default)]
+    struct ExclusionHandler(Mutex<Vec<(String, EngineExclusionReport)>>);
+
+    #[async_trait::async_trait]
+    impl Handler for ExclusionHandler {
+        async fn report_exclusion_counts(
+            &self,
+            peer: &str,
+            report: &EngineExclusionReport,
+        ) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((peer.to_string(), report.clone()));
+            if report.counts.is_empty() {
+                Err("nothing to record".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let reports = engine_exclusion_reports();
+    assert!(reports.iter().any(|report| report.counts.is_empty()));
+    let requests = reports
+        .iter()
+        .map(|report| request_frame(52, report))
+        .collect::<Vec<_>>()
+        .concat();
+
+    let (incoming, _, _, node) = raw_sessions_at(
+        SessionOptions::legacy_compatible(),
+        review_protocol::PROTOCOL_VERSION,
+    )
+    .await;
+    let policy = Policy::default();
+    let trace = policy.trace.clone();
+    let mut incoming = incoming.with_authorization(context(), Arc::new(policy));
+    let handler = Arc::new(ExclusionHandler::default());
+    let (mut send, mut recv) = open_requests(&node, &requests).await;
+    send.finish().unwrap();
+    assert!(matches!(
+        request_stream(&mut incoming)
+            .await
+            .run(Arc::clone(&handler))
+            .await,
+        Ok(ServerRequestOutcome::Finished)
+    ));
+    let mut responses = Vec::new();
+    recv.read_to_end(&mut responses).await.unwrap();
+
+    let frames = response_frames(&responses);
+    let replies = frames
+        .iter()
+        .map(|frame| decode_response::<()>(frame))
+        .collect::<Vec<_>>();
+    let expected = reports
+        .iter()
+        .map(|report| {
+            if report.counts.is_empty() {
+                Err("nothing to record".to_string())
+            } else {
+                Ok(())
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(replies, expected);
+    assert_eq!(
+        *handler.0.lock().unwrap(),
+        reports
+            .iter()
+            .map(|report| ("verified-peer".to_string(), report.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        *trace.lock().unwrap(),
+        reports
+            .iter()
+            .map(|_| Observation::Authorization(service_id::SERVER_EXCLUSION_LIST_REPORT_COUNTS))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The owned runner answers request 52 with the default `not supported`
+/// error when the handler does not override `report_exclusion_counts`, after
+/// authorizing it, and continues with the next request.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn runner_answers_exclusion_count_report_unsupported_by_default() {
+    use review_protocol::test::engine_exclusion_reports;
+
+    let report = engine_exclusion_reports().remove(0);
+    let requests = [request_frame(52, &report).as_slice(), GET_CONFIG].concat();
+
+    let (incoming, _, _, node) = raw_sessions_at(
+        SessionOptions::legacy_compatible(),
+        review_protocol::PROTOCOL_VERSION,
+    )
+    .await;
+    let policy = Policy::default();
+    let trace = policy.trace.clone();
+    let mut incoming = incoming.with_authorization(context(), Arc::new(policy));
+    let (mut send, mut recv) = open_requests(&node, &requests).await;
+    send.finish().unwrap();
+    assert!(matches!(
+        request_stream(&mut incoming)
+            .await
+            .run(Arc::new(ConfigResponse(1)))
+            .await,
+        Ok(ServerRequestOutcome::Finished)
+    ));
+    let mut responses = Vec::new();
+    recv.read_to_end(&mut responses).await.unwrap();
+
+    let frames = response_frames(&responses);
+    let [report_answer, config_answer] = frames.as_slice() else {
+        panic!("expected two responses, got {}", frames.len());
+    };
+    assert_eq!(
+        decode_response::<()>(report_answer),
+        Err("not supported".to_string())
+    );
+    assert_eq!(
+        decode_response::<String>(config_answer),
+        Ok("x".to_string())
+    );
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            Observation::Authorization(service_id::SERVER_EXCLUSION_LIST_REPORT_COUNTS),
+            Observation::Authorization(service_id::SERVER_CONFIG_GET),
+        ]
     );
 }
 

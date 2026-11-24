@@ -61,11 +61,11 @@ pub(crate) enum RequestCode {
     /// Update the list of Internal network
     InternalNetworkList = 14,
 
-    /// Update the list of allow
-    Allowlist = 15,
+    /// Update the exclusion list
+    ExclusionList = 15,
 
-    /// Update the list of block
-    Blocklist = 16,
+    /// Update the watchlist
+    Watchlist = 16,
 
     /// Request Echo (for ping)
     EchoRequest = 17,
@@ -512,14 +512,14 @@ impl ConnectionBuilder {
 pub struct Connection {
     endpoint: quinn::Endpoint,
     conn: quinn::Connection,
-    /// The handshake version that keeps this connection off the allowlist and
-    /// blocklist pulls, or `None` when both sides speak the item lists.
+    /// The handshake version that keeps this connection off the exclusion-list and
+    /// watchlist pulls, or `None` when both sides speak the item lists.
     network_list_blocker: Option<String>,
 }
 
 #[cfg(feature = "client")]
 impl Connection {
-    /// Refuses an allowlist or blocklist pull, before anything is sent, when
+    /// Refuses an exclusion-list or watchlist pull, before anything is sent, when
     /// the version this agent advertised or the server's handshake reply is
     /// earlier than the item lists.
     pub(crate) fn check_network_lists(&self) -> std::io::Result<()> {
@@ -714,6 +714,16 @@ mod tests {
         let root_pem = root_cert.pem();
 
         (chain_pem, leaf_key_pem, root_pem, 2)
+    }
+
+    /// The renamed list pushes keep their request numbers, so their encoded
+    /// bytes are unchanged.
+    #[test]
+    fn network_list_codes() {
+        assert_eq!(u32::from(RequestCode::ExclusionList), 15);
+        assert_eq!(u32::from(RequestCode::Watchlist), 16);
+        assert_eq!(RequestCode::from_primitive(15), RequestCode::ExclusionList);
+        assert_eq!(RequestCode::from_primitive(16), RequestCode::Watchlist);
     }
 
     #[test]

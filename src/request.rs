@@ -675,21 +675,21 @@ pub trait Handler: Send {
         return Err("not supported".to_string());
     }
 
-    /// Handles agent request 15, the allowlist entries in the order sent.
+    /// Handles agent request 15, the exclusion-list entries in the order sent.
     ///
     /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
     /// decode as a different item list. The dispatcher has no handshake
     /// version to check, so the caller checks it; see [`NetworkListItem`].
-    async fn allowlist(&mut self, _list: Vec<NetworkListItem>) -> Result<(), String> {
+    async fn exclusion_list(&mut self, _list: Vec<NetworkListItem>) -> Result<(), String> {
         return Err("not supported".to_string());
     }
 
-    /// Handles agent request 16, the blocklist entries in the order sent.
+    /// Handles agent request 16, the watchlist entries in the order sent.
     ///
     /// The peer must speak protocol `0.50.0` or later: a `0.49.0` payload can
     /// decode as a different item list. The dispatcher has no handshake
     /// version to check, so the caller checks it; see [`NetworkListItem`].
-    async fn blocklist(&mut self, _list: Vec<NetworkListItem>) -> Result<(), String> {
+    async fn watchlist(&mut self, _list: Vec<NetworkListItem>) -> Result<(), String> {
         return Err("not supported".to_string());
     }
 
@@ -1172,7 +1172,7 @@ async fn decode_args<'de, T: serde::Deserialize<'de>>(
 /// Decodes the arguments of request `code` like [`decode_args`], but also
 /// rejects bytes left over after them.
 ///
-/// The allowlist and blocklist pushes use this so that a `0.49.0` peer's
+/// The exclusion-list and watchlist pushes use this so that a `0.49.0` peer's
 /// `HostNetworkGroup` payload with no explicit hosts is refused rather than
 /// read as an empty item list; see `legacy_transport::decode_exact`. It does
 /// not catch every `0.49.0` payload, and this dispatcher has no handshake
@@ -1493,16 +1493,17 @@ pub async fn handle<H: Handler>(
                     .await
                     .map_err(HandlerError::SendError)?;
             }
-            RequestCode::Allowlist => {
-                let allowlist = decode_exact_args::<Vec<NetworkListItem>>(send, code, body).await?;
-                let result = handler.allowlist(allowlist).await;
+            RequestCode::ExclusionList => {
+                let exclusion_list =
+                    decode_exact_args::<Vec<NetworkListItem>>(send, code, body).await?;
+                let result = handler.exclusion_list(exclusion_list).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
             }
-            RequestCode::Blocklist => {
-                let blocklist = decode_exact_args::<Vec<NetworkListItem>>(send, code, body).await?;
-                let result = handler.blocklist(blocklist).await;
+            RequestCode::Watchlist => {
+                let watchlist = decode_exact_args::<Vec<NetworkListItem>>(send, code, body).await?;
+                let result = handler.watchlist(watchlist).await;
                 send_response(send, &mut buf, result)
                     .await
                     .map_err(HandlerError::SendError)?;
@@ -5077,7 +5078,7 @@ mod tests {
     }
 
     /// A `0.49.0` `HostNetworkGroup` with no explicit hosts but other
-    /// entries, pushed as the allowlist or the blocklist.
+    /// entries, pushed as the exclusion list or the watchlist.
     ///
     /// Its leading zero host count is also an empty `Vec<NetworkListItem>`,
     /// so the encoding is checked to be one a prefix decode would accept.
@@ -5100,7 +5101,7 @@ mod tests {
         body
     }
 
-    /// An allowlist or blocklist push in the `0.49.0` `HostNetworkGroup`
+    /// An exclusion-list or watchlist push in the `0.49.0` `HostNetworkGroup`
     /// shape is answered with the error frame instead of reaching the
     /// handler as an empty list.
     #[tokio::test]
@@ -5109,7 +5110,7 @@ mod tests {
         use crate::test::{TOKEN, channel};
 
         let _lock = TOKEN.lock().await;
-        for request in [RequestCode::Allowlist, RequestCode::Blocklist] {
+        for request in [RequestCode::ExclusionList, RequestCode::Watchlist] {
             let channel = channel().await;
             let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
             let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);

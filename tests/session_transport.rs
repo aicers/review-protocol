@@ -1171,6 +1171,51 @@ async fn engine_reports_preserve_arguments_and_remote_rejection() {
     );
 }
 
+/// Every exclusion-count report, one with no counts among them, reaches the
+/// manager as request 52 with its counts intact and in order, and the
+/// manager's reply, a success or a rejection, reaches the engine.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn exclusion_count_reports_round_trip() {
+    use review_protocol::test::engine_exclusion_reports;
+
+    let reports = engine_exclusion_reports();
+    assert!(reports.iter().any(|report| report.counts.is_empty()));
+    let (_, mut incoming, engine, _) = sessions(SessionOptions::legacy_compatible()).await;
+    let ((), ()) = tokio::join!(
+        async {
+            for report in &reports {
+                let result = engine.report_exclusion_counts(report).await;
+                if report.counts.is_empty() {
+                    assert!(
+                        matches!(result, Err(SessionError::RemoteRejection(message)) if message == "nothing to record")
+                    );
+                } else {
+                    result.unwrap();
+                }
+            }
+        },
+        async {
+            for report in &reports {
+                let mut stream = request_stream(&mut incoming).await;
+                let ServerRequest::ReportExclusionCounts { request, reply } =
+                    stream.next().await.unwrap().unwrap()
+                else {
+                    panic!("wrong request")
+                };
+                assert_eq!(&request, report);
+                let answer = if request.counts.is_empty() {
+                    Err("nothing to record".into())
+                } else {
+                    Ok(())
+                };
+                reply.respond(answer).await.unwrap();
+                stream.finish().unwrap();
+            }
+        }
+    );
+}
+
 /// Every detection event of the batch, with one that fails `validate` among
 /// valid ones, crosses the session-layer stream as sent and in order, both
 /// through `next` and through the owned runner.
@@ -1231,7 +1276,7 @@ async fn detection_event_stream_delivers_every_event_unvalidated() {
     assert_eq!(*collect.0.lock().unwrap(), events);
 }
 
-/// The allowlist and blocklist pulls carry every item, in the order the
+/// The exclusion-list and watchlist pulls carry every item, in the order the
 /// manager supplied, with ids above 2^53 and overlapping groups intact.
 #[cfg(feature = "test-support")]
 #[tokio::test]
@@ -1245,19 +1290,20 @@ async fn list_pulls_preserve_every_item_in_order() {
         sessions_at(SessionOptions::legacy_compatible(), PROTOCOL_VERSION).await;
     let ((), ()) = tokio::join!(
         async {
-            assert_eq!(agent.get_allowlist().await.unwrap(), items);
-            assert_eq!(agent.get_blocklist().await.unwrap(), reversed);
+            assert_eq!(agent.get_exclusion_list().await.unwrap(), items);
+            assert_eq!(agent.get_watchlist().await.unwrap(), reversed);
         },
         async {
             let mut stream = request_stream(&mut incoming).await;
-            let ServerRequest::GetAllowlist { reply, .. } = stream.next().await.unwrap().unwrap()
+            let ServerRequest::GetExclusionList { reply, .. } =
+                stream.next().await.unwrap().unwrap()
             else {
                 panic!("wrong request")
             };
             reply.respond(Ok(items.clone())).await.unwrap();
             stream.finish().unwrap();
             let mut stream = request_stream(&mut incoming).await;
-            let ServerRequest::GetBlocklist { reply, .. } = stream.next().await.unwrap().unwrap()
+            let ServerRequest::GetWatchlist { reply, .. } = stream.next().await.unwrap().unwrap()
             else {
                 panic!("wrong request")
             };
@@ -1267,7 +1313,7 @@ async fn list_pulls_preserve_every_item_in_order() {
     );
 }
 
-/// An allowlist or blocklist reply in the `0.49.0` shape, a
+/// An exclusion-list or watchlist reply in the `0.49.0` shape, a
 /// `HostNetworkGroup` with no explicit hosts but other entries, from a manager
 /// whose handshake claimed `0.50.0`, is refused as malformed rather than read
 /// as an empty item list, which a prefix decode would do.
@@ -1314,7 +1360,7 @@ async fn list_pulls_reject_legacy_host_network_group_reply() {
     // Keep the manager session alive without accepting its streams.
     let _server = server.unwrap();
     let (agent, _) = agent.unwrap();
-    for pull_blocklist in [false, true] {
+    for pull_watchlist in [false, true] {
         let ((), result) = tokio::join!(
             async {
                 let (send, recv) = manager.accept_bi().await.unwrap();
@@ -1327,10 +1373,10 @@ async fn list_pulls_reject_legacy_host_network_group_reply() {
                 let _ = writer.into_inner().finish();
             },
             async {
-                if pull_blocklist {
-                    agent.get_blocklist().await
+                if pull_watchlist {
+                    agent.get_watchlist().await
                 } else {
-                    agent.get_allowlist().await
+                    agent.get_exclusion_list().await
                 }
             }
         );
@@ -1340,7 +1386,7 @@ async fn list_pulls_reject_legacy_host_network_group_reply() {
     }
 }
 
-/// Checks that a `0.49.0` allowlist or blocklist reply can get past
+/// Checks that a `0.49.0` exclusion-list or watchlist reply can get past
 /// full-frame decoding: a `HostNetworkGroup` holding one IPv4 host is also a
 /// complete one-item `Vec<NetworkListItem>` with an invented id and name and an
 /// empty group. Only the handshake version keeps it out.
@@ -1396,7 +1442,10 @@ async fn assert_list_pulls_refused_locally(
     manager: &Connection,
     version: &str,
 ) {
-    for result in [agent.get_allowlist().await, agent.get_blocklist().await] {
+    for result in [
+        agent.get_exclusion_list().await,
+        agent.get_watchlist().await,
+    ] {
         let error = result.unwrap_err();
         assert!(
             matches!(&error, SessionError::IncompatibleProtocol { version: v, required }
@@ -1412,7 +1461,7 @@ async fn assert_list_pulls_refused_locally(
     assert_eq!(code, 36, "no list pull reached the manager");
 }
 
-/// An agent that advertised `0.49.0` refuses its own allowlist and blocklist
+/// An agent that advertised `0.49.0` refuses its own exclusion-list and watchlist
 /// pulls before sending them, even to a manager whose ceiling is `0.50.0`.
 #[tokio::test]
 async fn list_pulls_refuse_an_agent_advertising_0_49_0() {
@@ -1435,7 +1484,7 @@ async fn list_pulls_refuse_an_agent_advertising_0_49_0() {
     assert_list_pulls_refused_locally(&agent, &manager, "0.49.0").await;
 }
 
-/// An agent that advertised `0.50.0` refuses its allowlist and blocklist pulls
+/// An agent that advertised `0.50.0` refuses its exclusion-list and watchlist pulls
 /// before sending them when the manager's handshake reply is `0.49.0`.
 #[tokio::test]
 async fn list_pulls_refuse_a_manager_replying_0_49_0() {
@@ -1505,7 +1554,7 @@ async fn agent_answers_unserved_and_undecodable_requests_like_the_legacy_dispatc
     let mut reader = FramedReader::new(recv, limit);
     let ((), ()) = tokio::join!(
         async {
-            // `Allowlist` (15) is served by the legacy dispatcher, not by sessions.
+            // `ExclusionList` (15) is served by the legacy dispatcher, not by sessions.
             writer.start((15_u32.to_le_bytes(), ())).unwrap();
             writer.flush().await.unwrap();
             let answer = reader.read().await.unwrap().unwrap();

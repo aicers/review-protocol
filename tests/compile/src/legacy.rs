@@ -36,3 +36,15 @@ pub async fn framing(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream)
 pub async fn dispatch<H: request::NodeHandler>(handler: &mut H, send: &mut quinn::SendStream, recv: &mut quinn::RecvStream) -> Result<(), request::HandlerError> {
     request::handle_node(handler, send, recv).await
 }
+
+pub async fn network_lists_and_exclusion_counts(
+    client: &client::Connection,
+    server: &server::Connection,
+    report: &review_protocol::types::EngineExclusionReport,
+) -> anyhow::Result<()> {
+    let exclusion_list = client.get_exclusion_list().await?;
+    let watchlist = client.get_watchlist().await?;
+    client.report_exclusion_counts(report).await?;
+    server.send_exclusion_list(&exclusion_list).await?;
+    server.send_watchlist(&watchlist).await
+}

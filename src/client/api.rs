@@ -8,8 +8,8 @@ use crate::{
     types::{
         DaiCursors, DaiExtractorConfig, DaiObservationBatch, DaiRangeDay, DaiRangeGrant,
         DaiRangeLate, DaiRangeMark, DaiRangeUnit, DaiStoreAck, DataSource, DataSourceKey,
-        DetectorStatusReport, HostNetworkGroup, NetworkListItem, ReportedRunState,
-        TimeSeriesGenerationPolicy,
+        DetectorStatusReport, EngineExclusionReport, HostNetworkGroup, NetworkListItem,
+        ReportedRunState, TimeSeriesGenerationPolicy,
     },
     unary_request,
 };
@@ -92,6 +92,21 @@ impl Connection {
         res.map_err(io::Error::other)
     }
 
+    /// Reports the raw events a Semi-supervised Engine skipped before
+    /// detection because they matched an exclusion-list entry, counted per
+    /// entry and UTC date.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the response is invalid, or the
+    /// server rejects the report; a server that does not serve it answers
+    /// `not supported`.
+    pub async fn report_exclusion_counts(&self, report: &EngineExclusionReport) -> io::Result<()> {
+        let res: Result<(), String> =
+            request(self, server::RequestCode::ReportExclusionCounts, report).await?;
+        res.map_err(io::Error::other)
+    }
+
     /// Fetches the configuration from the server.
     ///
     /// The format of the configuration is up to the caller to interpret.
@@ -104,7 +119,7 @@ impl Connection {
         res.map_err(io::Error::other)
     }
 
-    /// Fetches the allowlist entries from the server, in the order the server
+    /// Fetches the exclusion-list entries from the server, in the order the server
     /// sent them.
     ///
     /// Both the protocol version this connection advertised and the server's
@@ -117,14 +132,14 @@ impl Connection {
     /// Returns an error of kind [`io::ErrorKind::Unsupported`] if either
     /// handshake version is earlier than `0.50.0`, and an error if the request
     /// fails or the response is invalid.
-    pub async fn get_allowlist(&self) -> io::Result<Vec<NetworkListItem>> {
+    pub async fn get_exclusion_list(&self) -> io::Result<Vec<NetworkListItem>> {
         self.check_network_lists()?;
         let res: Result<Vec<NetworkListItem>, String> =
-            request_exact(self, server::RequestCode::GetAllowlist, ()).await?;
+            request_exact(self, server::RequestCode::GetExclusionList, ()).await?;
         res.map_err(io::Error::other)
     }
 
-    /// Fetches the blocklist entries from the server, in the order the server
+    /// Fetches the watchlist entries from the server, in the order the server
     /// sent them.
     ///
     /// Both the protocol version this connection advertised and the server's
@@ -137,10 +152,10 @@ impl Connection {
     /// Returns an error of kind [`io::ErrorKind::Unsupported`] if either
     /// handshake version is earlier than `0.50.0`, and an error if the request
     /// fails or the response is invalid.
-    pub async fn get_blocklist(&self) -> io::Result<Vec<NetworkListItem>> {
+    pub async fn get_watchlist(&self) -> io::Result<Vec<NetworkListItem>> {
         self.check_network_lists()?;
         let res: Result<Vec<NetworkListItem>, String> =
-            request_exact(self, server::RequestCode::GetBlocklist, ()).await?;
+            request_exact(self, server::RequestCode::GetWatchlist, ()).await?;
         res.map_err(io::Error::other)
     }
 
@@ -839,6 +854,45 @@ mod tests {
         .await;
     }
 
+    /// Every exclusion-count report, including one with no counts, reaches
+    /// the handler as sent, with its counts in order.
+    #[tokio::test]
+    async fn report_exclusion_counts_returns_handler_ok() {
+        for report in crate::test::engine_exclusion_reports() {
+            run_test(|client_conn| async move {
+                assert!(
+                    client_conn.report_exclusion_counts(&report).await.is_ok(),
+                    "exclusion-count report {report:?} should arrive intact"
+                );
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn report_exclusion_counts_converts_handler_error() {
+        run_test(|client_conn| async move {
+            let mut report = crate::test::engine_exclusion_reports().remove(0);
+            report.counts.reverse();
+            let error = client_conn
+                .report_exclusion_counts(&report)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "report rejected");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn report_exclusion_counts_default_is_not_supported() {
+        run_test_with(DefaultHandler, |client_conn| async move {
+            let report = crate::test::engine_exclusion_reports().remove(0);
+            assert_not_supported(client_conn.report_exclusion_counts(&report).await);
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn get_labeldb_patterns() {
         run_test(|client_conn| async move {
@@ -867,26 +921,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_allowlist() {
+    async fn get_exclusion_list() {
         run_test(|client_conn| async move {
-            let received_allowlist = client_conn.get_allowlist().await.unwrap();
-            assert_eq!(received_allowlist, crate::test::network_list_items());
+            let received_exclusion_list = client_conn.get_exclusion_list().await.unwrap();
+            assert_eq!(received_exclusion_list, crate::test::network_list_items());
         })
         .await;
     }
 
     #[tokio::test]
-    async fn get_blocklist() {
+    async fn get_watchlist() {
         run_test(|client_conn| async move {
-            let received_blocklist = client_conn.get_blocklist().await.unwrap();
+            let received_watchlist = client_conn.get_watchlist().await.unwrap();
             let mut expected = crate::test::network_list_items();
             expected.reverse();
-            assert_eq!(received_blocklist, expected);
+            assert_eq!(received_watchlist, expected);
         })
         .await;
     }
 
-    /// A `0.49.0` server's allowlist or blocklist reply, a
+    /// A `0.49.0` server's exclusion-list or watchlist reply, a
     /// `HostNetworkGroup` with no explicit hosts but other entries, is
     /// refused rather than read as an empty item list.
     #[tokio::test]
@@ -921,7 +975,7 @@ mod tests {
         );
 
         let test_env = TEST_ENV.lock().await;
-        for pull_blocklist in [false, true] {
+        for pull_watchlist in [false, true] {
             let (server_conn, client_conn) = test_env.setup().await;
             let server_reply = reply.clone();
             let handler_conn = server_conn.clone();
@@ -934,10 +988,10 @@ mod tests {
                 let _ = send.stopped().await;
             });
 
-            let res = if pull_blocklist {
-                client_conn.get_blocklist().await
+            let res = if pull_watchlist {
+                client_conn.get_watchlist().await
             } else {
-                client_conn.get_allowlist().await
+                client_conn.get_exclusion_list().await
             };
             assert_eq!(
                 res.expect_err("the legacy reply is refused").kind(),
@@ -949,8 +1003,8 @@ mod tests {
         }
     }
 
-    /// A connection that advertised `0.49.0` refuses its allowlist and
-    /// blocklist pulls before sending them: a server reply in the `0.49.0`
+    /// A connection that advertised `0.49.0` refuses its exclusion-list and
+    /// watchlist pulls before sending them: a server reply in the `0.49.0`
     /// shape holding one IPv4 host is also a complete item list, which
     /// full-frame decoding cannot refuse.
     #[tokio::test]
@@ -983,8 +1037,8 @@ mod tests {
         let (server_conn, client_conn, _) =
             test_env.setup_advertising("0.49.0", |_builder| {}).await;
         for res in [
-            client_conn.get_allowlist().await,
-            client_conn.get_blocklist().await,
+            client_conn.get_exclusion_list().await,
+            client_conn.get_watchlist().await,
         ] {
             let error = res.expect_err("the pull is refused");
             assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);

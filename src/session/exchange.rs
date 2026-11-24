@@ -221,7 +221,7 @@ impl Drop for Exchange {
 pub(super) enum Decoding {
     /// The value may be followed by bytes that are ignored.
     Prefix,
-    /// The value must consume the whole frame. The allowlist and blocklist
+    /// The value must consume the whole frame. The exclusion-list and watchlist
     /// pulls use this, so that a `0.49.0` peer's `HostNetworkGroup` reply,
     /// which starts with the same zero count as an empty item list when it
     /// has no explicit hosts, is refused rather than read as an empty list.

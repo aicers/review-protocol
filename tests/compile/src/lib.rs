@@ -53,8 +53,8 @@ pub async fn server(
             ServerRequest::GetModel { .. }
             | ServerRequest::GetPretrainedModel { .. }
             | ServerRequest::GetModelNames { .. }
-            | ServerRequest::GetAllowlist { .. }
-            | ServerRequest::GetBlocklist { .. }
+            | ServerRequest::GetExclusionList { .. }
+            | ServerRequest::GetWatchlist { .. }
             | ServerRequest::InsertModel { .. }
             | ServerRequest::UpdateModel { .. }
             | ServerRequest::RemoveModel { .. }
@@ -62,7 +62,8 @@ pub async fn server(
             | ServerRequest::UploadRunModel { .. }
             | ServerRequest::ReportRun { .. }
             | ServerRequest::ReportActiveRuns { .. }
-            | ServerRequest::ReportDetectorStatus { .. } => {}
+            | ServerRequest::ReportDetectorStatus { .. }
+            | ServerRequest::ReportExclusionCounts { .. } => {}
         }
     }
     stream.finish()?;
@@ -90,6 +91,24 @@ pub async fn engine_reports(
     handle.report_run(1, ReportedRunState::Started, None).await?;
     handle.report_active_runs(&[1]).await?;
     handle.report_detector_status(report).await
+}
+
+#[cfg(feature = "client")]
+pub async fn semi_supervised_engine(
+    handle: &review_protocol::session::AgentHandle,
+    report: &review_protocol::types::EngineExclusionReport,
+) -> Result<(), review_protocol::session::SessionError> {
+    let _exclusion_list: Vec<review_protocol::types::NetworkListItem> =
+        handle.get_exclusion_list().await?;
+    let _watchlist: Vec<review_protocol::types::NetworkListItem> = handle.get_watchlist().await?;
+    handle.report_exclusion_counts(report).await
+}
+
+/// The exclusion-count report is a schema type, usable without any transport.
+pub fn exclusion_counts(
+    report: &review_protocol::types::EngineExclusionReport,
+) -> &[review_protocol::types::ExcludedCount] {
+    &report.counts
 }
 
 #[cfg(feature = "server")]
