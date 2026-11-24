@@ -716,6 +716,16 @@ mod tests {
         (chain_pem, leaf_key_pem, root_pem, 2)
     }
 
+    /// The renamed list pushes keep their request numbers, so their encoded
+    /// bytes are unchanged.
+    #[test]
+    fn network_list_codes() {
+        assert_eq!(u32::from(RequestCode::ExclusionList), 15);
+        assert_eq!(u32::from(RequestCode::Watchlist), 16);
+        assert_eq!(RequestCode::from_primitive(15), RequestCode::ExclusionList);
+        assert_eq!(RequestCode::from_primitive(16), RequestCode::Watchlist);
+    }
+
     #[test]
     fn new_preserves_full_cert_chain() {
         let (chain_pem, key_pem, _root_pem, expected_count) = generate_chain();
