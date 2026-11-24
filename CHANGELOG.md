@@ -5,6 +5,16 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.32.0](https://github.com/aicers/review-protocol/compare/0.31.0...0.32.0) - 2026-11-24
+
+### Added
+
+- [**breaking**] rename the allowlist and blocklist to the exclusion list and watchlist and add the exclusion-count report ([#370](https://github.com/aicers/review-protocol/pull/370))
+
+### Other
+
+- *(deps)* [**breaking**] update structured to 0.18.0 ([#361](https://github.com/aicers/review-protocol/pull/361))
+
 ## [0.31.0](https://github.com/aicers/review-protocol/compare/0.30.0...0.31.0) - 2026-11-24
 
 ### Added
