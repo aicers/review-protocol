@@ -279,10 +279,17 @@
 //! compatibility. Request codes and representative responses have independently
 //! captured release/current fixtures in `tests/fixtures`.
 //!
-//! The protocol is `0.51.0`, and the library's `>=0.49.0` suggested floor is
-//! unchanged. `0.51.0` adds the device identification (DAI) requests, codes 45
+//! The protocol is `0.52.0`, and the library's `>=0.49.0` suggested floor is
+//! unchanged. `0.52.0` changes the detection event payload: the 14 Sysmon raw
+//! event bodies gain the endpoint host header as a trailing field (and
+//! `ProcessCreate` the full 64-bit logon ID after it), so their bytes differ
+//! from `0.51.0`; eight raw event kinds are added (five Sysmon kinds and the
+//! Windows event log, journald and auditd kinds); and the endpoint primary
+//! subject is added. Detection events that use none of these shapes keep
+//! their `0.51.0` bytes, and an earlier peer cannot decode those that do.
+//! `0.51.0` added the device identification (DAI) requests, codes 45
 //! through 51, and a Semi-supervised Engine's exclusion-count report, code 52,
-//! and retires the host report requests 37 and 38, which now decode as unknown
+//! and retired the host report requests 37 and 38, which now decode as unknown
 //! codes and draw the unknown-code answer; a manager that predates `0.51.0`
 //! answers the DAI requests and the exclusion-count report the same way.
 //! `0.50.0` replaced the detection event, exclusion-list, watchlist and

@@ -192,3 +192,34 @@ The device identification requests that 0.51.0 adds, codes 45 through 51, are
 not part of these fixtures; their own tests cover them. Neither is request 52,
 `ReportExclusionCounts`, the exclusion-count report of a Semi-supervised
 Engine; its own tests cover it as well.
+
+## Detection events released in 0.32.0
+
+Protocol 0.52.0 appends the endpoint host header to the 14 Sysmon raw event
+bodies, which changes their bytes, and adds eight raw event kinds and the
+`Endpoint` primary subject after every existing variant. The fixtures under
+`0.32.0/` pin the detection event shapes that were released before it, so a
+change that moves a variant or a field of those shapes fails.
+
+They were captured from tag `0.32.0`
+(`8f30e9a4f011867b15f2d9698175d1953035ad0c`) in a separate copy of that tag,
+by a test added there only for the capture. Each file is the bincode 2
+standard serde encodings of its events, concatenated with no length prefix.
+The bytes of a later patch release that changes only `CHANGELOG.md` and
+`Cargo.toml` are the same.
+
+- `detection-events.bin`: the 25 events of `test::detection_events()` at that
+  tag, in order. Between them they carry the `Host`, `Cluster`, `Sensor` and
+  `Network` primary subjects, both target kinds and every detail, including
+  the event that fails `validate`.
+- `raw-event-detection-events.bin`: one `Target::RawEvent` detection event for
+  each of the 22 network and Netflow bodies of the test `bodies()` list at
+  that tag (the 20 network bodies, `Netflow5` and `Netflow9`), in list order.
+  Each has time `1_773_586_804_120_000_000` ns for both the event and its raw
+  event, sensor `sensor-1`, model and detail `NonBrowser`, the body's kind,
+  category `CommandAndControl` and score `0.75`. The Sysmon bodies are left
+  out, since their bytes change.
+
+The tests rebuild the same events from the current helpers: the events of
+`test::detection_events()` before the appended endpoint event, and the same
+22 bodies. The `current/server-*.bin` fixtures are unchanged by 0.52.0.

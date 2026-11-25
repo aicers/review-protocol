@@ -693,8 +693,13 @@ pub enum RawEventKind {
     FileCreateTime = 32,
     NetworkConnect = 33,
     ProcessTerminate = 35,
+    DriverLoad = 36,
     ImageLoad = 37,
+    CreateRemoteThread = 38,
+    RawAccessRead = 39,
+    ProcessAccess = 40,
     FileCreate = 41,
+    RegistryObjectAddDel = 42,
     RegistryValueSet = 43,
     RegistryKeyRename = 44,
     FileCreateStreamHash = 45,
@@ -707,10 +712,18 @@ pub enum RawEventKind {
     // Netflow
     Netflow5 = 60,
     Netflow9 = 61,
+
+    // Endpoint logs
+    WindowsEventLog = 80,
+    Journald = 81,
+    Auditd = 82,
 }
 
 /// The body of a raw event, one variant per [`RawEventKind`] holding the
 /// [`raw_event`] struct of the same name.
+///
+/// A variant is serialized as its declaration index, so a variant added later
+/// is appended after every existing one, never inserted among them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RawEventBody {
     Conn(raw_event::Conn),
@@ -749,6 +762,14 @@ pub enum RawEventBody {
     FileDeleteDetected(raw_event::FileDeleteDetected),
     Netflow5(raw_event::Netflow5),
     Netflow9(raw_event::Netflow9),
+    DriverLoad(raw_event::DriverLoad),
+    CreateRemoteThread(raw_event::CreateRemoteThread),
+    RawAccessRead(raw_event::RawAccessRead),
+    ProcessAccess(raw_event::ProcessAccess),
+    RegistryObjectAddDel(raw_event::RegistryObjectAddDel),
+    WindowsEventLog(raw_event::WindowsEventLog),
+    Journald(raw_event::Journald),
+    Auditd(raw_event::Auditd),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize_repr, Eq, PartialEq, Serialize_repr)]

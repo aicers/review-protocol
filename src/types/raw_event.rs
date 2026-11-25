@@ -1,17 +1,36 @@
 //! Raw event bodies, one per [`RawEventKind`](super::RawEventKind).
 //!
 //! Each struct copies, field for field, the ingest struct of the same kind
-//! in giganto-client (`giganto_client::ingest::{network, sysmon, netflow}`)
-//! at tag `0.29.2`.
+//! in giganto-client
+//! (`giganto_client::ingest::{network, sysmon, netflow, endpoint, log}`);
+//! each struct's documentation names the giganto-client struct it copies.
 //!
-//! `Debug` is derived on every struct except [`Http`], [`Ftp`], [`Ldap`],
-//! [`Dhcp`], [`Radius`], [`ProcessCreate`], [`RegistryValueSet`] and
-//! [`FileCreateStreamHash`], whose fields that can carry credentials are
-//! printed as `<redacted>`.
+//! The copies follow different giganto-client tags:
+//!
+//! - The host header types ([`EndpointHeader`], [`ClockOffset`],
+//!   [`NetStateSource`], [`OsFamily`] and [`CollectionMode`], from
+//!   `ingest::endpoint`), the 14 Sysmon copies that carry the header as their
+//!   trailing `endpoint` field, and the eight kinds added with it
+//!   ([`DriverLoad`], [`CreateRemoteThread`], [`RawAccessRead`],
+//!   [`ProcessAccess`], [`RegistryObjectAddDel`], and [`WindowsEventLog`],
+//!   [`Journald`] and [`Auditd`] from `ingest::log`, with their inner types)
+//!   follow tag `0.31.0`.
+//! - [`Kerberos`] and [`Dhcp`] follow tag `0.29.2` by deliberate exception:
+//!   the fields giganto-client `0.30.0` appended to them are not copied.
+//! - Every other copy follows tag `0.29.2`.
+//!
+//! Time fields are nanosecond `i64`, as in giganto-client.
+//!
+//! `Debug` is derived on every type except [`Http`], [`Ftp`], [`Ldap`],
+//! [`Dhcp`], [`Radius`], [`ProcessCreate`], [`RegistryValueSet`],
+//! [`FileCreateStreamHash`], [`WindowsEventLog`], [`EventData`] and
+//! [`LogField`], whose fields that can carry credentials are printed as
+//! `<redacted>`.
 
 use std::{fmt, net::IpAddr};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// What a hand-written `Debug` prints in place of a credential field.
 const REDACTED: &str = "<redacted>";
@@ -860,6 +879,71 @@ pub struct Icmp {
     pub payload: Vec<u8>,
 }
 
+/// The host header of an endpoint record, copying giganto-client's
+/// `ingest::endpoint::EndpointHeader`.
+///
+/// It identifies the host (a host running Clumit Endpoint) a record was
+/// collected from and the host's network state at the time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointHeader {
+    pub endpoint_id: Uuid,
+    pub stream: Uuid,
+    pub seq: u64,
+    /// Nanoseconds since the Unix epoch.
+    pub event_time: i64,
+    /// Nanoseconds since the Unix epoch.
+    pub collected_at: i64,
+    pub clock_offset: Option<ClockOffset>,
+    pub hostname: String,
+    pub ips: Vec<IpAddr>,
+    pub default_route_ip: Option<IpAddr>,
+    pub net_state_source: NetStateSource,
+    pub os_family: OsFamily,
+    pub os_version: String,
+    pub collection_mode: CollectionMode,
+    pub process_key: Option<Vec<u8>>,
+    pub schema: u16,
+}
+
+/// The measured offset of an endpoint's clock, copying giganto-client's
+/// `ingest::endpoint::ClockOffset`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClockOffset {
+    pub offset_ms: i64,
+    pub uncertainty_ms: u32,
+    /// Nanoseconds since the Unix epoch.
+    pub measured_at: i64,
+}
+
+/// How an endpoint's network state was obtained, copying giganto-client's
+/// `ingest::endpoint::NetStateSource`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetStateSource {
+    Observed,
+    Inferred,
+    Unknown,
+    Other(String),
+}
+
+/// An endpoint's operating system family, copying giganto-client's
+/// `ingest::endpoint::OsFamily`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OsFamily {
+    Windows,
+    Linux,
+    Macos,
+    Other(String),
+}
+
+/// The collection mode an endpoint ran in, copying giganto-client's
+/// `ingest::endpoint::CollectionMode`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CollectionMode {
+    Extended,
+    Essential,
+    Other(String),
+}
+
 /// The `ProcessCreate` raw event body, copying giganto-client's `ingest::sysmon::ProcessCreate`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessCreate {
@@ -886,6 +970,16 @@ pub struct ProcessCreate {
     pub parent_image: String,
     pub parent_command_line: String,
     pub parent_user: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
+    /// The full 64-bit logon ID of an endpoint record.
+    ///
+    /// An endpoint record carries the full 64-bit `LogonId` here and puts in
+    /// `logon_id` that value if it fits in `u32`, else `u32::MAX`. A record
+    /// with no header (`REproduce` local mode) has both `endpoint` and
+    /// `logon_id_full` as `None`.
+    pub logon_id_full: Option<u64>,
 }
 
 /// `command_line` and `parent_command_line` hold every argument the
@@ -921,6 +1015,8 @@ impl fmt::Debug for ProcessCreate {
             parent_image,
             parent_command_line: _,
             parent_user,
+            endpoint,
+            logon_id_full,
         } = self;
         f.debug_struct("ProcessCreate")
             .field("agent_name", agent_name)
@@ -946,6 +1042,8 @@ impl fmt::Debug for ProcessCreate {
             .field("parent_image", parent_image)
             .field("parent_command_line", &REDACTED)
             .field("parent_user", parent_user)
+            .field("endpoint", endpoint)
+            .field("logon_id_full", logon_id_full)
             .finish()
     }
 }
@@ -962,6 +1060,9 @@ pub struct FileCreateTime {
     pub creation_utc_time: i64,
     pub previous_creation_utc_time: i64,
     pub user: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
 }
 
 /// The `NetworkConnect` raw event body, copying giganto-client's `ingest::sysmon::NetworkConnection`.
@@ -985,6 +1086,9 @@ pub struct NetworkConnect {
     pub destination_hostname: String,
     pub destination_port: u16,
     pub destination_port_name: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
 }
 
 /// The `ProcessTerminate` raw event body, copying giganto-client's `ingest::sysmon::ProcessTerminated`.
@@ -996,6 +1100,9 @@ pub struct ProcessTerminate {
     pub process_id: u32,
     pub image: String,
     pub user: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
 }
 
 /// The `ImageLoad` raw event body, copying giganto-client's `ingest::sysmon::ImageLoaded`.
@@ -1017,6 +1124,9 @@ pub struct ImageLoad {
     pub signature: String,
     pub signature_status: String,
     pub user: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
 }
 
 /// The `FileCreate` raw event body, copying giganto-client's `ingest::sysmon::FileCreate`.
@@ -1030,6 +1140,9 @@ pub struct FileCreate {
     pub target_filename: String,
     pub creation_utc_time: i64,
     pub user: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
 }
 
 /// The `RegistryValueSet` raw event body, copying giganto-client's `ingest::sysmon::RegistryValueSet`.
@@ -1044,6 +1157,9 @@ pub struct RegistryValueSet {
     pub target_object: String,
     pub details: String,
     pub user: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
 }
 
 /// `details` holds the data written to the registry value, such as the
@@ -1064,6 +1180,7 @@ impl fmt::Debug for RegistryValueSet {
             target_object,
             details: _,
             user,
+            endpoint,
         } = self;
         f.debug_struct("RegistryValueSet")
             .field("agent_name", agent_name)
@@ -1075,6 +1192,7 @@ impl fmt::Debug for RegistryValueSet {
             .field("target_object", target_object)
             .field("details", &REDACTED)
             .field("user", user)
+            .field("endpoint", endpoint)
             .finish()
     }
 }
@@ -1091,6 +1209,9 @@ pub struct RegistryKeyRename {
     pub target_object: String,
     pub new_name: String,
     pub user: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
 }
 
 /// The `FileCreateStreamHash` raw event body, copying giganto-client's `ingest::sysmon::FileCreateStreamHash`.
@@ -1106,6 +1227,9 @@ pub struct FileCreateStreamHash {
     pub hash: Vec<String>,
     pub contents: String,
     pub user: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
 }
 
 /// `contents` holds the captured contents of the named stream, such as a
@@ -1127,6 +1251,7 @@ impl fmt::Debug for FileCreateStreamHash {
             hash,
             contents: _,
             user,
+            endpoint,
         } = self;
         f.debug_struct("FileCreateStreamHash")
             .field("agent_name", agent_name)
@@ -1139,6 +1264,7 @@ impl fmt::Debug for FileCreateStreamHash {
             .field("hash", hash)
             .field("contents", &REDACTED)
             .field("user", user)
+            .field("endpoint", endpoint)
             .finish()
     }
 }
@@ -1154,6 +1280,9 @@ pub struct PipeEvent {
     pub pipe_name: String,
     pub image: String,
     pub user: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
 }
 
 /// The `DnsQuery` raw event body, copying giganto-client's `ingest::sysmon::DnsEvent`.
@@ -1168,6 +1297,9 @@ pub struct DnsQuery {
     pub query_results: Vec<String>, // divided by ';'
     pub image: String,
     pub user: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
 }
 
 /// The `FileDelete` raw event body, copying giganto-client's `ingest::sysmon::FileDelete`.
@@ -1183,6 +1315,9 @@ pub struct FileDelete {
     pub hashes: Vec<String>,
     pub is_executable: bool,
     pub archived: bool,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
 }
 
 /// The `ProcessTamper` raw event body, copying giganto-client's `ingest::sysmon::ProcessTampering`.
@@ -1195,6 +1330,9 @@ pub struct ProcessTamper {
     pub image: String,
     pub tamper_type: String, // type
     pub user: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
 }
 
 /// The `FileDeleteDetected` raw event body, copying giganto-client's `ingest::sysmon::FileDeleteDetected`.
@@ -1209,6 +1347,98 @@ pub struct FileDeleteDetected {
     pub target_filename: String,
     pub hashes: Vec<String>,
     pub is_executable: bool,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
+}
+
+/// The `DriverLoad` raw event body, copying giganto-client's `ingest::sysmon::DriverLoad`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriverLoad {
+    pub agent_name: String,
+    pub agent_id: String,
+    pub image_loaded: String,
+    pub hashes: Vec<String>,
+    pub signed: bool,
+    pub signature: String,
+    pub signature_status: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
+}
+
+/// The `CreateRemoteThread` raw event body, copying giganto-client's `ingest::sysmon::CreateRemoteThread`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateRemoteThread {
+    pub agent_name: String,
+    pub agent_id: String,
+    pub source_process_guid: String,
+    pub source_process_id: u32,
+    pub source_image: String,
+    pub target_process_guid: String,
+    pub target_process_id: u32,
+    pub target_image: String,
+    pub new_thread_id: u32,
+    pub start_address: String,
+    pub start_module: String,
+    pub start_function: String,
+    pub source_user: String,
+    pub target_user: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
+}
+
+/// The `RawAccessRead` raw event body, copying giganto-client's `ingest::sysmon::RawAccessRead`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawAccessRead {
+    pub agent_name: String,
+    pub agent_id: String,
+    pub process_guid: String,
+    pub process_id: u32,
+    pub image: String,
+    pub device: String,
+    pub user: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
+}
+
+/// The `ProcessAccess` raw event body, copying giganto-client's `ingest::sysmon::ProcessAccess`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessAccess {
+    pub agent_name: String,
+    pub agent_id: String,
+    pub source_process_guid: String,
+    pub source_process_id: u32,
+    pub source_thread_id: u32,
+    pub source_image: String,
+    pub target_process_guid: String,
+    pub target_process_id: u32,
+    pub target_image: String,
+    pub granted_access: u64,
+    pub call_trace: String,
+    pub source_user: String,
+    pub target_user: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
+}
+
+/// The `RegistryObjectAddDel` raw event body, copying giganto-client's `ingest::sysmon::RegistryObjectAddDel`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryObjectAddDel {
+    pub agent_name: String,
+    pub agent_id: String,
+    pub event_type: String,
+    pub process_guid: String,
+    pub process_id: u32,
+    pub image: String,
+    pub target_object: String,
+    pub user: String,
+    /// The host header of an endpoint record; `None` for records from any
+    /// other producer.
+    pub endpoint: Option<EndpointHeader>,
 }
 
 /// The `Netflow5` raw event body, copying giganto-client's `ingest::netflow::Netflow5`.
@@ -1253,6 +1483,149 @@ pub struct Netflow9 {
     pub contents: String,
 }
 
+/// The `WindowsEventLog` raw event body, copying giganto-client's `ingest::log::WindowsEventLog`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsEventLog {
+    pub channel: Option<String>,
+    pub provider: Option<String>,
+    pub event_id: Option<u16>,
+    pub version: Option<u8>,
+    pub level: Option<u8>,
+    pub task: Option<u16>,
+    pub opcode: Option<u8>,
+    pub keywords: Option<u64>,
+    pub record_id: Option<u64>,
+    pub computer: Option<String>,
+    pub user_sid: Option<String>,
+    pub event_data: Option<Vec<EventData>>,
+    pub user_data_xml: Option<String>,
+    /// The host header of the endpoint the record was collected from.
+    pub endpoint: EndpointHeader,
+}
+
+/// `user_data_xml` holds the event's provider-defined user data, which can
+/// carry a command line or a credential, so it is redacted rather than
+/// derived; `event_data` is printed through [`EventData`]'s `Debug`, which
+/// redacts every value, and every other field is printed as a derived
+/// `Debug` would print it.
+impl fmt::Debug for WindowsEventLog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured so that a field added to the struct fails to
+        // compile here until it is printed or redacted.
+        let Self {
+            channel,
+            provider,
+            event_id,
+            version,
+            level,
+            task,
+            opcode,
+            keywords,
+            record_id,
+            computer,
+            user_sid,
+            event_data,
+            user_data_xml: _,
+            endpoint,
+        } = self;
+        f.debug_struct("WindowsEventLog")
+            .field("channel", channel)
+            .field("provider", provider)
+            .field("event_id", event_id)
+            .field("version", version)
+            .field("level", level)
+            .field("task", task)
+            .field("opcode", opcode)
+            .field("keywords", keywords)
+            .field("record_id", record_id)
+            .field("computer", computer)
+            .field("user_sid", user_sid)
+            .field("event_data", event_data)
+            .field("user_data_xml", &REDACTED)
+            .field("endpoint", endpoint)
+            .finish()
+    }
+}
+
+/// One `EventData` item of a [`WindowsEventLog`], copying giganto-client's
+/// `ingest::log::EventData`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventData {
+    pub name: Option<String>,
+    pub value: String,
+}
+
+/// `value` can hold anything the event's provider records, such as a command
+/// line or a password, so it is redacted rather than derived; `name` is
+/// printed as a derived `Debug` would print it.
+impl fmt::Debug for EventData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured so that a field added to the struct fails to
+        // compile here until it is printed or redacted.
+        let Self { name, value: _ } = self;
+        f.debug_struct("EventData")
+            .field("name", name)
+            .field("value", &REDACTED)
+            .finish()
+    }
+}
+
+/// The `Journald` raw event body, copying giganto-client's `ingest::log::Journald`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Journald {
+    pub fields: Option<Vec<LogField>>,
+    /// The host header of the endpoint the record was collected from.
+    pub endpoint: EndpointHeader,
+}
+
+/// The `Auditd` raw event body, copying giganto-client's `ingest::log::Auditd`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Auditd {
+    pub serial: Option<u64>,
+    pub records: Option<Vec<AuditRecord>>,
+    /// The host header of the endpoint the record was collected from.
+    pub endpoint: EndpointHeader,
+}
+
+/// One record of an [`Auditd`] event, copying giganto-client's
+/// `ingest::log::AuditRecord`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRecord {
+    pub record_type: String,
+    pub fields: Vec<LogField>,
+}
+
+/// One named field of a [`Journald`] entry or an [`AuditRecord`], copying
+/// giganto-client's `ingest::log::LogField`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogField {
+    pub name: String,
+    pub value: LogValue,
+}
+
+/// `value` can hold anything the logging process recorded, such as a command
+/// line or a password, so it is redacted rather than derived; `name` is
+/// printed as a derived `Debug` would print it.
+impl fmt::Debug for LogField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured so that a field added to the struct fails to
+        // compile here until it is printed or redacted.
+        let Self { name, value: _ } = self;
+        f.debug_struct("LogField")
+            .field("name", name)
+            .field("value", &REDACTED)
+            .finish()
+    }
+}
+
+/// The value of a [`LogField`], copying giganto-client's
+/// `ingest::log::LogValue`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogValue {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -1275,9 +1648,16 @@ pub(super) mod tests {
     const REGISTRY_DETAILS: &str = "registry-default-password-secret";
     const STREAM_CONTENTS: &str =
         "[ZoneTransfer]\r\nHostUrl=https://example.net/a.zip?sig=stream-contents-secret";
+    const EVENT_DATA_VALUE: &str = "event-data-value-secret";
+    const UNNAMED_EVENT_DATA_VALUE: &str = "unnamed-event-data-value-secret";
+    const USER_DATA_XML: &str = "<UserData><Password>user-data-xml-secret</Password></UserData>";
+    const JOURNALD_TEXT: &str = "sudo -S --password journald-text-secret";
+    const JOURNALD_BYTES: &[u8] = b"mysql\0--password=journald-bytes-secret";
+    const AUDITD_TEXT: &str = "auditd-text-secret";
+    const AUDITD_BYTES: &[u8] = b"curl\0-u\0user:auditd-bytes-secret";
 
     /// The kinds and numbers the schema commits to.
-    const TABLE: [(RawEventKind, u32); 36] = [
+    const TABLE: [(RawEventKind, u32); 44] = [
         (RawEventKind::Conn, 0),
         (RawEventKind::Dns, 1),
         (RawEventKind::Http, 3),
@@ -1302,8 +1682,13 @@ pub(super) mod tests {
         (RawEventKind::FileCreateTime, 32),
         (RawEventKind::NetworkConnect, 33),
         (RawEventKind::ProcessTerminate, 35),
+        (RawEventKind::DriverLoad, 36),
         (RawEventKind::ImageLoad, 37),
+        (RawEventKind::CreateRemoteThread, 38),
+        (RawEventKind::RawAccessRead, 39),
+        (RawEventKind::ProcessAccess, 40),
         (RawEventKind::FileCreate, 41),
+        (RawEventKind::RegistryObjectAddDel, 42),
         (RawEventKind::RegistryValueSet, 43),
         (RawEventKind::RegistryKeyRename, 44),
         (RawEventKind::FileCreateStreamHash, 45),
@@ -1314,6 +1699,22 @@ pub(super) mod tests {
         (RawEventKind::FileDeleteDetected, 56),
         (RawEventKind::Netflow5, 60),
         (RawEventKind::Netflow9, 61),
+        (RawEventKind::WindowsEventLog, 80),
+        (RawEventKind::Journald, 81),
+        (RawEventKind::Auditd, 82),
+    ];
+
+    /// The kinds giganto-client 0.31.0 added that this crate copies, in
+    /// `RawEventBody` declaration order, with their numbers.
+    pub(super) const NEW_KINDS: [(RawEventKind, u8); 8] = [
+        (RawEventKind::DriverLoad, 36),
+        (RawEventKind::CreateRemoteThread, 38),
+        (RawEventKind::RawAccessRead, 39),
+        (RawEventKind::ProcessAccess, 40),
+        (RawEventKind::RegistryObjectAddDel, 42),
+        (RawEventKind::WindowsEventLog, 80),
+        (RawEventKind::Journald, 81),
+        (RawEventKind::Auditd, 82),
     ];
 
     /// Returns every `RawEventKind`, found by scanning the numbers the enum
@@ -1338,7 +1739,24 @@ pub(super) mod tests {
 
     #[test]
     fn try_from_rejects_numbers_outside_the_subset() {
-        for n in [2, 5, 11, 12, 13, 20, 26, 30, 62, 1000, u32::MAX] {
+        for n in [
+            2,
+            5,
+            11,
+            12,
+            13,
+            20,
+            26,
+            30,
+            34,
+            46,
+            57,
+            62,
+            79,
+            83,
+            1000,
+            u32::MAX,
+        ] {
             assert!(RawEventKind::try_from(n).is_err(), "{n} was accepted");
         }
         let accepted = (0..=u32::from(u16::MAX))
@@ -1359,8 +1777,23 @@ pub(super) mod tests {
             let decoded: RawEventKind = serde_json::from_str(&json).expect("deserializes");
             assert_eq!(decoded, kind);
         }
+        for (kind, number) in NEW_KINDS {
+            assert_eq!(
+                serde_json::to_string(&kind).expect("serializes"),
+                number.to_string()
+            );
+        }
         assert!(serde_json::from_str::<RawEventKind>("2").is_err());
         assert!(serde_json::from_str::<RawEventKind>("\"ProcessCreate\"").is_err());
+    }
+
+    #[test]
+    fn every_body_round_trips_through_json() {
+        for body in bodies_with_and_without_endpoint() {
+            let json = serde_json::to_string(&body).expect("serializes");
+            let decoded: RawEventBody = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(decoded, body);
+        }
     }
 
     /// Checks one direction only: every kind here exists in giganto-client
@@ -1369,7 +1802,7 @@ pub(super) mod tests {
     #[test]
     fn kinds_exist_in_giganto_client_with_same_number_and_name() {
         let kinds = scanned_kinds();
-        assert_eq!(kinds.len(), 36);
+        assert_eq!(kinds.len(), 44);
         for kind in kinds {
             let number = u32::from(kind);
             let giganto = giganto_client::RawEventKind::try_from(number)
@@ -1395,6 +1828,110 @@ pub(super) mod tests {
 
     fn s(value: &str) -> String {
         value.to_string()
+    }
+
+    /// Returns a fully populated host header, every `Option` `Some`, told
+    /// apart from the others by `seed`, which is also the last byte of its
+    /// `endpoint_id`.
+    pub(in crate::types) fn endpoint_header(seed: u8) -> EndpointHeader {
+        EndpointHeader {
+            endpoint_id: Uuid::from_bytes([
+                0x0b, 0x1c, 0x2d, 0x3e, 0x4f, 0x50, 0x41, 0x72, 0x83, 0x94, 0xa5, 0xb6, 0xc7, 0xd8,
+                0xe9, seed,
+            ]),
+            stream: Uuid::from_bytes([
+                0xf0, 0xe9, 0xd8, 0xc7, 0xb6, 0xa5, 0x44, 0x93, 0x82, 0x71, 0x60, 0x5f, 0x4e, 0x3d,
+                0x2c, seed,
+            ]),
+            seq: u64::from(seed) << 40,
+            event_time: 1_700_000_000_000_000_000 + i64::from(seed),
+            collected_at: 1_700_000_000_500_000_000 + i64::from(seed),
+            clock_offset: Some(ClockOffset {
+                offset_ms: -15,
+                uncertainty_ms: 3,
+                measured_at: 1_699_999_999_000_000_000,
+            }),
+            hostname: format!("host-{seed}"),
+            ips: vec![v4(200), v6(201)],
+            default_route_ip: Some(v4(200)),
+            net_state_source: NetStateSource::Other(s("netlink")),
+            os_family: OsFamily::Other(s("freebsd")),
+            os_version: s("10.0.19045"),
+            collection_mode: CollectionMode::Other(s("forensic")),
+            process_key: Some(vec![0x00, 0xab, 0x0f, seed]),
+            schema: 3,
+        }
+    }
+
+    /// Returns `body` with its host header removed: a Sysmon body's
+    /// `endpoint` (and `ProcessCreate`'s `logon_id_full`) set to `None`, as
+    /// in a record from a producer other than an endpoint. Any other body is
+    /// returned unchanged, since it has no header or requires one.
+    pub(in crate::types) fn without_endpoint(mut body: RawEventBody) -> RawEventBody {
+        match &mut body {
+            RawEventBody::ProcessCreate(body) => {
+                body.endpoint = None;
+                body.logon_id_full = None;
+            }
+            RawEventBody::FileCreateTime(body) => body.endpoint = None,
+            RawEventBody::NetworkConnect(body) => body.endpoint = None,
+            RawEventBody::ProcessTerminate(body) => body.endpoint = None,
+            RawEventBody::ImageLoad(body) => body.endpoint = None,
+            RawEventBody::FileCreate(body) => body.endpoint = None,
+            RawEventBody::RegistryValueSet(body) => body.endpoint = None,
+            RawEventBody::RegistryKeyRename(body) => body.endpoint = None,
+            RawEventBody::FileCreateStreamHash(body) => body.endpoint = None,
+            RawEventBody::PipeEvent(body) => body.endpoint = None,
+            RawEventBody::DnsQuery(body) => body.endpoint = None,
+            RawEventBody::FileDelete(body) => body.endpoint = None,
+            RawEventBody::ProcessTamper(body) => body.endpoint = None,
+            RawEventBody::FileDeleteDetected(body) => body.endpoint = None,
+            RawEventBody::DriverLoad(body) => body.endpoint = None,
+            RawEventBody::CreateRemoteThread(body) => body.endpoint = None,
+            RawEventBody::RawAccessRead(body) => body.endpoint = None,
+            RawEventBody::ProcessAccess(body) => body.endpoint = None,
+            RawEventBody::RegistryObjectAddDel(body) => body.endpoint = None,
+            RawEventBody::Conn(_)
+            | RawEventBody::Dns(_)
+            | RawEventBody::Http(_)
+            | RawEventBody::Rdp(_)
+            | RawEventBody::Smtp(_)
+            | RawEventBody::Ntlm(_)
+            | RawEventBody::Kerberos(_)
+            | RawEventBody::Ssh(_)
+            | RawEventBody::DceRpc(_)
+            | RawEventBody::Ftp(_)
+            | RawEventBody::Mqtt(_)
+            | RawEventBody::Ldap(_)
+            | RawEventBody::Tls(_)
+            | RawEventBody::Smb(_)
+            | RawEventBody::Nfs(_)
+            | RawEventBody::Bootp(_)
+            | RawEventBody::Dhcp(_)
+            | RawEventBody::Radius(_)
+            | RawEventBody::MalformedDns(_)
+            | RawEventBody::Icmp(_)
+            | RawEventBody::Netflow5(_)
+            | RawEventBody::Netflow9(_)
+            | RawEventBody::WindowsEventLog(_)
+            | RawEventBody::Journald(_)
+            | RawEventBody::Auditd(_) => {}
+        }
+        body
+    }
+
+    /// Returns [`bodies`] followed by every body that [`without_endpoint`]
+    /// changes, so that each Sysmon kind appears with its header `Some` and
+    /// `None`.
+    pub(in crate::types) fn bodies_with_and_without_endpoint() -> Vec<RawEventBody> {
+        let bodies = bodies();
+        let stripped: Vec<_> = bodies
+            .iter()
+            .cloned()
+            .map(without_endpoint)
+            .filter(|body| !bodies.contains(body))
+            .collect();
+        bodies.into_iter().chain(stripped).collect()
     }
 
     #[allow(clippy::too_many_lines)] // One synthetic body per kind.
@@ -1910,7 +2447,8 @@ pub(super) mod tests {
                 current_directory: s("C:\\"),
                 user: s("user"),
                 logon_guid: s("logon-guid"),
-                logon_id: 1002,
+                // The full logon ID does not fit in `u32`.
+                logon_id: u32::MAX,
                 terminal_session_id: 1,
                 integrity_level: s("High"),
                 hashes: strings("hash"),
@@ -1919,6 +2457,8 @@ pub(super) mod tests {
                 parent_image: s("C:\\parent.exe"),
                 parent_command_line: s(PARENT_COMMAND_LINE),
                 parent_user: s("parent-user"),
+                endpoint: Some(endpoint_header(1)),
+                logon_id_full: Some(0x0000_0001_0000_03ea),
             }),
             RawEventBody::FileCreateTime(FileCreateTime {
                 agent_name: s("agent"),
@@ -1930,6 +2470,7 @@ pub(super) mod tests {
                 creation_utc_time: 124,
                 previous_creation_utc_time: 125,
                 user: s("user"),
+                endpoint: Some(endpoint_header(2)),
             }),
             RawEventBody::NetworkConnect(NetworkConnect {
                 agent_name: s("agent"),
@@ -1950,6 +2491,7 @@ pub(super) mod tests {
                 destination_hostname: s("dst"),
                 destination_port: 443,
                 destination_port_name: s("https"),
+                endpoint: Some(endpoint_header(3)),
             }),
             RawEventBody::ProcessTerminate(ProcessTerminate {
                 agent_name: s("agent"),
@@ -1958,6 +2500,7 @@ pub(super) mod tests {
                 process_id: 1006,
                 image: s("C:\\d.exe"),
                 user: s("user"),
+                endpoint: Some(endpoint_header(4)),
             }),
             RawEventBody::ImageLoad(ImageLoad {
                 agent_name: s("agent"),
@@ -1976,6 +2519,7 @@ pub(super) mod tests {
                 signature: s("signer"),
                 signature_status: s("Valid"),
                 user: s("user"),
+                endpoint: Some(endpoint_header(5)),
             }),
             RawEventBody::FileCreate(FileCreate {
                 agent_name: s("agent"),
@@ -1986,6 +2530,7 @@ pub(super) mod tests {
                 target_filename: s("C:\\f.txt"),
                 creation_utc_time: 126,
                 user: s("user"),
+                endpoint: Some(endpoint_header(6)),
             }),
             RawEventBody::RegistryValueSet(RegistryValueSet {
                 agent_name: s("agent"),
@@ -1999,6 +2544,7 @@ pub(super) mod tests {
                 ),
                 details: s(REGISTRY_DETAILS),
                 user: s("user"),
+                endpoint: Some(endpoint_header(7)),
             }),
             RawEventBody::RegistryKeyRename(RegistryKeyRename {
                 agent_name: s("agent"),
@@ -2010,6 +2556,7 @@ pub(super) mod tests {
                 target_object: s("HKLM\\Old"),
                 new_name: s("HKLM\\New"),
                 user: s("user"),
+                endpoint: Some(endpoint_header(8)),
             }),
             RawEventBody::FileCreateStreamHash(FileCreateStreamHash {
                 agent_name: s("agent"),
@@ -2022,6 +2569,7 @@ pub(super) mod tests {
                 hash: strings("hash"),
                 contents: s(STREAM_CONTENTS),
                 user: s("user"),
+                endpoint: Some(endpoint_header(9)),
             }),
             RawEventBody::PipeEvent(PipeEvent {
                 agent_name: s("agent"),
@@ -2032,6 +2580,7 @@ pub(super) mod tests {
                 pipe_name: s("\\pipe"),
                 image: s("C:\\j.exe"),
                 user: s("user"),
+                endpoint: Some(endpoint_header(10)),
             }),
             RawEventBody::DnsQuery(DnsQuery {
                 agent_name: s("agent"),
@@ -2043,6 +2592,7 @@ pub(super) mod tests {
                 query_results: strings("result"),
                 image: s("C:\\k.exe"),
                 user: s("user"),
+                endpoint: Some(endpoint_header(11)),
             }),
             RawEventBody::FileDelete(FileDelete {
                 agent_name: s("agent"),
@@ -2055,6 +2605,7 @@ pub(super) mod tests {
                 hashes: strings("hash"),
                 is_executable: true,
                 archived: true,
+                endpoint: Some(endpoint_header(12)),
             }),
             RawEventBody::ProcessTamper(ProcessTamper {
                 agent_name: s("agent"),
@@ -2064,6 +2615,7 @@ pub(super) mod tests {
                 image: s("C:\\m.exe"),
                 tamper_type: s("Image is replaced"),
                 user: s("user"),
+                endpoint: Some(endpoint_header(13)),
             }),
             RawEventBody::FileDeleteDetected(FileDeleteDetected {
                 agent_name: s("agent"),
@@ -2075,6 +2627,7 @@ pub(super) mod tests {
                 target_filename: s("C:\\n.txt"),
                 hashes: strings("hash"),
                 is_executable: true,
+                endpoint: Some(endpoint_header(14)),
             }),
             RawEventBody::Netflow5(Netflow5 {
                 src_addr: v4(62),
@@ -2112,6 +2665,128 @@ pub(super) mod tests {
                 proto: 17,
                 contents: s("contents"),
             }),
+            RawEventBody::DriverLoad(DriverLoad {
+                agent_name: s("agent"),
+                agent_id: s("agent-15"),
+                image_loaded: s("C:\\Windows\\System32\\drivers\\o.sys"),
+                hashes: strings("hash"),
+                signed: true,
+                signature: s("signer"),
+                signature_status: s("Valid"),
+                endpoint: Some(endpoint_header(15)),
+            }),
+            RawEventBody::CreateRemoteThread(CreateRemoteThread {
+                agent_name: s("agent"),
+                agent_id: s("agent-16"),
+                source_process_guid: s("source-guid"),
+                source_process_id: 1017,
+                source_image: s("C:\\p.exe"),
+                target_process_guid: s("target-guid"),
+                target_process_id: 1018,
+                target_image: s("C:\\q.exe"),
+                new_thread_id: 1019,
+                start_address: s("0x7FF600001000"),
+                start_module: s("C:\\q.dll"),
+                start_function: s("start"),
+                source_user: s("source-user"),
+                target_user: s("target-user"),
+                endpoint: Some(endpoint_header(16)),
+            }),
+            RawEventBody::RawAccessRead(RawAccessRead {
+                agent_name: s("agent"),
+                agent_id: s("agent-17"),
+                process_guid: s("guid"),
+                process_id: 1020,
+                image: s("C:\\r.exe"),
+                device: s("\\Device\\HarddiskVolume1"),
+                user: s("user"),
+                endpoint: Some(endpoint_header(17)),
+            }),
+            RawEventBody::ProcessAccess(ProcessAccess {
+                agent_name: s("agent"),
+                agent_id: s("agent-18"),
+                source_process_guid: s("source-guid"),
+                source_process_id: 1021,
+                source_thread_id: 1022,
+                source_image: s("C:\\s.exe"),
+                target_process_guid: s("target-guid"),
+                target_process_id: 1023,
+                target_image: s("C:\\Windows\\System32\\lsass.exe"),
+                granted_access: 0x1010,
+                call_trace: s("C:\\Windows\\SYSTEM32\\ntdll.dll+9d4c4"),
+                source_user: s("source-user"),
+                target_user: s("target-user"),
+                endpoint: Some(endpoint_header(18)),
+            }),
+            RawEventBody::RegistryObjectAddDel(RegistryObjectAddDel {
+                agent_name: s("agent"),
+                agent_id: s("agent-19"),
+                event_type: s("CreateKey"),
+                process_guid: s("guid"),
+                process_id: 1024,
+                image: s("C:\\t.exe"),
+                target_object: s("HKLM\\Added"),
+                user: s("user"),
+                endpoint: Some(endpoint_header(19)),
+            }),
+            RawEventBody::WindowsEventLog(WindowsEventLog {
+                channel: Some(s("Security")),
+                provider: Some(s("Microsoft-Windows-Security-Auditing")),
+                event_id: Some(4625),
+                version: Some(0),
+                level: Some(0),
+                task: Some(12544),
+                opcode: Some(0),
+                keywords: Some(0x8010_0000_0000_0000),
+                record_id: Some(u64::MAX),
+                computer: Some(s("host-20")),
+                user_sid: Some(s("S-1-5-18")),
+                event_data: Some(vec![
+                    EventData {
+                        name: Some(s("TargetUserName")),
+                        value: s(EVENT_DATA_VALUE),
+                    },
+                    EventData {
+                        name: None,
+                        value: s(UNNAMED_EVENT_DATA_VALUE),
+                    },
+                ]),
+                user_data_xml: Some(s(USER_DATA_XML)),
+                endpoint: endpoint_header(20),
+            }),
+            RawEventBody::Journald(Journald {
+                fields: Some(vec![
+                    LogField {
+                        name: s("MESSAGE"),
+                        value: LogValue::Text(s(JOURNALD_TEXT)),
+                    },
+                    LogField {
+                        name: s("_CMDLINE"),
+                        value: LogValue::Bytes(JOURNALD_BYTES.to_vec()),
+                    },
+                ]),
+                endpoint: endpoint_header(21),
+            }),
+            RawEventBody::Auditd(Auditd {
+                serial: Some(1025),
+                records: Some(vec![
+                    AuditRecord {
+                        record_type: s("EXECVE"),
+                        fields: vec![LogField {
+                            name: s("a1"),
+                            value: LogValue::Text(s(AUDITD_TEXT)),
+                        }],
+                    },
+                    AuditRecord {
+                        record_type: s("PROCTITLE"),
+                        fields: vec![LogField {
+                            name: s("proctitle"),
+                            value: LogValue::Bytes(AUDITD_BYTES.to_vec()),
+                        }],
+                    },
+                ]),
+                endpoint: endpoint_header(22),
+            }),
         ]
     }
 
@@ -2132,8 +2807,15 @@ pub(super) mod tests {
             format!("{PROCESS_COMMAND_LINE:?}"),
             format!("{PARENT_COMMAND_LINE:?}"),
             format!("{STREAM_CONTENTS:?}"),
+            format!("{EVENT_DATA_VALUE:?}"),
+            format!("{UNNAMED_EVENT_DATA_VALUE:?}"),
+            format!("{USER_DATA_XML:?}"),
+            format!("{JOURNALD_TEXT:?}"),
+            format!("{:?}", JOURNALD_BYTES.to_vec()),
+            format!("{AUDITD_TEXT:?}"),
+            format!("{:?}", AUDITD_BYTES.to_vec()),
         ];
-        for body in bodies() {
+        for body in bodies_with_and_without_endpoint() {
             let rendered = format!("{body:?}");
             for secret in &secrets {
                 assert!(!rendered.contains(secret.as_str()), "{rendered}");
@@ -2149,10 +2831,558 @@ pub(super) mod tests {
                 RawEventBody::FileCreateStreamHash(_) => {
                     (true, r#"target_filename: "C:\\i.txt:Zone.Identifier""#)
                 }
+                RawEventBody::WindowsEventLog(_) => (
+                    true,
+                    r#"event_data: Some([EventData { name: Some("TargetUserName"), value: "<redacted>" }, EventData { name: None, value: "<redacted>" }]), user_data_xml: "<redacted>""#,
+                ),
+                RawEventBody::Journald(_) => (
+                    true,
+                    r#"fields: Some([LogField { name: "MESSAGE", value: "<redacted>" }, LogField { name: "_CMDLINE", value: "<redacted>" }])"#,
+                ),
+                RawEventBody::Auditd(_) => (
+                    true,
+                    r#"records: Some([AuditRecord { record_type: "EXECVE", fields: [LogField { name: "a1", value: "<redacted>" }] }, AuditRecord { record_type: "PROCTITLE", fields: [LogField { name: "proctitle", value: "<redacted>" }] }])"#,
+                ),
                 _ => (false, ""),
             };
             assert_eq!(rendered.contains(REDACTED), has_credentials, "{rendered}");
             assert!(rendered.contains(kept), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn debug_redacts_log_values_and_keeps_names() {
+        let event_data = EventData {
+            name: Some(s("TargetUserName")),
+            value: s(EVENT_DATA_VALUE),
+        };
+        assert_eq!(
+            format!("{event_data:?}"),
+            r#"EventData { name: Some("TargetUserName"), value: "<redacted>" }"#
+        );
+        for (value, secret) in [
+            (
+                LogValue::Text(s(JOURNALD_TEXT)),
+                format!("{JOURNALD_TEXT:?}"),
+            ),
+            (
+                LogValue::Bytes(JOURNALD_BYTES.to_vec()),
+                format!("{:?}", JOURNALD_BYTES.to_vec()),
+            ),
+        ] {
+            let field = LogField {
+                name: s("MESSAGE"),
+                value,
+            };
+            for rendered in [format!("{field:?}"), format!("{field:#?}")] {
+                assert!(!rendered.contains(&secret), "{rendered}");
+                assert!(rendered.contains(REDACTED), "{rendered}");
+                assert!(rendered.contains(r#""MESSAGE""#), "{rendered}");
+            }
+        }
+        // `LogValue` itself is derived, and prints its value.
+        assert_eq!(
+            format!("{:?}", LogValue::Text(s("plain"))),
+            r#"Text("plain")"#
+        );
+    }
+
+    #[test]
+    fn debug_prints_endpoint_header_and_full_logon_id() {
+        let header = endpoint_header(1);
+        let header_debug = format!("{header:?}");
+        assert!(
+            header_debug.contains("endpoint_id: 0b1c2d3e-4f50-4172-8394-a5b6c7d8e901"),
+            "{header_debug}"
+        );
+        for body in bodies() {
+            let rendered = format!("{body:?}");
+            match &body {
+                RawEventBody::ProcessCreate(_) => {
+                    assert!(
+                        rendered.contains(&format!(
+                            "parent_user: \"parent-user\", endpoint: Some({header_debug}), \
+                             logon_id_full: Some(4294968298) }}"
+                        )),
+                        "{rendered}"
+                    );
+                }
+                RawEventBody::RegistryValueSet(_) | RawEventBody::FileCreateStreamHash(_) => {
+                    assert!(rendered.contains("endpoint: Some(EndpointHeader {"));
+                }
+                _ => {}
+            }
+        }
+        let RawEventBody::ProcessCreate(stripped) = without_endpoint(
+            bodies()
+                .into_iter()
+                .find(|body| matches!(body, RawEventBody::ProcessCreate(_)))
+                .expect("bodies() has a ProcessCreate body"),
+        ) else {
+            unreachable!("without_endpoint keeps the variant");
+        };
+        let rendered = format!("{stripped:?}");
+        assert!(
+            rendered.ends_with("endpoint: None, logon_id_full: None }"),
+            "{rendered}"
+        );
+    }
+}
+
+/// Maps giganto-client 0.31.0's host header, Sysmon and log structs to
+/// their copies here. Every conversion destructures without `..` and every
+/// enum match has no wildcard, so a field or variant giganto-client adds or
+/// renames fails to compile here. Kerberos and Dhcp are not mapped: their
+/// copies deliberately stay at giganto-client 0.29.2.
+#[cfg(test)]
+mod giganto_field_mapping {
+    use std::fmt::Debug;
+
+    use giganto_client::ingest::{endpoint as g_endpoint, log as g_log, sysmon as g_sysmon};
+    use serde::{Serialize, de::DeserializeOwned};
+
+    use super::super::RawEventBody;
+    use super::tests::{bodies, bodies_with_and_without_endpoint, endpoint_header};
+    use super::*;
+
+    fn header(value: g_endpoint::EndpointHeader) -> EndpointHeader {
+        let g_endpoint::EndpointHeader {
+            endpoint_id,
+            stream,
+            seq,
+            event_time,
+            collected_at,
+            clock_offset,
+            hostname,
+            ips,
+            default_route_ip,
+            net_state_source,
+            os_family,
+            os_version,
+            collection_mode,
+            process_key,
+            schema,
+        } = value;
+        EndpointHeader {
+            endpoint_id,
+            stream,
+            seq,
+            event_time,
+            collected_at,
+            clock_offset: clock_offset.map(clock),
+            hostname,
+            ips,
+            default_route_ip,
+            net_state_source: net_state(net_state_source),
+            os_family: os(os_family),
+            os_version,
+            collection_mode: mode(collection_mode),
+            process_key,
+            schema,
+        }
+    }
+
+    // Takes its value like every other conversion here, so that it fits
+    // `assert_maps`'s `fn(G) -> T`; its fields are all `Copy`.
+    #[allow(clippy::needless_pass_by_value)]
+    fn clock(value: g_endpoint::ClockOffset) -> ClockOffset {
+        let g_endpoint::ClockOffset {
+            offset_ms,
+            uncertainty_ms,
+            measured_at,
+        } = value;
+        ClockOffset {
+            offset_ms,
+            uncertainty_ms,
+            measured_at,
+        }
+    }
+
+    fn net_state(value: g_endpoint::NetStateSource) -> NetStateSource {
+        match value {
+            g_endpoint::NetStateSource::Observed => NetStateSource::Observed,
+            g_endpoint::NetStateSource::Inferred => NetStateSource::Inferred,
+            g_endpoint::NetStateSource::Unknown => NetStateSource::Unknown,
+            g_endpoint::NetStateSource::Other(other) => NetStateSource::Other(other),
+        }
+    }
+
+    fn os(value: g_endpoint::OsFamily) -> OsFamily {
+        match value {
+            g_endpoint::OsFamily::Windows => OsFamily::Windows,
+            g_endpoint::OsFamily::Linux => OsFamily::Linux,
+            g_endpoint::OsFamily::Macos => OsFamily::Macos,
+            g_endpoint::OsFamily::Other(other) => OsFamily::Other(other),
+        }
+    }
+
+    fn mode(value: g_endpoint::CollectionMode) -> CollectionMode {
+        match value {
+            g_endpoint::CollectionMode::Extended => CollectionMode::Extended,
+            g_endpoint::CollectionMode::Essential => CollectionMode::Essential,
+            g_endpoint::CollectionMode::Other(other) => CollectionMode::Other(other),
+        }
+    }
+
+    /// Defines `$name`, converting giganto-client's Sysmon struct `$from` to
+    /// its copy `$to`: the listed fields move as they are, `endpoint`
+    /// through [`header`], and the optional trailing fields after it move as
+    /// they are.
+    macro_rules! sysmon {
+        ($name:ident: $from:path => $to:ident {
+            $($field:ident,)*
+        } $(then { $($trailing:ident,)* })?) => {
+            fn $name(value: $from) -> $to {
+                let $from {
+                    $($field,)*
+                    endpoint,
+                    $($($trailing,)*)?
+                } = value;
+                $to {
+                    $($field,)*
+                    endpoint: endpoint.map(header),
+                    $($($trailing,)*)?
+                }
+            }
+        };
+    }
+
+    sysmon!(process_create: g_sysmon::ProcessCreate => ProcessCreate {
+        agent_name, agent_id, process_guid, process_id, image, file_version, description,
+        product, company, original_file_name, command_line, current_directory, user,
+        logon_guid, logon_id, terminal_session_id, integrity_level, hashes,
+        parent_process_guid, parent_process_id, parent_image, parent_command_line,
+        parent_user,
+    } then { logon_id_full, });
+    sysmon!(file_create_time: g_sysmon::FileCreationTimeChanged => FileCreateTime {
+        agent_name, agent_id, process_guid, process_id, image, target_filename,
+        creation_utc_time, previous_creation_utc_time, user,
+    });
+    sysmon!(network_connect: g_sysmon::NetworkConnection => NetworkConnect {
+        agent_name, agent_id, process_guid, process_id, image, user, protocol, initiated,
+        source_is_ipv6, source_ip, source_hostname, source_port, source_port_name,
+        destination_is_ipv6, destination_ip, destination_hostname, destination_port,
+        destination_port_name,
+    });
+    sysmon!(process_terminate: g_sysmon::ProcessTerminated => ProcessTerminate {
+        agent_name, agent_id, process_guid, process_id, image, user,
+    });
+    sysmon!(image_load: g_sysmon::ImageLoaded => ImageLoad {
+        agent_name, agent_id, process_guid, process_id, image, image_loaded, file_version,
+        description, product, company, original_file_name, hashes, signed, signature,
+        signature_status, user,
+    });
+    sysmon!(file_create: g_sysmon::FileCreate => FileCreate {
+        agent_name, agent_id, process_guid, process_id, image, target_filename,
+        creation_utc_time, user,
+    });
+    sysmon!(registry_value_set: g_sysmon::RegistryValueSet => RegistryValueSet {
+        agent_name, agent_id, event_type, process_guid, process_id, image, target_object,
+        details, user,
+    });
+    sysmon!(registry_key_rename: g_sysmon::RegistryKeyValueRename => RegistryKeyRename {
+        agent_name, agent_id, event_type, process_guid, process_id, image, target_object,
+        new_name, user,
+    });
+    sysmon!(file_create_stream_hash: g_sysmon::FileCreateStreamHash => FileCreateStreamHash {
+        agent_name, agent_id, process_guid, process_id, image, target_filename,
+        creation_utc_time, hash, contents, user,
+    });
+    sysmon!(pipe_event: g_sysmon::PipeEvent => PipeEvent {
+        agent_name, agent_id, event_type, process_guid, process_id, pipe_name, image, user,
+    });
+    sysmon!(dns_query: g_sysmon::DnsEvent => DnsQuery {
+        agent_name, agent_id, process_guid, process_id, query_name, query_status,
+        query_results, image, user,
+    });
+    sysmon!(file_delete: g_sysmon::FileDelete => FileDelete {
+        agent_name, agent_id, process_guid, process_id, user, image, target_filename, hashes,
+        is_executable, archived,
+    });
+    sysmon!(process_tamper: g_sysmon::ProcessTampering => ProcessTamper {
+        agent_name, agent_id, process_guid, process_id, image, tamper_type, user,
+    });
+    sysmon!(file_delete_detected: g_sysmon::FileDeleteDetected => FileDeleteDetected {
+        agent_name, agent_id, process_guid, process_id, user, image, target_filename, hashes,
+        is_executable,
+    });
+    sysmon!(driver_load: g_sysmon::DriverLoad => DriverLoad {
+        agent_name, agent_id, image_loaded, hashes, signed, signature, signature_status,
+    });
+    sysmon!(create_remote_thread: g_sysmon::CreateRemoteThread => CreateRemoteThread {
+        agent_name, agent_id, source_process_guid, source_process_id, source_image,
+        target_process_guid, target_process_id, target_image, new_thread_id, start_address,
+        start_module, start_function, source_user, target_user,
+    });
+    sysmon!(raw_access_read: g_sysmon::RawAccessRead => RawAccessRead {
+        agent_name, agent_id, process_guid, process_id, image, device, user,
+    });
+    sysmon!(process_access: g_sysmon::ProcessAccess => ProcessAccess {
+        agent_name, agent_id, source_process_guid, source_process_id, source_thread_id,
+        source_image, target_process_guid, target_process_id, target_image, granted_access,
+        call_trace, source_user, target_user,
+    });
+    sysmon!(registry_object_add_del: g_sysmon::RegistryObjectAddDel => RegistryObjectAddDel {
+        agent_name, agent_id, event_type, process_guid, process_id, image, target_object, user,
+    });
+
+    fn windows_event_log(value: g_log::WindowsEventLog) -> WindowsEventLog {
+        let g_log::WindowsEventLog {
+            channel,
+            provider,
+            event_id,
+            version,
+            level,
+            task,
+            opcode,
+            keywords,
+            record_id,
+            computer,
+            user_sid,
+            event_data: data,
+            user_data_xml,
+            endpoint,
+        } = value;
+        WindowsEventLog {
+            channel,
+            provider,
+            event_id,
+            version,
+            level,
+            task,
+            opcode,
+            keywords,
+            record_id,
+            computer,
+            user_sid,
+            event_data: data.map(|data| data.into_iter().map(event_data).collect()),
+            user_data_xml,
+            endpoint: header(endpoint),
+        }
+    }
+
+    fn event_data(value: g_log::EventData) -> EventData {
+        let g_log::EventData { name, value } = value;
+        EventData { name, value }
+    }
+
+    fn journald(value: g_log::Journald) -> Journald {
+        let g_log::Journald { fields, endpoint } = value;
+        Journald {
+            fields: fields.map(|fields| fields.into_iter().map(log_field).collect()),
+            endpoint: header(endpoint),
+        }
+    }
+
+    fn auditd(value: g_log::Auditd) -> Auditd {
+        let g_log::Auditd {
+            serial,
+            records,
+            endpoint,
+        } = value;
+        Auditd {
+            serial,
+            records: records.map(|records| records.into_iter().map(audit_record).collect()),
+            endpoint: header(endpoint),
+        }
+    }
+
+    fn audit_record(value: g_log::AuditRecord) -> AuditRecord {
+        let g_log::AuditRecord {
+            record_type,
+            fields,
+        } = value;
+        AuditRecord {
+            record_type,
+            fields: fields.into_iter().map(log_field).collect(),
+        }
+    }
+
+    fn log_field(value: g_log::LogField) -> LogField {
+        let g_log::LogField { name, value } = value;
+        LogField {
+            name,
+            value: log_value(value),
+        }
+    }
+
+    fn log_value(value: g_log::LogValue) -> LogValue {
+        match value {
+            g_log::LogValue::Text(text) => LogValue::Text(text),
+            g_log::LogValue::Bytes(bytes) => LogValue::Bytes(bytes),
+        }
+    }
+
+    /// Checks that `copy` maps from giganto-client's struct `G` field for
+    /// field: the giganto-client value read from `copy`'s JSON serializes to
+    /// the same JSON, so the two declare the same fields in the same order
+    /// with the same serialized values, and `convert` turns it back into
+    /// `copy`.
+    fn assert_maps<G, T>(copy: &T, convert: fn(G) -> T)
+    where
+        G: Serialize + DeserializeOwned,
+        T: Serialize + PartialEq + Debug,
+    {
+        let json = serde_json::to_string(copy).expect("serializes");
+        let giganto: G = serde_json::from_str(&json).expect("giganto-client reads the copy");
+        assert_eq!(
+            serde_json::to_string(&giganto).expect("serializes"),
+            json,
+            "{copy:?}"
+        );
+        assert_eq!(&convert(giganto), copy);
+    }
+
+    #[test]
+    fn host_header_maps_every_field_and_variant() {
+        let full = endpoint_header(7);
+        assert!(full.clock_offset.is_some());
+        assert!(full.default_route_ip.is_some());
+        assert!(full.process_key.is_some());
+        assert_maps(&full, header);
+        for clock_offset in [None, full.clock_offset.clone()] {
+            for default_route_ip in [None, full.default_route_ip] {
+                for process_key in [None, Some(Vec::new())] {
+                    assert_maps(
+                        &EndpointHeader {
+                            clock_offset: clock_offset.clone(),
+                            default_route_ip,
+                            process_key,
+                            ..endpoint_header(8)
+                        },
+                        header,
+                    );
+                }
+            }
+        }
+        assert_maps(full.clock_offset.as_ref().expect("Some"), clock);
+        for value in [
+            NetStateSource::Observed,
+            NetStateSource::Inferred,
+            NetStateSource::Unknown,
+            NetStateSource::Other("other".to_string()),
+        ] {
+            assert_maps(&value, net_state);
+        }
+        for value in [
+            OsFamily::Windows,
+            OsFamily::Linux,
+            OsFamily::Macos,
+            OsFamily::Other("other".to_string()),
+        ] {
+            assert_maps(&value, os);
+        }
+        for value in [
+            CollectionMode::Extended,
+            CollectionMode::Essential,
+            CollectionMode::Other("other".to_string()),
+        ] {
+            assert_maps(&value, mode);
+        }
+    }
+
+    #[test]
+    fn sysmon_and_log_bodies_map_every_field() {
+        let mut mapped = 0;
+        for body in bodies_with_and_without_endpoint() {
+            match &body {
+                RawEventBody::ProcessCreate(copy) => assert_maps(copy, process_create),
+                RawEventBody::FileCreateTime(copy) => assert_maps(copy, file_create_time),
+                RawEventBody::NetworkConnect(copy) => assert_maps(copy, network_connect),
+                RawEventBody::ProcessTerminate(copy) => assert_maps(copy, process_terminate),
+                RawEventBody::ImageLoad(copy) => assert_maps(copy, image_load),
+                RawEventBody::FileCreate(copy) => assert_maps(copy, file_create),
+                RawEventBody::RegistryValueSet(copy) => assert_maps(copy, registry_value_set),
+                RawEventBody::RegistryKeyRename(copy) => assert_maps(copy, registry_key_rename),
+                RawEventBody::FileCreateStreamHash(copy) => {
+                    assert_maps(copy, file_create_stream_hash);
+                }
+                RawEventBody::PipeEvent(copy) => assert_maps(copy, pipe_event),
+                RawEventBody::DnsQuery(copy) => assert_maps(copy, dns_query),
+                RawEventBody::FileDelete(copy) => assert_maps(copy, file_delete),
+                RawEventBody::ProcessTamper(copy) => assert_maps(copy, process_tamper),
+                RawEventBody::FileDeleteDetected(copy) => {
+                    assert_maps(copy, file_delete_detected);
+                }
+                RawEventBody::DriverLoad(copy) => assert_maps(copy, driver_load),
+                RawEventBody::CreateRemoteThread(copy) => assert_maps(copy, create_remote_thread),
+                RawEventBody::RawAccessRead(copy) => assert_maps(copy, raw_access_read),
+                RawEventBody::ProcessAccess(copy) => assert_maps(copy, process_access),
+                RawEventBody::RegistryObjectAddDel(copy) => {
+                    assert_maps(copy, registry_object_add_del);
+                }
+                RawEventBody::WindowsEventLog(copy) => assert_maps(copy, windows_event_log),
+                RawEventBody::Journald(copy) => assert_maps(copy, journald),
+                RawEventBody::Auditd(copy) => assert_maps(copy, auditd),
+                RawEventBody::Conn(_)
+                | RawEventBody::Dns(_)
+                | RawEventBody::Http(_)
+                | RawEventBody::Rdp(_)
+                | RawEventBody::Smtp(_)
+                | RawEventBody::Ntlm(_)
+                | RawEventBody::Kerberos(_)
+                | RawEventBody::Ssh(_)
+                | RawEventBody::DceRpc(_)
+                | RawEventBody::Ftp(_)
+                | RawEventBody::Mqtt(_)
+                | RawEventBody::Ldap(_)
+                | RawEventBody::Tls(_)
+                | RawEventBody::Smb(_)
+                | RawEventBody::Nfs(_)
+                | RawEventBody::Bootp(_)
+                | RawEventBody::Dhcp(_)
+                | RawEventBody::Radius(_)
+                | RawEventBody::MalformedDns(_)
+                | RawEventBody::Icmp(_)
+                | RawEventBody::Netflow5(_)
+                | RawEventBody::Netflow9(_) => continue,
+            }
+            mapped += 1;
+        }
+        // 19 Sysmon bodies with a header and without, and 3 log bodies.
+        assert_eq!(mapped, 19 * 2 + 3);
+    }
+
+    #[test]
+    fn log_bodies_map_with_absent_options() {
+        for body in bodies() {
+            match body {
+                RawEventBody::WindowsEventLog(copy) => assert_maps(
+                    &WindowsEventLog {
+                        channel: None,
+                        provider: None,
+                        event_id: None,
+                        version: None,
+                        level: None,
+                        task: None,
+                        opcode: None,
+                        keywords: None,
+                        record_id: None,
+                        computer: None,
+                        user_sid: None,
+                        event_data: None,
+                        user_data_xml: None,
+                        endpoint: copy.endpoint,
+                    },
+                    windows_event_log,
+                ),
+                RawEventBody::Journald(copy) => assert_maps(
+                    &Journald {
+                        fields: None,
+                        endpoint: copy.endpoint,
+                    },
+                    journald,
+                ),
+                RawEventBody::Auditd(copy) => assert_maps(
+                    &Auditd {
+                        serial: None,
+                        records: None,
+                        endpoint: copy.endpoint,
+                    },
+                    auditd,
+                ),
+                _ => {}
+            }
         }
     }
 }
@@ -2162,7 +3392,7 @@ mod bincode_tests {
     use serde::{Serialize, de::DeserializeOwned};
 
     use super::super::{RawEventBody, RawEventKind};
-    use super::tests::bodies;
+    use super::tests::{NEW_KINDS, bodies, bodies_with_and_without_endpoint};
 
     fn encode<T: Serialize>(value: &T) -> Vec<u8> {
         bincode::serde::encode_to_vec(value, bincode::config::standard())
@@ -2186,7 +3416,11 @@ mod bincode_tests {
     #[test]
     fn kind_serializes_as_number_in_bincode() {
         let kinds = all_kinds();
-        assert_eq!(kinds.len(), 36);
+        assert_eq!(kinds.len(), 44);
+        for (kind, number) in NEW_KINDS {
+            assert_eq!(encode(&kind), [number], "{kind:?}");
+            assert_eq!(decode::<RawEventKind>(&[number]), kind);
+        }
         for kind in kinds {
             let bytes = encode(&kind);
             assert_eq!(bytes, encode(&u32::from(kind)), "{kind:?}");
@@ -2247,6 +3481,14 @@ mod bincode_tests {
             RawEventBody::FileDeleteDetected(_) => RawEventKind::FileDeleteDetected,
             RawEventBody::Netflow5(_) => RawEventKind::Netflow5,
             RawEventBody::Netflow9(_) => RawEventKind::Netflow9,
+            RawEventBody::DriverLoad(_) => RawEventKind::DriverLoad,
+            RawEventBody::CreateRemoteThread(_) => RawEventKind::CreateRemoteThread,
+            RawEventBody::RawAccessRead(_) => RawEventKind::RawAccessRead,
+            RawEventBody::ProcessAccess(_) => RawEventKind::ProcessAccess,
+            RawEventBody::RegistryObjectAddDel(_) => RawEventKind::RegistryObjectAddDel,
+            RawEventBody::WindowsEventLog(_) => RawEventKind::WindowsEventLog,
+            RawEventBody::Journald(_) => RawEventKind::Journald,
+            RawEventBody::Auditd(_) => RawEventKind::Auditd,
         }
     }
 
@@ -2259,9 +3501,53 @@ mod bincode_tests {
         assert_eq!(covered, all_kinds(), "one body per kind");
         assert_eq!(bodies.len(), covered.len());
 
-        for body in bodies {
+        for body in bodies_with_and_without_endpoint() {
             let decoded: RawEventBody = decode(&encode(&body));
             assert_eq!(decoded, body);
+        }
+    }
+
+    #[test]
+    fn bodies_encode_their_declaration_index_and_new_ones_follow_netflow9() {
+        // `bodies()` lists the released variants in declaration order,
+        // ending with `Netflow9`, then the new ones in declaration order.
+        let bodies = bodies();
+        let netflow9 = bodies
+            .iter()
+            .position(|body| matches!(body, RawEventBody::Netflow9(_)))
+            .expect("bodies() has a Netflow9 body");
+        assert_eq!(netflow9, 35);
+        for (index, body) in bodies.iter().enumerate() {
+            let tag = u8::try_from(index).expect("fewer than 251 variants");
+            assert_eq!(encode(body).first(), Some(&tag), "{:?}", kind_of(body));
+        }
+        let appended: Vec<_> = bodies[netflow9 + 1..].iter().map(kind_of).collect();
+        assert_eq!(
+            appended,
+            NEW_KINDS.iter().map(|(kind, _)| *kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sysmon_header_is_a_trailing_option() {
+        for body in bodies() {
+            let stripped = super::tests::without_endpoint(body.clone());
+            if stripped == body {
+                continue;
+            }
+            let with = encode(&body);
+            let without = encode(&stripped);
+            if let RawEventBody::ProcessCreate(_) = body {
+                // `endpoint: None` then `logon_id_full: None`.
+                assert_eq!(without.last_chunk(), Some(&[0, 0]));
+                // `logon_id_full: Some(0x1_0000_03ea)`, a `u64` varint.
+                assert_eq!(
+                    with.last_chunk(),
+                    Some(&[1, 0xfd, 0xea, 0x03, 0, 0, 1, 0, 0, 0])
+                );
+            } else {
+                assert_eq!(without.last(), Some(&0));
+            }
         }
     }
 }

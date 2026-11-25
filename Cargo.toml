@@ -65,11 +65,13 @@ serde_repr = "0.1.19"
 structured = "0.18.0"
 thiserror = { version = "2", optional = true }
 tokio = { version = "1", features = ["sync"], optional = true }
+uuid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
-# Checks `types::RawEventKind` against the tag `types::raw_event` copies.
+# Checks `types::RawEventKind`, and the fields of the host header, Sysmon and
+# log copies in `types::raw_event`, against the tag those copies follow.
 # giganto-client is `publish = false`, so it is a git dependency.
-giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "0.29.2" }
+giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "0.31.0" }
 quinn = { version = "0.11", default-features = false, features = [
   "log",
   "platform-verifier",
