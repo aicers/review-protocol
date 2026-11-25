@@ -5,6 +5,16 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.0](https://github.com/aicers/review-protocol/compare/0.32.0...0.33.0) - 2026-11-25
+
+### Added
+
+- [**breaking**] add the endpoint host header, eight endpoint raw event kinds and the endpoint primary subject ([#375](https://github.com/aicers/review-protocol/pull/375))
+
+### Other
+
+- *(server)* add a standalone server example and integrated session guide ([#371](https://github.com/aicers/review-protocol/pull/371))
+
 ## [0.32.0](https://github.com/aicers/review-protocol/compare/0.31.0...0.32.0) - 2026-11-24
 
 ### Added
