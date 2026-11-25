@@ -5,7 +5,9 @@ use std::{fmt, net::IpAddr};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use uuid::Uuid;
 
+use super::raw_event::{EndpointHeader, NetStateSource};
 use super::{EventCategory, RawEventBody, RawEventKind};
 
 /// The maximum number of related IPs a [`Target::Subject`] carries.
@@ -136,6 +138,11 @@ pub struct DetectionEvent {
     #[serde(with = "jiff::fmt::serde::timestamp::nanosecond::required")]
     pub time: jiff::Timestamp,
     /// The sensor the detection's raw events came from, if one.
+    ///
+    /// For a [`PrimarySubject::Endpoint`] subject, or a [`Target::RawEvent`]
+    /// whose body has a host header, it is the endpoint id as a lowercase
+    /// hyphenated UUID string, whichever sensor the underlying raw events
+    /// were read from ([`validate`](Self::validate) rules 11 and 12).
     pub sensor: Option<String>,
     /// The model that made the detection.
     pub detection_model: DetectionModel,
@@ -204,6 +211,33 @@ pub enum PrimarySubject {
         /// The network's name.
         name: String,
         /// Whether the network causes or suffers the threat.
+        role: ThreatRole,
+    },
+    /// One endpoint, a host running Clumit Endpoint, that the detection is
+    /// about.
+    ///
+    /// The event's `sensor` must be the endpoint id, as a lowercase
+    /// hyphenated UUID string ([`DetectionEvent::validate`] rule 11).
+    ///
+    /// `ips`, `default_route_ip` and `net_state_source` are copied unchanged,
+    /// with no filtering or reordering, from the host header
+    /// ([`EndpointHeader`]) of the bundled raw event with the latest raw
+    /// event time, ties going to the one the engine received last. When no
+    /// bundled raw event has a header, the detection model's own
+    /// specification decides the values, and failing that they are an empty
+    /// list, `None` and [`NetStateSource::Unknown`].
+    Endpoint {
+        /// The endpoint's id, [`EndpointHeader::endpoint_id`].
+        endpoint_id: Uuid,
+        /// The endpoint's addresses, [`EndpointHeader::ips`]; not capped.
+        ips: Vec<IpAddr>,
+        /// The endpoint's default route address,
+        /// [`EndpointHeader::default_route_ip`].
+        default_route_ip: Option<IpAddr>,
+        /// How the endpoint's network state was obtained,
+        /// [`EndpointHeader::net_state_source`].
+        net_state_source: NetStateSource,
+        /// Whether the endpoint is the actor or the target of the threat.
         role: ThreatRole,
     },
 }
@@ -626,14 +660,41 @@ impl DetectionEvent {
     ///     most 3 entries; and `time_series_id` contains `/`, the part after
     ///     the first `/` parses as an [`IpAddr`], and that address equals the
     ///     host's `ip`. The part before `/` is not checked.
+    /// 11. For [`PrimarySubject::Endpoint`]: `sensor` is `Some` and equals
+    ///     `endpoint_id` as a lowercase hyphenated UUID string
+    ///     (`endpoint_id.to_string()`).
+    /// 12. For [`Target::RawEvent`] whose body has a host header (a Sysmon
+    ///     body whose `endpoint` is `Some`, or a [`WindowsEventLog`],
+    ///     [`Journald`] or [`Auditd`] body): `sensor` equals the header's
+    ///     `endpoint_id` as a lowercase hyphenated UUID string. A Sysmon body
+    ///     whose `endpoint` is `None` is not checked by this rule, and a
+    ///     Sysmon body's `agent_id` is never compared.
+    ///
+    /// Rules 11 and 12 compare strings exactly: an uppercase or unhyphenated
+    /// form of the same UUID breaks them.
+    ///
+    /// Rule 13 is not checked here either; like rules 8 and 9 it is a check
+    /// the receiver makes against its own state:
+    ///
+    /// 13. The receiver accepts an event with a [`PrimarySubject::Endpoint`]
+    ///     subject only when the endpoint is registered, its customer is the
+    ///     sending engine node's current customer, and that customer has no
+    ///     customer data deletion job.
     ///
     /// It accepts [`PrimarySubject::Network`] and [`PrimarySubject::Cluster`]
     /// subjects: whether to take those depends on the connection and request,
-    /// which the receiver checks.
+    /// which the receiver checks. A [`PrimarySubject::Endpoint`] subject falls
+    /// under none of rules 3, 8 and 9; rules 4 to 6 apply to it as to every
+    /// subject.
+    ///
+    /// [`WindowsEventLog`]: super::raw_event::WindowsEventLog
+    /// [`Journald`]: super::raw_event::Journald
+    /// [`Auditd`]: super::raw_event::Auditd
     ///
     /// # Errors
     ///
-    /// Returns the first rule, in the order above, that the event breaks.
+    /// Returns the first rule, in the order 1 to 7, 10, 11, 12, that the
+    /// event breaks.
     pub fn validate(&self) -> Result<(), DetectionEventError> {
         let detail = self.detail.detection_model();
         if detail != self.detection_model {
@@ -690,8 +751,41 @@ impl DetectionEvent {
         if let Detail::WindowOutlier(detail) = &self.detail {
             validate_window_outlier(&self.target, detail)?;
         }
+        if let Target::Subject {
+            primary: PrimarySubject::Endpoint { endpoint_id, .. },
+            ..
+        } = &self.target
+            && !self
+                .sensor
+                .as_deref()
+                .is_some_and(|sensor| names_endpoint(sensor, endpoint_id))
+        {
+            return Err(DetectionEventError::EndpointSensorMismatch {
+                endpoint_id: *endpoint_id,
+                sensor: self.sensor.clone(),
+            });
+        }
+        if let Target::RawEvent { body, .. } = &self.target
+            && let Some(header) = raw_event_body_endpoint(body)
+            && let Some(sensor) = &self.sensor
+            && !names_endpoint(sensor, &header.endpoint_id)
+        {
+            return Err(DetectionEventError::RawEventEndpointSensorMismatch {
+                endpoint_id: header.endpoint_id,
+                sensor: sensor.clone(),
+            });
+        }
         Ok(())
     }
+}
+
+/// Returns whether `sensor` is `endpoint_id` as a lowercase hyphenated UUID
+/// string, the form rules 11 and 12 of [`DetectionEvent::validate`] require.
+fn names_endpoint(sensor: &str, endpoint_id: &Uuid) -> bool {
+    sensor
+        == endpoint_id
+            .hyphenated()
+            .encode_lower(&mut Uuid::encode_buffer())
 }
 
 /// Checks rule 10 of [`DetectionEvent::validate`] for a
@@ -778,6 +872,66 @@ fn raw_event_body_kind(body: &RawEventBody) -> RawEventKind {
         RawEventBody::FileDeleteDetected(_) => RawEventKind::FileDeleteDetected,
         RawEventBody::Netflow5(_) => RawEventKind::Netflow5,
         RawEventBody::Netflow9(_) => RawEventKind::Netflow9,
+        RawEventBody::DriverLoad(_) => RawEventKind::DriverLoad,
+        RawEventBody::CreateRemoteThread(_) => RawEventKind::CreateRemoteThread,
+        RawEventBody::RawAccessRead(_) => RawEventKind::RawAccessRead,
+        RawEventBody::ProcessAccess(_) => RawEventKind::ProcessAccess,
+        RawEventBody::RegistryObjectAddDel(_) => RawEventKind::RegistryObjectAddDel,
+        RawEventBody::WindowsEventLog(_) => RawEventKind::WindowsEventLog,
+        RawEventBody::Journald(_) => RawEventKind::Journald,
+        RawEventBody::Auditd(_) => RawEventKind::Auditd,
+    }
+}
+
+/// Returns the host header of a raw event body: the `endpoint` of a Sysmon
+/// body when it is `Some`, and that of a log body always. The match has no
+/// wildcard, so a variant added to `RawEventBody` must be handled here.
+fn raw_event_body_endpoint(body: &RawEventBody) -> Option<&EndpointHeader> {
+    match body {
+        RawEventBody::Conn(_)
+        | RawEventBody::Dns(_)
+        | RawEventBody::Http(_)
+        | RawEventBody::Rdp(_)
+        | RawEventBody::Smtp(_)
+        | RawEventBody::Ntlm(_)
+        | RawEventBody::Kerberos(_)
+        | RawEventBody::Ssh(_)
+        | RawEventBody::DceRpc(_)
+        | RawEventBody::Ftp(_)
+        | RawEventBody::Mqtt(_)
+        | RawEventBody::Ldap(_)
+        | RawEventBody::Tls(_)
+        | RawEventBody::Smb(_)
+        | RawEventBody::Nfs(_)
+        | RawEventBody::Bootp(_)
+        | RawEventBody::Dhcp(_)
+        | RawEventBody::Radius(_)
+        | RawEventBody::MalformedDns(_)
+        | RawEventBody::Icmp(_)
+        | RawEventBody::Netflow5(_)
+        | RawEventBody::Netflow9(_) => None,
+        RawEventBody::ProcessCreate(body) => body.endpoint.as_ref(),
+        RawEventBody::FileCreateTime(body) => body.endpoint.as_ref(),
+        RawEventBody::NetworkConnect(body) => body.endpoint.as_ref(),
+        RawEventBody::ProcessTerminate(body) => body.endpoint.as_ref(),
+        RawEventBody::ImageLoad(body) => body.endpoint.as_ref(),
+        RawEventBody::FileCreate(body) => body.endpoint.as_ref(),
+        RawEventBody::RegistryValueSet(body) => body.endpoint.as_ref(),
+        RawEventBody::RegistryKeyRename(body) => body.endpoint.as_ref(),
+        RawEventBody::FileCreateStreamHash(body) => body.endpoint.as_ref(),
+        RawEventBody::PipeEvent(body) => body.endpoint.as_ref(),
+        RawEventBody::DnsQuery(body) => body.endpoint.as_ref(),
+        RawEventBody::FileDelete(body) => body.endpoint.as_ref(),
+        RawEventBody::ProcessTamper(body) => body.endpoint.as_ref(),
+        RawEventBody::FileDeleteDetected(body) => body.endpoint.as_ref(),
+        RawEventBody::DriverLoad(body) => body.endpoint.as_ref(),
+        RawEventBody::CreateRemoteThread(body) => body.endpoint.as_ref(),
+        RawEventBody::RawAccessRead(body) => body.endpoint.as_ref(),
+        RawEventBody::ProcessAccess(body) => body.endpoint.as_ref(),
+        RawEventBody::RegistryObjectAddDel(body) => body.endpoint.as_ref(),
+        RawEventBody::WindowsEventLog(body) => Some(&body.endpoint),
+        RawEventBody::Journald(body) => Some(&body.endpoint),
+        RawEventBody::Auditd(body) => Some(&body.endpoint),
     }
 }
 
@@ -835,6 +989,23 @@ pub enum DetectionEventError {
     /// Rule 10: a [`Detail::WindowOutlier`] event breaks a requirement of
     /// that detail.
     InvalidWindowOutlier(WindowOutlierViolation),
+    /// Rule 11: a [`PrimarySubject::Endpoint`] event's `sensor` is not the
+    /// endpoint id as a lowercase hyphenated UUID string.
+    EndpointSensorMismatch {
+        /// The primary subject's `endpoint_id`.
+        endpoint_id: Uuid,
+        /// The event's `sensor`.
+        sensor: Option<String>,
+    },
+    /// Rule 12: a [`Target::RawEvent`] event whose body has a host header
+    /// has a `sensor` that is not the header's endpoint id as a lowercase
+    /// hyphenated UUID string.
+    RawEventEndpointSensorMismatch {
+        /// The header's `endpoint_id`.
+        endpoint_id: Uuid,
+        /// The event's `sensor`.
+        sensor: String,
+    },
 }
 
 /// The requirement of rule 10 of [`DetectionEvent::validate`] that a
@@ -892,10 +1063,10 @@ impl fmt::Display for WindowOutlierViolation {
 
 impl DetectionEventError {
     /// Returns the number of the rule of [`DetectionEvent::validate`] that
-    /// failed: 1 to 7, or 10.
+    /// failed: 1 to 7, 10, 11 or 12.
     ///
-    /// Numbers 8 and 9 are never returned: they name the checks `REview` makes
-    /// on receipt, which `validate` does not make.
+    /// Numbers 8, 9 and 13 are never returned: they name the checks the
+    /// receiver makes on receipt, which `validate` does not make.
     #[must_use]
     pub fn rule(&self) -> u8 {
         match self {
@@ -907,6 +1078,8 @@ impl DetectionEventError {
             Self::NonFiniteScore { .. } => 6,
             Self::RawEventTimeMismatch { .. } => 7,
             Self::InvalidWindowOutlier(_) => 10,
+            Self::EndpointSensorMismatch { .. } => 11,
+            Self::RawEventEndpointSensorMismatch { .. } => 12,
         }
     }
 }
@@ -949,6 +1122,20 @@ impl fmt::Display for DetectionEventError {
                 "time {time} differs from the raw event's time {raw_event_time}"
             ),
             Self::InvalidWindowOutlier(violation) => violation.fmt(f),
+            Self::EndpointSensorMismatch {
+                endpoint_id,
+                sensor,
+            } => write!(
+                f,
+                "the endpoint primary subject {endpoint_id} is not the sensor {sensor:?}"
+            ),
+            Self::RawEventEndpointSensorMismatch {
+                endpoint_id,
+                sensor,
+            } => write!(
+                f,
+                "the raw event's endpoint header {endpoint_id} is not the sensor {sensor}"
+            ),
         }
     }
 }
@@ -1280,6 +1467,58 @@ mod tests {
         event
     }
 
+    /// The id of [`endpoint`]'s endpoint.
+    const ENDPOINT_ID: &str = "6f1d7a52-93c4-4b8e-a0f5-2c7e9b41d308";
+
+    pub(super) fn endpoint() -> PrimarySubject {
+        PrimarySubject::Endpoint {
+            endpoint_id: ENDPOINT_ID.parse().expect("the test UUID parses"),
+            ips: vec![
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 30)),
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x30)),
+            ],
+            default_route_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 30))),
+            net_state_source: NetStateSource::Observed,
+            role: ThreatRole::Actor,
+        }
+    }
+
+    /// A valid event about [`endpoint`], whose `sensor` is the endpoint id.
+    fn endpoint_event() -> DetectionEvent {
+        let mut event = subject(endpoint());
+        event.sensor = Some(ENDPOINT_ID.to_string());
+        event
+    }
+
+    /// The forms of [`ENDPOINT_ID`] other than its lowercase hyphenated one,
+    /// and other values, that rules 11 and 12 reject.
+    fn not_endpoint_ids(endpoint_id: &str) -> Vec<String> {
+        vec![
+            endpoint_id.to_uppercase(),
+            endpoint_id.replace('-', ""),
+            format!("{{{endpoint_id}}}"),
+            format!("urn:uuid:{endpoint_id}"),
+            "00000000-0000-4000-8000-000000000000".to_string(),
+            "sensor-1".to_string(),
+            String::new(),
+        ]
+    }
+
+    /// Returns a valid raw event detection event carrying `body`, whose
+    /// `sensor` is the body's endpoint id when it has a host header.
+    fn raw_event_with(body: RawEventBody) -> DetectionEvent {
+        let mut event = raw_event_target();
+        event.raw_event_kind = raw_event_body_kind(&body);
+        if let Some(header) = raw_event_body_endpoint(&body) {
+            event.sensor = Some(header.endpoint_id.to_string());
+        }
+        event.target = Target::RawEvent {
+            time: event.time,
+            body,
+        };
+        event
+    }
+
     fn window_of(event: &mut DetectionEvent) -> &mut TimeWindow {
         match &mut event.target {
             Target::Subject { window, .. } => window,
@@ -1379,6 +1618,7 @@ mod tests {
         })
         .validate()
         .expect("network subject");
+        endpoint_event().validate().expect("endpoint subject");
     }
 
     #[test]
@@ -1565,6 +1805,9 @@ mod tests {
 
             let mut event = raw_event_target();
             event.raw_event_kind = kind;
+            if let Some(header) = raw_event_body_endpoint(&body) {
+                event.sensor = Some(header.endpoint_id.to_string());
+            }
             event.target = Target::RawEvent {
                 time: event.time,
                 body: body.clone(),
@@ -1590,7 +1833,247 @@ mod tests {
         covered.sort_unstable();
         covered.dedup();
         assert_eq!(covered.len(), total, "one body per kind");
-        assert_eq!(covered.len(), 36, "every raw event kind");
+        assert_eq!(covered.len(), 44, "every raw event kind");
+    }
+
+    #[test]
+    fn validate_requires_the_endpoint_id_as_sensor() {
+        let event = endpoint_event();
+        assert_eq!(event.validate(), Ok(()));
+        let endpoint_id: Uuid = ENDPOINT_ID.parse().expect("the test UUID parses");
+        assert_eq!(endpoint_id.to_string(), ENDPOINT_ID);
+
+        let mut sensors: Vec<Option<String>> = not_endpoint_ids(ENDPOINT_ID)
+            .into_iter()
+            .map(Some)
+            .collect();
+        sensors.push(None);
+        for sensor in sensors {
+            let mut event = endpoint_event();
+            event.sensor.clone_from(&sensor);
+            let error = assert_rule(&event, 11);
+            assert_eq!(
+                error,
+                DetectionEventError::EndpointSensorMismatch {
+                    endpoint_id,
+                    sensor: sensor.clone(),
+                }
+            );
+        }
+
+        let mut event = endpoint_event();
+        event.sensor = None;
+        assert_eq!(
+            assert_rule(&event, 11).to_string(),
+            "detection event rule 11: the endpoint primary subject \
+             6f1d7a52-93c4-4b8e-a0f5-2c7e9b41d308 is not the sensor None"
+        );
+        event.sensor = Some(ENDPOINT_ID.to_uppercase());
+        assert_eq!(
+            assert_rule(&event, 11).to_string(),
+            "detection event rule 11: the endpoint primary subject \
+             6f1d7a52-93c4-4b8e-a0f5-2c7e9b41d308 is not the sensor \
+             Some(\"6F1D7A52-93C4-4B8E-A0F5-2C7E9B41D308\")"
+        );
+    }
+
+    #[test]
+    fn validate_requires_the_header_endpoint_id_as_raw_event_sensor() {
+        let mut checked = 0;
+        for body in raw_event::tests::bodies_with_and_without_endpoint() {
+            let event = raw_event_with(body.clone());
+            assert_eq!(event.validate(), Ok(()), "{body:?}");
+            let Some(header) = raw_event_body_endpoint(&body) else {
+                continue;
+            };
+            checked += 1;
+            let endpoint_id = header.endpoint_id.to_string();
+            assert_eq!(event.sensor.as_deref(), Some(endpoint_id.as_str()));
+            for sensor in not_endpoint_ids(&endpoint_id) {
+                let mut event = event.clone();
+                event.sensor = Some(sensor.clone());
+                let error = assert_rule(&event, 12);
+                assert_eq!(
+                    error,
+                    DetectionEventError::RawEventEndpointSensorMismatch {
+                        endpoint_id: header.endpoint_id,
+                        sensor: sensor.clone(),
+                    }
+                );
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "detection event rule 12: the raw event's endpoint header \
+                         {endpoint_id} is not the sensor {sensor}"
+                    )
+                );
+            }
+            // A missing sensor is rule 2's to report, before rule 12.
+            let mut event = event.clone();
+            event.sensor = None;
+            assert_eq!(
+                assert_rule(&event, 2),
+                DetectionEventError::RawEventWithoutSensor
+            );
+        }
+        // 19 Sysmon bodies with a header, and 3 log bodies.
+        assert_eq!(checked, 22);
+    }
+
+    #[test]
+    fn validate_skips_rule_12_for_sysmon_bodies_without_header() {
+        let mut checked = 0;
+        for body in raw_event::tests::bodies_with_and_without_endpoint() {
+            // The Sysmon kinds are numbered 31 to 56.
+            let sysmon = (31..=56).contains(&u32::from(raw_event_body_kind(&body)));
+            if !sysmon || raw_event_body_endpoint(&body).is_some() {
+                continue;
+            }
+            checked += 1;
+            let mut event = raw_event_with(body);
+            // Neither the sensor's form nor the body's `agent_id` is
+            // compared.
+            for sensor in [
+                "sensor-1".to_string(),
+                "not a UUID".to_string(),
+                ENDPOINT_ID.to_string(),
+                ENDPOINT_ID.to_uppercase(),
+                String::new(),
+            ] {
+                event.sensor = Some(sensor);
+                assert_eq!(event.validate(), Ok(()));
+            }
+            event.sensor = None;
+            assert_eq!(
+                assert_rule(&event, 2),
+                DetectionEventError::RawEventWithoutSensor
+            );
+        }
+        // Every Sysmon kind, without its header.
+        assert_eq!(checked, 19);
+    }
+
+    #[test]
+    fn validate_checks_rules_11_and_12_last() {
+        // Each event also breaks rule 11, so the lower-numbered rule is the
+        // one reported.
+        let broken = || {
+            let mut event = endpoint_event();
+            event.sensor = Some("sensor-1".to_string());
+            event
+        };
+        assert_rule(&broken(), 11);
+
+        let mut mismatch = broken();
+        mismatch.detection_model = DetectionModel::FarOutlier;
+        assert_rule(&mismatch, 1);
+
+        let mut inverted = broken();
+        window_of(&mut inverted).start = at(NANOS + 1);
+        assert_rule(&inverted, 4);
+
+        let mut related = broken();
+        let Target::Subject {
+            related_ips: too_many,
+            ..
+        } = with_related_ips(MAX_RELATED_IPS + 1).target
+        else {
+            unreachable!("with_related_ips() builds a subject target");
+        };
+        let Target::Subject { related_ips, .. } = &mut related.target else {
+            unreachable!("the event has a subject target");
+        };
+        *related_ips = too_many;
+        assert_rule(&related, 5);
+
+        let mut score = broken();
+        score.score = f64::INFINITY;
+        assert_rule(&score, 6);
+
+        // Rule 10 before rule 11: a WindowOutlier detail with an endpoint
+        // subject breaks both.
+        let mut window = broken();
+        window.detection_model = DetectionModel::WindowOutlier;
+        window.detail = Detail::WindowOutlier(window_outlier());
+        assert_eq!(
+            assert_rule(&window, 10),
+            DetectionEventError::InvalidWindowOutlier(WindowOutlierViolation::NotHostSubject)
+        );
+
+        // Each raw event also breaks rule 12.
+        let header_body = raw_event::tests::bodies()
+            .into_iter()
+            .find(|body| matches!(body, RawEventBody::Journald(_)))
+            .expect("bodies() has a Journald body");
+        let broken = || {
+            let mut event = raw_event_with(header_body.clone());
+            event.sensor = Some("sensor-1".to_string());
+            event
+        };
+        assert_rule(&broken(), 12);
+
+        let mut mismatch = broken();
+        mismatch.detection_model = DetectionModel::FarOutlier;
+        assert_rule(&mismatch, 1);
+
+        let mut kind = broken();
+        kind.raw_event_kind = RawEventKind::Auditd;
+        assert_rule(&kind, 2);
+
+        let mut score = broken();
+        score.score = f64::NAN;
+        assert_rule(&score, 6);
+
+        let mut time = broken();
+        time.time = at(NANOS + 1);
+        assert_rule(&time, 7);
+
+        let mut window = broken();
+        window.detection_model = DetectionModel::WindowOutlier;
+        window.detail = Detail::WindowOutlier(window_outlier());
+        assert_eq!(
+            assert_rule(&window, 10),
+            DetectionEventError::InvalidWindowOutlier(WindowOutlierViolation::NotSubjectTarget)
+        );
+    }
+
+    #[test]
+    fn rule_numbers_of_the_endpoint_errors() {
+        let endpoint_id: Uuid = ENDPOINT_ID.parse().expect("the test UUID parses");
+        let rule_11 = DetectionEventError::EndpointSensorMismatch {
+            endpoint_id,
+            sensor: Some("s".to_string()),
+        };
+        assert_eq!(rule_11.rule(), 11);
+        assert_eq!(
+            rule_11.to_string(),
+            "detection event rule 11: the endpoint primary subject \
+             6f1d7a52-93c4-4b8e-a0f5-2c7e9b41d308 is not the sensor Some(\"s\")"
+        );
+        let rule_12 = DetectionEventError::RawEventEndpointSensorMismatch {
+            endpoint_id,
+            sensor: "s".to_string(),
+        };
+        assert_eq!(rule_12.rule(), 12);
+        assert_eq!(
+            rule_12.to_string(),
+            "detection event rule 12: the raw event's endpoint header \
+             6f1d7a52-93c4-4b8e-a0f5-2c7e9b41d308 is not the sensor s"
+        );
+    }
+
+    #[test]
+    fn endpoint_subject_round_trips_through_json() {
+        let event = endpoint_event();
+        let json = serde_json::to_string(&event).expect("serializes");
+        assert!(
+            json.contains(
+                r#""primary":{"Endpoint":{"endpoint_id":"6f1d7a52-93c4-4b8e-a0f5-2c7e9b41d308","ips":["192.0.2.30","2001:db8::30"],"default_route_ip":"192.0.2.30","net_state_source":"Observed","role":"Actor"}}"#
+            ),
+            "{json}"
+        );
+        let decoded: DetectionEvent = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(decoded, event);
     }
 
     #[test]
@@ -2142,11 +2625,23 @@ mod bincode_tests {
     use serde::{Serialize, de::DeserializeOwned};
 
     use super::tests::{
-        NANOS, TABLE, WIDE_NANOS, at, conn, details, far_outlier, far_outlier_without_prefix,
-        label_db_match, window_outlier, window_outlier_event, window_outlier_variants,
-        window_outlier_without_slots,
+        NANOS, TABLE, WIDE_NANOS, at, conn, details, endpoint, far_outlier,
+        far_outlier_without_prefix, label_db_match, window_outlier, window_outlier_event,
+        window_outlier_variants, window_outlier_without_slots,
     };
     use super::*;
+    use crate::types::raw_event;
+
+    /// `test::detection_events()` as of tag `0.32.0`, each event encoded and
+    /// the encodings concatenated.
+    const RELEASED_EVENTS: &[u8] =
+        include_bytes!("../../tests/fixtures/0.32.0/detection-events.bin");
+
+    /// One raw event detection event per network and Netflow body of
+    /// `raw_event::tests::bodies()` as of tag `0.32.0`, built by
+    /// [`released_raw_event`], each encoded and the encodings concatenated.
+    const RELEASED_RAW_EVENTS: &[u8] =
+        include_bytes!("../../tests/fixtures/0.32.0/raw-event-detection-events.bin");
 
     /// The crate's bincode 2 encoding of [`NANOS`] as an `i128`: the
     /// zigzagged value in a `u64` varint.
@@ -2170,6 +2665,168 @@ mod bincode_tests {
                 .expect("deserialization should succeed");
         assert_eq!(len, bytes.len());
         value
+    }
+
+    /// Builds the raw event detection event the `0.32.0` fixture holds for
+    /// `body`.
+    fn released_raw_event(body: RawEventBody) -> DetectionEvent {
+        DetectionEvent {
+            time: at(NANOS),
+            sensor: Some("sensor-1".to_string()),
+            detection_model: DetectionModel::NonBrowser,
+            raw_event_kind: raw_event_body_kind(&body),
+            category: Some(EventCategory::CommandAndControl),
+            target: Target::RawEvent {
+                time: at(NANOS),
+                body,
+            },
+            score: 0.75,
+            detail: Detail::NonBrowser,
+        }
+    }
+
+    /// Returns whether a body's variant was released with its current
+    /// fields: every network and Netflow body. A Sysmon body gained its
+    /// header in protocol `0.52.0`, and the log bodies are new.
+    fn released_unchanged(body: &RawEventBody) -> bool {
+        match body {
+            RawEventBody::Conn(_)
+            | RawEventBody::Dns(_)
+            | RawEventBody::Http(_)
+            | RawEventBody::Rdp(_)
+            | RawEventBody::Smtp(_)
+            | RawEventBody::Ntlm(_)
+            | RawEventBody::Kerberos(_)
+            | RawEventBody::Ssh(_)
+            | RawEventBody::DceRpc(_)
+            | RawEventBody::Ftp(_)
+            | RawEventBody::Mqtt(_)
+            | RawEventBody::Ldap(_)
+            | RawEventBody::Tls(_)
+            | RawEventBody::Smb(_)
+            | RawEventBody::Nfs(_)
+            | RawEventBody::Bootp(_)
+            | RawEventBody::Dhcp(_)
+            | RawEventBody::Radius(_)
+            | RawEventBody::MalformedDns(_)
+            | RawEventBody::Icmp(_)
+            | RawEventBody::Netflow5(_)
+            | RawEventBody::Netflow9(_) => true,
+            RawEventBody::ProcessCreate(_)
+            | RawEventBody::FileCreateTime(_)
+            | RawEventBody::NetworkConnect(_)
+            | RawEventBody::ProcessTerminate(_)
+            | RawEventBody::ImageLoad(_)
+            | RawEventBody::FileCreate(_)
+            | RawEventBody::RegistryValueSet(_)
+            | RawEventBody::RegistryKeyRename(_)
+            | RawEventBody::FileCreateStreamHash(_)
+            | RawEventBody::PipeEvent(_)
+            | RawEventBody::DnsQuery(_)
+            | RawEventBody::FileDelete(_)
+            | RawEventBody::ProcessTamper(_)
+            | RawEventBody::FileDeleteDetected(_)
+            | RawEventBody::DriverLoad(_)
+            | RawEventBody::CreateRemoteThread(_)
+            | RawEventBody::RawAccessRead(_)
+            | RawEventBody::ProcessAccess(_)
+            | RawEventBody::RegistryObjectAddDel(_)
+            | RawEventBody::WindowsEventLog(_)
+            | RawEventBody::Journald(_)
+            | RawEventBody::Auditd(_) => false,
+        }
+    }
+
+    /// Checks that `events` encode, one after another, to exactly `fixture`.
+    fn assert_encodes_to(events: &[DetectionEvent], fixture: &[u8]) {
+        let mut rest = fixture;
+        for (index, event) in events.iter().enumerate() {
+            let bytes = encode(event);
+            let Some((released, after)) = rest.split_at_checked(bytes.len()) else {
+                panic!("the fixture ends inside event {index}: {event:?}");
+            };
+            assert_eq!(bytes, released, "event {index}: {event:?}");
+            assert_eq!(&decode::<DetectionEvent>(released), event);
+            rest = after;
+        }
+        assert!(rest.is_empty(), "the fixture holds more events");
+    }
+
+    #[test]
+    fn released_detection_events_keep_their_bytes() {
+        let mut events = crate::test::detection_events();
+        assert!(matches!(
+            events.get(crate::test::RELEASED_DETECTION_EVENTS),
+            Some(DetectionEvent {
+                target: Target::Subject {
+                    primary: PrimarySubject::Endpoint { .. },
+                    ..
+                },
+                ..
+            })
+        ));
+        events.truncate(crate::test::RELEASED_DETECTION_EVENTS);
+        assert_encodes_to(&events, RELEASED_EVENTS);
+    }
+
+    #[test]
+    fn released_raw_event_bodies_keep_their_bytes() {
+        let events: Vec<_> = raw_event::tests::bodies()
+            .into_iter()
+            .filter(released_unchanged)
+            .map(released_raw_event)
+            .collect();
+        assert_eq!(events.len(), 22);
+        for event in &events {
+            assert_eq!(event.validate(), Ok(()));
+        }
+        assert_encodes_to(&events, RELEASED_RAW_EVENTS);
+    }
+
+    #[test]
+    fn endpoint_subject_encodes_after_every_existing_variant() {
+        let mut expected = vec![4];
+        expected.extend([
+            16, 0x6f, 0x1d, 0x7a, 0x52, 0x93, 0xc4, 0x4b, 0x8e, 0xa0, 0xf5, 0x2c, 0x7e, 0x9b, 0x41,
+            0xd3, 0x08,
+        ]);
+        expected.extend([2, 0, 192, 0, 2, 30, 1]);
+        expected.extend([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x30,
+        ]);
+        expected.extend([1, 0, 192, 0, 2, 30]);
+        expected.extend([0, 0]);
+        let primary = endpoint();
+        assert_eq!(encode(&primary), expected);
+        assert_eq!(decode::<PrimarySubject>(&expected), primary);
+
+        let PrimarySubject::Endpoint {
+            endpoint_id, role, ..
+        } = primary
+        else {
+            unreachable!("endpoint() is an endpoint subject");
+        };
+        for (net_state_source, tag) in [
+            (NetStateSource::Observed, vec![0]),
+            (NetStateSource::Inferred, vec![1]),
+            (NetStateSource::Unknown, vec![2]),
+            (NetStateSource::Other("x".to_string()), vec![3, 1, b'x']),
+        ] {
+            let primary = PrimarySubject::Endpoint {
+                endpoint_id,
+                ips: Vec::new(),
+                default_route_ip: None,
+                net_state_source,
+                role,
+            };
+            let mut expected = vec![4];
+            expected.extend(encode(&endpoint_id));
+            expected.extend([0, 0]);
+            expected.extend(tag);
+            expected.push(0);
+            assert_eq!(encode(&primary), expected);
+            assert_eq!(decode::<PrimarySubject>(&expected), primary);
+        }
     }
 
     #[test]
@@ -2470,6 +3127,29 @@ mod bincode_tests {
             })
             .collect();
         assert_eq!(pcap_truncated, [true, false]);
+
+        // Every primary subject variant appears, by its encoded tag.
+        let mut subjects = Vec::new();
+        for event in &events {
+            if let Target::Subject { primary, .. } = &event.target {
+                let index = encode(primary).first().copied();
+                if !subjects.contains(&index) {
+                    subjects.push(index);
+                }
+            }
+        }
+        subjects.sort_unstable();
+        assert_eq!(subjects, [Some(0), Some(1), Some(2), Some(3), Some(4)]);
+        assert!(matches!(
+            events.last(),
+            Some(DetectionEvent {
+                target: Target::Subject {
+                    primary: PrimarySubject::Endpoint { .. },
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     #[test]

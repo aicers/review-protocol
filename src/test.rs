@@ -441,6 +441,10 @@ pub(crate) fn detector_status_reports() -> Vec<crate::types::DetectorStatusRepor
 /// [`DetectionEvent::validate`](crate::types::DetectionEvent::validate).
 pub const INVALID_DETECTION_EVENT: usize = 9;
 
+/// The number of leading events of [`detection_events`] whose shapes were
+/// released before protocol `0.52.0`, so their bytes are pinned by fixtures.
+pub const RELEASED_DETECTION_EVENTS: usize = 25;
+
 /// Returns a batch of synthetic detection events.
 ///
 /// Between them they carry every `Detail` variant, both `Target` kinds and
@@ -449,6 +453,10 @@ pub const INVALID_DETECTION_EVENT: usize = 9;
 /// `Some` and once `None`. Every event is valid except the one at
 /// [`INVALID_DETECTION_EVENT`], which carries a detail of another model and
 /// sits between valid events.
+///
+/// The first [`RELEASED_DETECTION_EVENTS`] events have shapes released before
+/// protocol `0.52.0`; the event after them, about an endpoint, was appended
+/// with the `Endpoint` primary subject.
 #[allow(clippy::too_many_lines)] // One synthetic event per detection model.
 #[must_use]
 pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
@@ -462,6 +470,8 @@ pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
         RepeatedHttpSessionsDetail, SlotDeviation, Target, ThreatRole, TimeWindow,
         UnusualDestinationPatternDetail, WatchlistMatchDetail, WindowOutlierDetail, raw_event,
     };
+
+    const ENDPOINT_ID: &str = "3c9e5b2a-7d41-4f86-b0a3-e5d2c8f17a64";
 
     const BASE: i128 = 1_773_586_804_120_000_000;
 
@@ -900,6 +910,31 @@ pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
                 pcap_truncated: None,
             }),
         },
+        // Appended with protocol 0.52.0; its sensor is the endpoint id.
+        subject(
+            23,
+            Some(ENDPOINT_ID),
+            DetectionModel::PortScan,
+            Some(EventCategory::Reconnaissance),
+            PrimarySubject::Endpoint {
+                endpoint_id: ENDPOINT_ID.parse().expect("the test UUID parses"),
+                ips: vec![
+                    IpAddr::V4(Ipv4Addr::new(192, 0, 2, 40)),
+                    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x40)),
+                    IpAddr::V4(Ipv4Addr::new(10, 0, 0, 40)),
+                ],
+                default_route_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 40))),
+                net_state_source: raw_event::NetStateSource::Other("netlink".to_string()),
+                role: ThreatRole::Actor,
+            },
+            related(2),
+            window(-60_000_000_000, 23),
+            8.0,
+            Detail::PortScan(PortScanDetail {
+                resp_ports: vec![135, 445, 3389],
+                proto: 6,
+            }),
+        ),
     ]
 }
 
