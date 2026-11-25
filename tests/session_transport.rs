@@ -1783,5 +1783,7 @@ async fn incomplete_install_cannot_send_a_terminal_success() {
     ));
 }
 
+#[path = "session_transport/server_integration.rs"]
+mod server_integration;
 #[path = "session_transport/server_processing.rs"]
 mod server_processing;
