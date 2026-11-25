@@ -193,8 +193,8 @@ pub struct ServerListener {
 /// no reason, that the transport applies when the last handle to a connection
 /// drops. Owners of connections taken from this listener close with the
 /// recorded code and reason instead of their own, and repeat it when they
-/// drop, so neither a later owner close nor dropping the session can replace
-/// the listener's.
+/// drop, so neither a later owner close nor dropping the session or a stream
+/// accepted on it can replace the listener's.
 pub(super) type ListenerClose = Arc<OnceLock<(ApplicationCode, Box<[u8]>)>>;
 
 /// Closes `connection` with the listener's close, if one has run.
@@ -328,8 +328,9 @@ impl ServerListener {
     /// tasks. Each session's [`ServerSessionControl::closed`] reports
     /// [`ServerSessionClose::Local`], and [`Self::wait_idle`] returns once
     /// transport shutdown completes. Neither a later `close` or `abort`, nor
-    /// closing a session through [`ServerSessionControl`] or dropping it
-    /// afterwards, changes the code and reason its peer observes;
+    /// closing a session through [`ServerSessionControl`] or dropping it or
+    /// its accepted streams afterwards, changes the code and reason its peer
+    /// observes;
     /// `ServerHandle::close`, which takes an explicit code, still applies its
     /// own.
     pub fn close(&self, reason: &[u8]) {

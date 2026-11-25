@@ -52,7 +52,7 @@
 //! with application code zero, the code of normal shutdown, and
 //! `ServerListener::abort` with code one, the code of refusal; whichever runs first
 //! sets the code and reason peers observe, even if sessions are closed through
-//! `ServerSessionControl` or dropped right after. A listener or session abort
+//! `ServerSessionControl` or dropped, with their accepted streams, right after. A listener or session abort
 //! immediately closes transport. The application owns task cancellation and
 //! joins. The listener and incoming accept futures are cancel-safe.
 //! `ServerIncoming::accept_next` reports clean exhaustion as `None`.
@@ -663,7 +663,9 @@ impl Shared {
 
 /// Dropping the last handle to a connection closes it implicitly with code
 /// zero and no reason, which would apply before the endpoint's asynchronous
-/// listener-wide close reaches the connection.
+/// listener-wide close reaches the connection. Accepted server streams retain
+/// the session too, so the repeat also covers a stream that outlives every
+/// other session owner.
 #[cfg(feature = "server")]
 impl Drop for Shared {
     fn drop(&mut self) {

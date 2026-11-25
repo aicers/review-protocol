@@ -418,7 +418,7 @@ impl ServerIncoming {
                 Ok(ServerStream::Requests(ServerRequestStream {
                     owner: RequestOwner::new(send, recv, self.shared.options.clone()),
                     authorization: self.authorization.clone(),
-                    network_list_blocker: self.shared.network_list_blocker.clone(),
+                    session: self.shared.clone(),
                 }))
             }
             result = self.shared.connection.accept_uni() => {
@@ -426,6 +426,7 @@ impl ServerIncoming {
                 Ok(ServerStream::DetectionEvents(super::DetectionEventReceiver::new(
                     recv,
                     self.shared.options.detection_events,
+                    self.shared.clone(),
                 )))
             }
         }
@@ -463,9 +464,11 @@ struct ServerAuthorization {
 pub struct ServerRequestStream {
     owner: RequestOwner,
     authorization: Option<Arc<ServerAuthorization>>,
-    /// The agent's advertised version when it is earlier than the exclusion-list
-    /// and watchlist item lists.
-    network_list_blocker: Option<String>,
+    /// The session this stream was accepted on. It supplies the agent's
+    /// exclusion-list and watchlist blocker, and, since the stream can outlive
+    /// every other session owner, it repeats a listener-wide close when the
+    /// stream drops last.
+    session: Arc<Shared>,
 }
 
 #[cfg(feature = "server")]
@@ -497,7 +500,7 @@ impl ServerRequestStream {
                 return Ok(None);
             };
             if let Some(message) =
-                server_network_list_refusal(code, self.network_list_blocker.as_deref())
+                server_network_list_refusal(code, self.session.network_list_blocker.as_deref())
             {
                 self.owner.refuse(frame, &message)?;
                 continue;
@@ -558,7 +561,7 @@ impl ServerRequestStream {
                 return Err(ServerRunError::AuthorizationDenied { service, source });
             }
             if let Some(message) =
-                server_network_list_refusal(code, self.network_list_blocker.as_deref())
+                server_network_list_refusal(code, self.session.network_list_blocker.as_deref())
             {
                 self.owner.refuse(frame, &message)?;
                 self.owner.flush_unserved().await?;

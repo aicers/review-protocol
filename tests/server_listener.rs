@@ -596,6 +596,51 @@ async fn dropping_a_session_right_after_a_listener_close_keeps_its_code() {
     }
 }
 
+/// An accepted stream can outlive every session owner. Dropping it right after
+/// a listener-wide close releases the last transport reference, whose
+/// implicit close, code zero with no reason, would overtake the endpoint's;
+/// the stream repeats the listener's close instead.
+#[tokio::test]
+async fn dropping_a_retained_stream_right_after_a_listener_close_keeps_its_code() {
+    for events in [false, true] {
+        for code in [0, 1] {
+            let (listener, endpoint) = setup(options());
+            let observations = Arc::new(Observations::default());
+            let (peer, owner, reply) = handshake(&listener, &endpoint, FULL).await;
+            assert_eq!(reply, ACCEPTED);
+            let (handle, mut incoming) =
+                decide(owner.unwrap(), Admission::Admit, &observations).unwrap();
+            // The peer writes a partial frame so the stream reaches the
+            // listener; acceptance does not read it.
+            let _peer_stream = if events {
+                let mut send = peer.open_uni().await.unwrap();
+                send.write_all(&[0]).await.unwrap();
+                (send, None)
+            } else {
+                let (mut send, recv) = peer.open_bi().await.unwrap();
+                send.write_all(&[0]).await.unwrap();
+                (send, Some(recv))
+            };
+            let stream = timeout(TEST_TIMEOUT, incoming.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(matches!(stream, ServerStream::DetectionEvents(_)), events);
+            drop(handle);
+            drop(incoming);
+            if code == 0 {
+                listener.close(CLOSE_REASON);
+            } else {
+                listener.abort(CLOSE_REASON);
+            }
+            drop(stream);
+            peer_close(&peer, ApplicationCode::new(code).unwrap(), CLOSE_REASON).await;
+            timeout(TEST_TIMEOUT, listener.wait_idle()).await.unwrap();
+            assert_eq!(observations.calls.load(Ordering::Relaxed), 0);
+        }
+    }
+}
+
 #[tokio::test]
 async fn pending_remote_addr_precedes_tls_and_protocol_failures() {
     let server = Certificate::generate();

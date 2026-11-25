@@ -187,8 +187,9 @@ runners see transport errors, and the application still joins its own tasks.
 `ServerSessionControl::closed` reports `ServerSessionClose::Local`, and
 `wait_idle` returns once transport shutdown completes. Neither a later `close`
 or `abort`, nor closing a session through `ServerSessionControl` or dropping it
-right after, changes the code and reason a peer observes; only
-`ServerHandle::close`, which takes an explicit code, still applies its own.
+or its accepted streams right after, changes the code and reason a peer
+observes; only `ServerHandle::close`, which takes an explicit code, still
+applies its own.
 `ServerListener::abort` closes the same way with code one; the application still
 joins its own tasks.
 
