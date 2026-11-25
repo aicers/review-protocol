@@ -49,9 +49,12 @@ Each stage has exactly one owner, and the application decides when to move on:
    already-bound socket. `accept` returns a `PendingSession` per connection
    attempt, or `None` once the listener is shut down. The listener spawns no
    application tasks.
-2. `PendingSession` owns one attempt before TLS. `handshake` performs TLS and
-   the protocol handshake under one deadline and returns an
-   `UnadmittedSession`. Dropping it abandons the attempt.
+2. `PendingSession` owns one attempt before TLS. `remote_addr` returns the
+   peer's address as observed when the attempt arrived; read it before
+   `handshake`, which consumes the owner, to log a TLS or protocol-handshake
+   failure with the peer it came from. `handshake` performs TLS and the
+   protocol handshake under one deadline and returns an `UnadmittedSession`.
+   Dropping it abandons the attempt.
 3. `UnadmittedSession` exposes what admission is decided from:
    `peer_certificates` (the TLS-verified chain) and `agent_claims` (the
    agent's self-reported `AgentInfo`, which grants nothing). `control` returns
@@ -62,6 +65,19 @@ Each stage has exactly one owner, and the application decides when to move on:
    commands, and the unique `ServerIncoming` that accepts the agent's streams
    as `ServerStream::Requests` (run with `ServerRequestStream::run`) or
    `ServerStream::DetectionEvents` (run with `DetectionEventReceiver::run`).
+
+`ServerHandle` sends every manager-to-agent request: the `node_*` operations,
+the engine commands, and the configuration and list pushes
+`send_exclusion_list`, `send_watchlist`, `send_config_update_cmd`,
+`send_delete_customer_data_cmd`, `send_filtering_rules`,
+`send_internal_network_list`, `send_time_series_generation_policies`,
+`send_tor_exit_node_list`, `send_trusted_domain_list` and
+`send_trusted_user_agent_list`. Each push sends its list in the order given and
+maps the agent's `Err(text)` to `SessionError::RemoteRejection(text)`.
+`send_exclusion_list` and `send_watchlist` return
+`SessionError::IncompatibleProtocol`, without sending, to an agent whose
+handshake version is below `0.50.0`. There is no `send_ping`: transport
+keepalive and the idle timeout in `ServerTransportOptions` cover liveness.
 
 `ServerSessionControl` is a cloneable handle to the connection itself, without
 dispatch or commands: `closed` waits for closure and reports a
@@ -134,7 +150,18 @@ the previous one installed.
 
 ### Shutdown and drain
 
-Shut down in this order:
+Four controls end work, from the gentlest:
+
+- `ServerListener::shutdown` stops acceptance only. Accepted sessions keep
+  running.
+- `ServerSessionControl::drain` then `ServerSessionControl::close` ends one
+  session in order: stop taking streams, let the accepted ones finish, then
+  close with code zero.
+- `ServerListener::close` closes the endpoint and every connection on it at
+  once with code zero, the code of normal shutdown.
+- `ServerListener::abort` does the same with code one, the code of refusal.
+
+For an orderly shutdown, use this order:
 
 1. `ServerListener::shutdown` stops acceptance and wakes a pending `accept`,
    which returns `None`. Join the handshake tasks.
@@ -148,8 +175,23 @@ Shut down in this order:
    finished closing. It does not return while an admitted session is still
    open.
 
-`ServerListener::abort` instead closes the endpoint and every connection at
-once; the application still joins its own tasks.
+To close before draining instead, call `ServerListener::close` with a reason.
+It stops acceptance and closes every connection on the endpoint with code zero
+and that reason, so peers can tell normal shutdown from the code-one refusal
+of `ServerListener::abort`. Admitted and unadmitted sessions see code zero, and
+so do pending sessions whose TLS has completed, whose `handshake` then returns
+`SessionError::Transport`. An attempt still in TLS, or accepted and not yet
+handshaken, cannot carry an application code; its `handshake` fails no later
+than the handshake deadline, and nothing is admitted. Nothing drains: accepted
+runners see transport errors, and the application still joins its own tasks.
+`ServerSessionControl::closed` reports `ServerSessionClose::Local`, and
+`wait_idle` returns once transport shutdown completes. Neither a later `close`
+or `abort`, nor closing a session through `ServerSessionControl` or dropping it
+or its accepted streams right after, changes the code and reason a peer
+observes; only `ServerHandle::close`, which takes an explicit code, still
+applies its own.
+`ServerListener::abort` closes the same way with code one; the application still
+joins its own tasks.
 
 ## Unidirectional Detection Event Stream API
 

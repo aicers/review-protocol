@@ -39,7 +39,7 @@ impl super::ServerHandle {
         } else {
             operation.await?
         };
-        let shared = server_shared(connection, options, agent);
+        let shared = server_shared(connection, options, agent, None);
         Ok((Self(shared.clone()), super::ServerIncoming::new(shared)))
     }
 }
@@ -85,15 +85,18 @@ pub(super) fn server_shared(
     connection: Connection,
     options: SessionOptions,
     agent: crate::AgentInfo,
+    listener: Option<super::listener::ListenerClose>,
 ) -> std::sync::Arc<Shared> {
     let network_list_blocker =
         crate::network_list_blocker([agent.protocol_version.as_str()]).map(str::to_owned);
-    Shared::new(
+    let mut shared = Shared::new(
         connection,
         options,
         HandshakeMetadata::Agent(agent),
         network_list_blocker,
-    )
+    );
+    shared.listener = listener;
+    std::sync::Arc::new(shared)
 }
 
 #[cfg(feature = "client")]
@@ -147,12 +150,12 @@ impl super::AgentHandle {
             protocol_version.as_str(),
         ])
         .map(str::to_owned);
-        let shared = Shared::new(
+        let shared = std::sync::Arc::new(Shared::new(
             connection,
             options,
             HandshakeMetadata::Server { protocol_version },
             network_list_blocker,
-        );
+        ));
         Ok((Self(shared.clone()), super::AgentIncoming::new(shared)))
     }
 }

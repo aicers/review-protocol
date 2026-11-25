@@ -1,4 +1,7 @@
 //! Owned detection event framing with retained header and frame progress.
+#[cfg(feature = "server")]
+use std::sync::Arc;
+
 use oinq::{ApplicationCode, frame::FrameLimit};
 #[cfg(feature = "server")]
 use oinq::{RecvStream, frame::FramedReader};
@@ -9,9 +12,9 @@ use tokio::io::AsyncReadExt;
 #[cfg(feature = "client")]
 use tokio::io::AsyncWriteExt;
 
-#[cfg(feature = "server")]
-use super::ServerRunError;
 use super::{OutcomeCertainty, SessionError};
+#[cfg(feature = "server")]
+use super::{ServerRunError, Shared};
 
 fn abort_code() -> ApplicationCode {
     ApplicationCode::new(1).expect("exchange abort code fits 62 bits")
@@ -26,17 +29,22 @@ pub struct DetectionEventReceiver {
     header: [u8; 2],
     header_pos: usize,
     limit: FrameLimit,
+    /// The session this stream was accepted on. The stream can outlive every
+    /// other session owner, so it keeps the session, which repeats a
+    /// listener-wide close when it drops last.
+    _session: Arc<Shared>,
 }
 
 #[cfg(feature = "server")]
 impl DetectionEventReceiver {
-    pub(super) fn new(recv: RecvStream, limit: FrameLimit) -> Self {
+    pub(super) fn new(recv: RecvStream, limit: FrameLimit, session: Arc<Shared>) -> Self {
         Self {
             raw: Some(recv),
             reader: None,
             header: [0; 2],
             header_pos: 0,
             limit,
+            _session: session,
         }
     }
     /// Processes this detection event stream with a server detection event

@@ -1,6 +1,6 @@
 use std::{
     net::{SocketAddr, UdpSocket},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -182,6 +182,39 @@ pub struct ServerListener {
     endpoint: Endpoint,
     options: Arc<ServerListenerOptions>,
     stopped: watch::Sender<bool>,
+    closed: ListenerClose,
+}
+
+/// The code and reason of the first listener-wide close, once one has run.
+///
+/// The endpoint delivers its close to each connection asynchronously, while a
+/// connection's own close applies at once, and the first close to apply is the
+/// one the peer observes. That includes the implicit close, with code zero and
+/// no reason, that the transport applies when the last handle to a connection
+/// drops. Owners of connections taken from this listener close with the
+/// recorded code and reason instead of their own, and repeat it when they
+/// drop, so neither a later owner close nor dropping the session or a stream
+/// accepted on it can replace the listener's.
+pub(super) type ListenerClose = Arc<OnceLock<(ApplicationCode, Box<[u8]>)>>;
+
+/// Closes `connection` with the listener's close, if one has run.
+pub(super) fn repeat_listener_close(connection: &Connection, listener: &ListenerClose) {
+    if let Some((code, reason)) = listener.get() {
+        connection.close(*code, reason);
+    }
+}
+
+/// Closes `connection` with the listener's close if one has run, else with `code`.
+fn close_connection(
+    connection: &Connection,
+    listener: Option<&ListenerClose>,
+    code: ApplicationCode,
+    reason: &[u8],
+) {
+    match listener.and_then(|closed| closed.get()) {
+        Some((code, reason)) => connection.close(*code, reason),
+        None => connection.close(code, reason),
+    }
 }
 
 impl ServerListener {
@@ -218,6 +251,7 @@ impl ServerListener {
             endpoint,
             options: Arc::new(options),
             stopped: watch::Sender::new(false),
+            closed: ListenerClose::default(),
         }
     }
 
@@ -247,6 +281,7 @@ impl ServerListener {
                     incoming,
                     accepted: Instant::now(),
                     options: self.options.clone(),
+                    listener: self.closed.clone(),
                 })),
                 None if *self.stopped.borrow() => Ok(None),
                 None => Err(unsent(std::io::Error::new(
@@ -278,12 +313,50 @@ impl ServerListener {
         self.stopped.send_replace(true);
     }
 
-    /// Stops acceptance and immediately closes the endpoint and its connections.
+    /// Stops acceptance and immediately closes the endpoint and its connections
+    /// with application code zero and the given reason.
     ///
-    /// The application still owns and joins or cancels its tasks.
+    /// This is the listener-wide counterpart of [`ServerSessionControl::close`]:
+    /// use it for normal shutdown when sessions need not drain first, and
+    /// [`Self::abort`] (code one) for refusal. Established sessions, admitted or
+    /// not, and pending sessions whose TLS has completed observe code zero and
+    /// the reason; their pending `handshake` returns a transport error. An
+    /// attempt still in TLS, or returned by [`Self::accept`] and not yet
+    /// handshaken, cannot carry an application code, and its `handshake` fails
+    /// no later than the handshake deadline. Nothing drains: accepted stream
+    /// runners observe transport errors, and the application joins its own
+    /// tasks. Each session's [`ServerSessionControl::closed`] reports
+    /// [`ServerSessionClose::Local`], and [`Self::wait_idle`] returns once
+    /// transport shutdown completes. Neither a later `close` or `abort`, nor
+    /// closing a session through [`ServerSessionControl`] or dropping it or
+    /// its accepted streams afterwards, changes the code and reason its peer
+    /// observes;
+    /// `ServerHandle::close`, which takes an explicit code, still applies its
+    /// own.
+    pub fn close(&self, reason: &[u8]) {
+        self.close_endpoint(ApplicationCode::default(), reason);
+    }
+
+    /// Stops acceptance and immediately closes the endpoint and its connections
+    /// with application code one and the given reason.
+    ///
+    /// Use it to refuse or abort; [`Self::close`] is the code-zero counterpart
+    /// for normal shutdown, and the same delivery rules apply. Once either has
+    /// run, a further `close` or `abort` only stops acceptance, so the code a
+    /// peer observes stays the first one. The application still owns and joins
+    /// or cancels its tasks.
     pub fn abort(&self, reason: &[u8]) {
+        self.close_endpoint(abort_code(), reason);
+    }
+
+    /// Stops acceptance and closes the endpoint, unless a close already ran.
+    fn close_endpoint(&self, code: ApplicationCode, reason: &[u8]) {
         self.shutdown();
-        self.endpoint.close(abort_code(), reason);
+        // Record the close before the endpoint delivers it, so an owner that
+        // closes its connection afterwards repeats this code and reason.
+        if self.closed.set((code, reason.into())).is_ok() {
+            self.endpoint.close(code, reason);
+        }
     }
 
     /// Waits for endpoint connections to finish transport shutdown.
@@ -304,9 +377,19 @@ pub struct PendingSession {
     incoming: Incoming,
     accepted: Instant,
     options: Arc<ServerListenerOptions>,
+    listener: ListenerClose,
 }
 
 impl PendingSession {
+    /// Returns the peer's transport address as observed when the attempt arrived.
+    ///
+    /// It is readable before [`Self::handshake`] consumes the owner, so a TLS
+    /// or protocol-handshake failure can be logged with the peer's address.
+    #[must_use]
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.incoming.remote_addr()
+    }
+
     /// Awaits TLS and performs the bounded protocol handshake.
     ///
     /// The deadline includes time spent holding the pending owner and waiting
@@ -331,15 +414,21 @@ impl PendingSession {
 
         tokio::time::timeout(remaining, async {
             let connection = self.incoming.await.map_err(unsent)?;
-            let mut guard = AbortPending(Some(connection.clone()));
+            let mut guard = AbortPending(Some(connection.clone()), self.listener.clone());
             let (claims, mut exchange) =
                 server_handshake(&connection, &self.options.session, &self.options.protocol)
                     .await?;
             // A refusal can immediately close the connection. Let the reply
             // reach the peer's transport before exposing that control.
             exchange.finish_and_wait().await?;
-            let control = ServerSessionControl::new(connection.clone());
-            let shared = server_shared(connection, self.options.session.clone(), claims);
+            let control =
+                ServerSessionControl::new(connection.clone()).with_listener(self.listener.clone());
+            let shared = server_shared(
+                connection,
+                self.options.session.clone(),
+                claims,
+                Some(self.listener.clone()),
+            );
             guard.0 = None;
             Ok(UnadmittedSession {
                 shared,
@@ -355,12 +444,17 @@ impl PendingSession {
     }
 }
 
-struct AbortPending(Option<Connection>);
+struct AbortPending(Option<Connection>, ListenerClose);
 
 impl Drop for AbortPending {
     fn drop(&mut self) {
         if let Some(connection) = &self.0 {
-            connection.close(abort_code(), b"handshake did not complete");
+            close_connection(
+                connection,
+                Some(&self.1),
+                abort_code(),
+                b"handshake did not complete",
+            );
         }
     }
 }
@@ -454,6 +548,7 @@ pub enum ServerSessionClose {
 pub struct ServerSessionControl {
     connection: Connection,
     draining: watch::Sender<bool>,
+    listener: Option<ListenerClose>,
 }
 
 impl ServerSessionControl {
@@ -461,7 +556,13 @@ impl ServerSessionControl {
         Self {
             connection,
             draining: watch::Sender::new(false),
+            listener: None,
         }
+    }
+
+    fn with_listener(mut self, listener: ListenerClose) -> Self {
+        self.listener = Some(listener);
+        self
     }
 
     /// Waits for closure. Cancelling the wait leaves the session open.
@@ -492,15 +593,31 @@ impl ServerSessionControl {
     ///
     /// Use after draining to signal orderly shutdown. Either close method can
     /// also refuse admission, with reason bytes subject to QUIC packet capacity.
+    /// After [`ServerListener::close`] or [`ServerListener::abort`] has run on
+    /// the listener that accepted this session, either method repeats the
+    /// listener's code and reason instead, so the peer observes the listener's.
     pub fn close(&self, reason: &[u8]) {
         self.drain();
-        self.connection.close(ApplicationCode::default(), reason);
+        close_connection(
+            &self.connection,
+            self.listener.as_ref(),
+            ApplicationCode::default(),
+            reason,
+        );
     }
 
     /// Immediately refuses or aborts the connection with application code one.
+    ///
+    /// After a listener-wide close, it repeats the listener's code and reason,
+    /// as [`Self::close`] does.
     pub fn abort(&self, reason: &[u8]) {
         self.drain();
-        self.connection.close(abort_code(), reason);
+        close_connection(
+            &self.connection,
+            self.listener.as_ref(),
+            abort_code(),
+            reason,
+        );
     }
 
     pub(super) async fn drained(&self) {
@@ -509,6 +626,14 @@ impl ServerSessionControl {
             .subscribe()
             .wait_for(|draining| *draining)
             .await;
+    }
+}
+
+impl Drop for ServerSessionControl {
+    fn drop(&mut self) {
+        if let Some(listener) = &self.listener {
+            repeat_listener_close(&self.connection, listener);
+        }
     }
 }
 
