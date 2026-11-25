@@ -22,13 +22,134 @@ facilitate efficient and secure communication within the REview ecosystem.
   management
 - **Error Handling**: Comprehensive error handling with custom recovery options
 
-## Additive session API
+## Server session guide
 
-The `session` module offers cloneable role-specific domain handles, unique
-incoming stream owners, typed errors and outcome certainty, peer certificate
-access, and bounded framing over oinq 0.14.0. Constructors require explicit
-`SessionOptions`; `legacy_compatible()` selects the existing `u32` wire bound,
-and applications can configure separate limits for each message family.
+The `session` module runs a protocol server through protocol-owned types: an
+application binds, accepts, handshakes, admits, serves and shuts down without
+naming a Quinn or oinq type. TLS verification, identity and authorization
+policy stay in the application.
+
+[`examples/session_server.rs`](examples/session_server.rs) is a complete,
+self-contained server with in-process agents. It generates throwaway TLS
+material, refuses one agent and admits another, serves a request stream and an
+event stream concurrently, sends an outbound command, reloads TLS and shuts
+down:
+
+```bash
+cargo run --example session_server --features client,server
+```
+
+### Ownership and lifecycle
+
+Each stage has exactly one owner, and the application decides when to move on:
+
+1. `ServerListener` owns the UDP endpoint. `ServerListener::bind` takes the
+   address, the application's `rustls::ServerConfig` and
+   `ServerListenerOptions`; `ServerListener::from_socket` adopts an
+   already-bound socket. `accept` returns a `PendingSession` per connection
+   attempt, or `None` once the listener is shut down. The listener spawns no
+   application tasks.
+2. `PendingSession` owns one attempt before TLS. `handshake` performs TLS and
+   the protocol handshake under one deadline and returns an
+   `UnadmittedSession`. Dropping it abandons the attempt.
+3. `UnadmittedSession` exposes what admission is decided from:
+   `peer_certificates` (the TLS-verified chain) and `agent_claims` (the
+   agent's self-reported `AgentInfo`, which grants nothing). `control` returns
+   a `ServerSessionControl` to refuse with. Dropping it unadmitted closes the
+   connection.
+4. `UnadmittedSession::admit` binds an `AuthorizationContext` and a policy and
+   returns the admitted owners: a cloneable `ServerHandle` for outbound
+   commands, and the unique `ServerIncoming` that accepts the agent's streams
+   as `ServerStream::Requests` (run with `ServerRequestStream::run`) or
+   `ServerStream::DetectionEvents` (run with `DetectionEventReceiver::run`).
+
+`ServerSessionControl` is a cloneable handle to the connection itself, without
+dispatch or commands: `closed` waits for closure and reports a
+`ServerSessionClose`, `drain` stops stream acceptance, `close` ends the session
+with code zero, and `abort` refuses or aborts it with code one.
+
+### Admission is not the handshake
+
+A successful `handshake` means the agent's protocol version is inside the
+listener's window, and the success reply has already been sent. Admission is
+the application's separate decision, typically checking the verified
+certificate against its enrolment records and the claims against that
+identity. It adds no wire message: admitting is a local ownership transfer,
+and refusing is closing the connection with `control().abort(reason)` after
+the agent has seen handshake success.
+
+### Protocol window, deadlines and frame limits
+
+`ServerListenerOptions` holds every per-listener choice:
+
+- `protocol`: a `ProtocolWindow`, for example
+  `ProtocolWindow::new(MIN_PROTOCOL_VERSION_REQ, PROTOCOL_VERSION)`. A peer
+  must satisfy the requirement and be at or below the advertised version;
+  others get the structured rejection reply.
+- `handshake_timeout`: one deadline spanning TLS and the protocol handshake,
+  measured from `accept`, so a stalled peer cannot hold a pending slot.
+- `session`: `SessionOptions` with a `FrameLimit` for each message family
+  (`handshake`, `unary`, `detection_events`, `package_chunks`) and an
+  optional `operation_timeout` for outbound operations.
+  `SessionOptions::legacy_compatible()` selects the legacy `u32` wire bound
+  for every family.
+- `transport`: `ServerTransportOptions` for keepalive, idle timeout, stream
+  counts and receive and send windows.
+
+### Per-invocation authorization
+
+`admit` binds the `AuthorizationContext` the application built from the
+verified identity, together with an `Arc<dyn AuthorizerV2>`.
+`ServerRequestStream::run` calls the policy before parsing and dispatching
+every request, including several requests on one stream, so a policy change
+takes effect on the next request rather than the next connection. A denial
+sends one error reply and ends that stream's runner with
+`ServerRunError::AuthorizationDenied`; other streams are unaffected.
+
+### Supervision and bounded concurrency
+
+The crate spawns no application tasks, so the application owns every future
+and every limit:
+
+- Acquire a permit (for example from a `tokio::sync::Semaphore`) before
+  `ServerListener::accept`, and hold it in the task that runs `handshake`.
+  This bounds pending handshakes; further attempts wait in the transport.
+- Acquire a permit before `ServerIncoming::accept_next` and move it into the
+  task that runs the stream, which bounds the runners of one session.
+  `drain` wakes only an `accept_next` in progress: a supervisor waiting for a
+  permit while every runner holds one does not see it, so give the supervisor
+  its own shutdown signal (for example a `tokio::sync::watch` channel) as
+  well.
+- Keep the tasks in a `JoinSet` or hold their `JoinHandle`s, and join them.
+  `ServerListener::accept` and `ServerIncoming::accept_next` are cancel-safe,
+  so they can sit in a `tokio::select!` beside `JoinSet::join_next`.
+
+### TLS reload
+
+`ServerListener::reload_tls` installs a new `rustls::ServerConfig`, with its
+own certificate, provider and client verification, for connections accepted
+afterwards. Established sessions and handshakes already in TLS keep the
+configuration they started with. An invalid config returns an error and leaves
+the previous one installed.
+
+### Shutdown and drain
+
+Shut down in this order:
+
+1. `ServerListener::shutdown` stops acceptance and wakes a pending `accept`,
+   which returns `None`. Join the handshake tasks.
+2. Call `drain` on each admitted session's `ServerSessionControl`.
+   `ServerIncoming::accept_next` returns `None`; streams already accepted keep
+   running and outbound commands stay available.
+3. Join the session's runner tasks. Both runners return at the peer's clean
+   end of stream, so bound the wait and abort what outlives it.
+4. `close` the session.
+5. `ServerListener::wait_idle` waits until the endpoint's connections have
+   finished closing. It does not return while an admitted session is still
+   open.
+
+`ServerListener::abort` instead closes the endpoint and every connection at
+once; the application still joins its own tasks.
 
 ## Unidirectional Detection Event Stream API
 

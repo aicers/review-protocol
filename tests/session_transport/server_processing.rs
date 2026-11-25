@@ -23,8 +23,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{event_stream, raw_sessions, raw_sessions_at, request_stream};
 
-const REQUESTS: &[u8] = include_bytes!("../fixtures/current/server-requests.bin");
-const RESPONSES: &[u8] = include_bytes!("../fixtures/current/server-responses.bin");
+pub(super) const REQUESTS: &[u8] = include_bytes!("../fixtures/current/server-requests.bin");
+pub(super) const RESPONSES: &[u8] = include_bytes!("../fixtures/current/server-responses.bin");
 const DENIED_REQUESTS: &[u8] = include_bytes!("../fixtures/current/server-denied-requests.bin");
 const DENIED_RESPONSES: &[u8] = include_bytes!("../fixtures/current/server-denied-responses.bin");
 const UNKNOWN_REQUESTS: &[u8] = include_bytes!("../fixtures/current/server-unknown-requests.bin");
@@ -33,7 +33,7 @@ const MALFORMED_REQUEST: &[u8] = include_bytes!("../fixtures/current/server-malf
 const TRUNCATED_REQUEST: &[u8] = include_bytes!("../fixtures/current/server-truncated-request.bin");
 const DELEGATED_REQUESTS: &[u8] =
     include_bytes!("../fixtures/current/server-delegated-requests.bin");
-const EVENTS: &[u8] = include_bytes!("../fixtures/current/server-events.bin");
+pub(super) const EVENTS: &[u8] = include_bytes!("../fixtures/current/server-events.bin");
 const TRUNCATED_EVENT: &[u8] = include_bytes!("../fixtures/current/server-truncated-event.bin");
 
 const GET_CONFIG: &[u8] = &[0, 0, 0, 4, 36, 0, 0, 0];
@@ -67,15 +67,15 @@ fn fixture_event(cluster_id: u32, score: f64) -> DetectionEvent {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Observation {
+pub(super) enum Observation {
     Authorization(ServiceId),
     Handler(ServiceId),
 }
 
-type Trace = Arc<Mutex<Vec<Observation>>>;
+pub(super) type Trace = Arc<Mutex<Vec<Observation>>>;
 
 #[derive(Default)]
-struct FixtureHandler(Trace);
+pub(super) struct FixtureHandler(pub(super) Trace);
 
 impl FixtureHandler {
     fn record(&self, service: ServiceId) {
@@ -89,9 +89,9 @@ impl FixtureHandler {
 }
 
 #[derive(Default)]
-struct Policy {
-    trace: Trace,
-    deny: Option<ServiceId>,
+pub(super) struct Policy {
+    pub(super) trace: Trace,
+    pub(super) deny: Option<ServiceId>,
 }
 
 impl Policy {
@@ -324,12 +324,12 @@ impl Handler for FixtureHandler {
     }
 }
 
-fn context() -> AuthorizationContext {
+pub(super) fn context() -> AuthorizationContext {
     AuthorizationContext::from_peer_context(&PeerContext::new("verified-peer"))
 }
 
 #[derive(Clone, Default)]
-struct EventLog {
+pub(super) struct EventLog {
     entries: Arc<Mutex<Vec<String>>>,
     fail_callback: Option<&'static str>,
 }
@@ -489,7 +489,7 @@ fn delegated_requests(code: u8) -> Vec<u8> {
     bytes
 }
 
-fn check_events(log: &EventLog) {
+pub(super) fn check_events(log: &EventLog) {
     let entries = log.entries.lock().unwrap();
     assert_eq!(entries.len(), 4);
     assert_eq!(entries[0], format!("{:?}", fixture_event(1, 1.0)));
@@ -503,54 +503,71 @@ fn check_events(log: &EventLog) {
     );
 }
 
-async fn open_requests(node: &Connection, bytes: &[u8]) -> (oinq::SendStream, oinq::RecvStream) {
+pub(super) async fn open_requests(
+    node: &Connection,
+    bytes: &[u8],
+) -> (oinq::SendStream, oinq::RecvStream) {
     let (mut send, recv) = node.open_bi().await.unwrap();
     send.write_all(bytes).await.unwrap();
     (send, recv)
 }
 
-async fn open_events(node: &Connection, bytes: &[u8]) -> oinq::SendStream {
+pub(super) async fn open_events(node: &Connection, bytes: &[u8]) -> oinq::SendStream {
     let mut send = node.open_uni().await.unwrap();
     send.write_all(bytes).await.unwrap();
     send
 }
 
+/// The services the requests of `server-requests.bin` invoke, in stream order.
+pub(super) const EXPECTED_SERVICES: [ServiceId; 30] = [
+    service_id::SERVER_DATA_SOURCE_GET,
+    service_id::SERVER_INDICATOR_GET,
+    service_id::SERVER_MODEL_GET,
+    service_id::SERVER_MODEL_GET_NAMES,
+    service_id::SERVER_STATISTICS_INSERT_COLUMN,
+    service_id::SERVER_MODEL_INSERT,
+    service_id::SERVER_STATISTICS_INSERT_TIME_SERIES,
+    service_id::SERVER_MODEL_REMOVE,
+    service_id::SERVER_CLUSTER_UPDATE,
+    service_id::SERVER_MODEL_UPDATE,
+    service_id::SERVER_OUTLIER_UPDATE,
+    service_id::SERVER_EVENT_INSERT_LABELS,
+    service_id::SERVER_LABEL_GET_DB_PATTERNS,
+    service_id::SERVER_DATA_SOURCE_INSERT,
+    service_id::SERVER_CERTIFICATE_RENEW,
+    service_id::SERVER_LIST_TRUSTED_DOMAIN,
+    service_id::SERVER_OUTLIER_GET,
+    service_id::SERVER_LIST_TOR_EXIT_NODE,
+    service_id::SERVER_LIST_INTERNAL_NETWORK,
+    service_id::SERVER_LIST_EXCLUSION_LIST,
+    service_id::SERVER_LIST_WATCHLIST,
+    service_id::SERVER_MODEL_GET_PRETRAINED,
+    service_id::SERVER_LIST_TRUSTED_USER_AGENT,
+    service_id::SERVER_CONFIG_GET,
+    service_id::SERVER_LIST_TIME_SERIES_GENERATION_POLICY,
+    service_id::SERVER_CUSTOMER_DATA_DELETION_REPORT,
+    service_id::SERVER_RUN_UPLOAD_MODEL,
+    service_id::SERVER_RUN_REPORT,
+    service_id::SERVER_RUN_REPORT_ACTIVE,
+    service_id::SERVER_DETECTOR_REPORT_STATUS,
+];
+
+/// Asserts that the runner authorized every request of `server-requests.bin`
+/// before dispatching it, in stream order.
+pub(super) fn check_dispatch_trace(trace: &Trace) {
+    let mut expected = Vec::new();
+    for service in EXPECTED_SERVICES {
+        expected.push(Observation::Authorization(service));
+        // This method uses the actual default implementation.
+        if service != service_id::SERVER_MODEL_GET_NAMES {
+            expected.push(Observation::Handler(service));
+        }
+    }
+    assert_eq!(*trace.lock().unwrap(), expected);
+}
+
 #[tokio::test]
 async fn runner_dispatches_every_built_in_on_one_stream() {
-    use review_protocol::service_id::*;
-
-    let expected_services = [
-        SERVER_DATA_SOURCE_GET,
-        SERVER_INDICATOR_GET,
-        SERVER_MODEL_GET,
-        SERVER_MODEL_GET_NAMES,
-        SERVER_STATISTICS_INSERT_COLUMN,
-        SERVER_MODEL_INSERT,
-        SERVER_STATISTICS_INSERT_TIME_SERIES,
-        SERVER_MODEL_REMOVE,
-        SERVER_CLUSTER_UPDATE,
-        SERVER_MODEL_UPDATE,
-        SERVER_OUTLIER_UPDATE,
-        SERVER_EVENT_INSERT_LABELS,
-        SERVER_LABEL_GET_DB_PATTERNS,
-        SERVER_DATA_SOURCE_INSERT,
-        SERVER_CERTIFICATE_RENEW,
-        SERVER_LIST_TRUSTED_DOMAIN,
-        SERVER_OUTLIER_GET,
-        SERVER_LIST_TOR_EXIT_NODE,
-        SERVER_LIST_INTERNAL_NETWORK,
-        SERVER_LIST_EXCLUSION_LIST,
-        SERVER_LIST_WATCHLIST,
-        SERVER_MODEL_GET_PRETRAINED,
-        SERVER_LIST_TRUSTED_USER_AGENT,
-        SERVER_CONFIG_GET,
-        SERVER_LIST_TIME_SERIES_GENERATION_POLICY,
-        SERVER_CUSTOMER_DATA_DELETION_REPORT,
-        SERVER_RUN_UPLOAD_MODEL,
-        SERVER_RUN_REPORT,
-        SERVER_RUN_REPORT_ACTIVE,
-        SERVER_DETECTOR_REPORT_STATUS,
-    ];
     // The agent speaks the current protocol, so the list pulls reach the
     // handler; an earlier agent's are answered without it.
     let (incoming, _, _, node) = raw_sessions_at(
@@ -577,15 +594,7 @@ async fn runner_dispatches_every_built_in_on_one_stream() {
     recv.read_to_end(&mut responses).await.unwrap();
     assert_eq!(responses, RESPONSES);
 
-    let mut expected = Vec::new();
-    for service in expected_services {
-        expected.push(Observation::Authorization(service));
-        // This method uses the actual default implementation.
-        if service != SERVER_MODEL_GET_NAMES {
-            expected.push(Observation::Handler(service));
-        }
-    }
-    assert_eq!(*trace.lock().unwrap(), expected);
+    check_dispatch_trace(&trace);
 }
 
 #[tokio::test]
