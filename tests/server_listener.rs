@@ -468,6 +468,174 @@ async fn abort_closes_a_handshaking_connection() {
     timeout(TEST_TIMEOUT, listener.wait_idle()).await.unwrap();
 }
 
+/// Opens a stream on `peer` and waits until the listener's transport has
+/// acknowledged it, polling the pending handshake first meanwhile so that it
+/// has taken the established connection and is reading the protocol claims.
+async fn acknowledged_probe(
+    peer: &Connection,
+    pending: &mut (impl Future<Output = Result<UnadmittedSession, SessionError>> + Unpin),
+) {
+    let mut probe = peer.open_uni().await.unwrap();
+    probe.finish().unwrap();
+    timeout(TEST_TIMEOUT, async {
+        tokio::select! {
+            biased;
+            result = pending => panic!("the protocol handshake ended early: {:?}", result.err()),
+            stopped = probe.stopped() => assert_eq!(stopped.unwrap(), None),
+        }
+    })
+    .await
+    .unwrap();
+}
+
+const CLOSE_REASON: &[u8] = b"listener closed";
+
+#[tokio::test]
+async fn close_delivers_code_zero_to_admitted_unadmitted_and_pending_peers() {
+    let (listener, endpoint) = setup(options());
+    let observations = Arc::new(Observations::default());
+    let (admitted_peer, owner, reply) = handshake(&listener, &endpoint, FULL).await;
+    assert_eq!(reply, ACCEPTED);
+    let (_handle, mut incoming) = decide(owner.unwrap(), Admission::Admit, &observations).unwrap();
+    let admitted = incoming.control();
+    let (unadmitted_peer, owner, reply) = handshake(&listener, &endpoint, FULL).await;
+    assert_eq!(reply, ACCEPTED);
+    let owner = owner.unwrap();
+    let unadmitted = owner.control();
+    let (pending_peer, pending) = connect_pending(&listener, &endpoint).await;
+    let mut pending = Box::pin(pending);
+    acknowledged_probe(&pending_peer, &mut pending).await;
+
+    listener.close(CLOSE_REASON);
+    assert!(listener.accept().await.unwrap().is_none());
+    // Neither a later abort nor the owners' own code-one closes replace the
+    // listener's code zero.
+    listener.abort(b"listener aborted");
+    drop(owner);
+    assert!(matches!(
+        timeout(TEST_TIMEOUT, pending).await.unwrap(),
+        Err(SessionError::Transport { .. })
+    ));
+    for control in [&admitted, &unadmitted] {
+        assert!(matches!(
+            timeout(TEST_TIMEOUT, control.closed()).await.unwrap(),
+            ServerSessionClose::Local
+        ));
+    }
+    // An accepted stream runner observes the closed transport.
+    assert!(incoming.accept().await.is_err());
+    for peer in [&admitted_peer, &unadmitted_peer, &pending_peer] {
+        peer_close(peer, ApplicationCode::default(), CLOSE_REASON).await;
+    }
+    timeout(TEST_TIMEOUT, listener.wait_idle()).await.unwrap();
+    assert_eq!(observations.calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn close_wakes_accept_and_fails_an_unawaited_attempt() {
+    let (listener, endpoint) = setup(options());
+    let (pending, connecting) = accept_attempt(&listener, &endpoint).await;
+    let mut accept = tokio_test::task::spawn(listener.accept());
+    assert!(accept.poll().is_pending());
+    listener.close(CLOSE_REASON);
+    assert!(accept.await.unwrap().is_none());
+    assert!(listener.accept().await.unwrap().is_none());
+    // The attempt had not started TLS, so it carries no application code,
+    // and it is never admitted.
+    assert!(
+        timeout(TEST_TIMEOUT, pending.handshake())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert!(timeout(TEST_TIMEOUT, connecting).await.unwrap().is_err());
+    timeout(TEST_TIMEOUT, listener.wait_idle()).await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_accept_or_handshake_around_close_leaves_nothing_open() {
+    let (listener, endpoint) = setup(options());
+    let mut canceled_accept = tokio_test::task::spawn(listener.accept());
+    assert!(canceled_accept.poll().is_pending());
+    drop(canceled_accept);
+    let (peer, pending) = connect_pending(&listener, &endpoint).await;
+    let mut pending = Box::pin(pending);
+    acknowledged_probe(&peer, &mut pending).await;
+
+    listener.close(CLOSE_REASON);
+    // The pending owner's code-one close on cancellation repeats the
+    // listener's close instead.
+    drop(pending);
+    peer_close(&peer, ApplicationCode::default(), CLOSE_REASON).await;
+    // A close after close leaves the code alone.
+    listener.close(b"closed again");
+    assert!(listener.accept().await.unwrap().is_none());
+    timeout(TEST_TIMEOUT, listener.wait_idle()).await.unwrap();
+}
+
+/// Dropping an admitted session right after a listener-wide close would let
+/// the transport's implicit close, code zero with no reason, overtake the
+/// endpoint's; the session repeats the listener's close instead.
+#[tokio::test]
+async fn dropping_a_session_right_after_a_listener_close_keeps_its_code() {
+    for code in [0, 1] {
+        let (listener, endpoint) = setup(options());
+        let observations = Arc::new(Observations::default());
+        let (peer, owner, reply) = handshake(&listener, &endpoint, FULL).await;
+        assert_eq!(reply, ACCEPTED);
+        let (handle, incoming) = decide(owner.unwrap(), Admission::Admit, &observations).unwrap();
+        if code == 0 {
+            listener.close(CLOSE_REASON);
+        } else {
+            listener.abort(CLOSE_REASON);
+        }
+        drop(handle);
+        drop(incoming);
+        peer_close(&peer, ApplicationCode::new(code).unwrap(), CLOSE_REASON).await;
+        timeout(TEST_TIMEOUT, listener.wait_idle()).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn pending_remote_addr_precedes_tls_and_protocol_failures() {
+    let server = Certificate::generate();
+    let client = Certificate::generate();
+    let stranger = Certificate::generate();
+    let listener = ServerListener::bind(LOOPBACK, server_tls(&server, &client), options()).unwrap();
+
+    // TLS fails: the listener does not trust the client certificate.
+    let untrusted = client_endpoint(&server, &stranger);
+    let (pending, connecting) = accept_attempt(&listener, &untrusted).await;
+    assert_eq!(pending.remote_addr(), untrusted.local_addr().unwrap());
+    let (result, _) = timeout(TEST_TIMEOUT, async {
+        tokio::join!(pending.handshake(), connecting)
+    })
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(SessionError::Transport { .. })));
+
+    // The protocol handshake fails: the version is outside the window.
+    let trusted = client_endpoint(&server, &client);
+    let (pending, connecting) = accept_attempt(&listener, &trusted).await;
+    assert_eq!(pending.remote_addr(), trusted.local_addr().unwrap());
+    let mut claims = FULL.to_vec();
+    claims[13..19].copy_from_slice(b"0.48.0");
+    let (result, (_peer, reply)) = timeout(TEST_TIMEOUT, async {
+        tokio::join!(pending.handshake(), async {
+            let peer = connecting.await.unwrap();
+            let reply = exchange_claims(&peer, &claims).await;
+            (peer, reply)
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(reply, REJECTED);
+    assert!(matches!(
+        result,
+        Err(SessionError::IncompatibleProtocol { .. })
+    ));
+}
+
 #[tokio::test]
 async fn admitted_session_binds_authorization_and_keeps_outbound_operations() {
     let (listener, endpoint) = setup(options());

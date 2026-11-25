@@ -37,10 +37,10 @@ use crate::{
     auth::{AuthorizationContext, AuthorizerV2},
     server::{Handler, RequestCode as ServerCode},
     types::{
-        ColumnStatisticsUpdate, DaiCursors, DaiExtractorConfig, DaiObservationBatch, DaiRangeDay,
-        DaiRangeGrant, DaiRangeLate, DaiRangeMark, DaiRangeUnit, DaiStoreAck, DataSource,
-        DataSourceKey, DetectionEvent, HostNetworkGroup, OutlierInfo, TimeSeriesGenerationPolicy,
-        TimeSeriesUpdate, UpdateClusterRequest,
+        ColumnStatisticsUpdate, CustomerDataDeletionRequest, DaiCursors, DaiExtractorConfig,
+        DaiObservationBatch, DaiRangeDay, DaiRangeGrant, DaiRangeLate, DaiRangeMark, DaiRangeUnit,
+        DaiStoreAck, DataSource, DataSourceKey, DetectionEvent, HostNetworkGroup, OutlierInfo,
+        TimeSeriesGenerationPolicy, TimeSeriesUpdate, TrafficFilterRule, UpdateClusterRequest,
     },
 };
 
@@ -1256,18 +1256,24 @@ pub enum AgentRequest<'a> {
     },
 }
 
+/// Refuses an exclusion-list or watchlist exchange, before anything is sent, on
+/// a session whose handshake shows a side earlier than the item lists.
+fn check_network_lists(shared: &Shared) -> Result<(), SessionError> {
+    match &shared.network_list_blocker {
+        None => Ok(()),
+        Some(version) => Err(SessionError::IncompatibleProtocol {
+            version: version.clone(),
+            required: crate::NETWORK_LIST_ITEMS_REQ.to_owned(),
+        }),
+    }
+}
+
 #[cfg(feature = "client")]
 impl super::AgentHandle {
     /// Refuses an exclusion-list or watchlist pull, before anything is sent, on a
     /// session whose handshake shows a side earlier than the item lists.
     fn check_network_lists(&self) -> Result<(), SessionError> {
-        match &self.0.network_list_blocker {
-            None => Ok(()),
-            Some(version) => Err(SessionError::IncompatibleProtocol {
-                version: version.clone(),
-                required: crate::NETWORK_LIST_ITEMS_REQ.to_owned(),
-            }),
-        }
+        check_network_lists(&self.0)
     }
 
     /// Sends the `upload_run_model` engine operation.
@@ -1547,6 +1553,142 @@ impl super::ServerHandle {
             detector_id,
         )
         .await
+    }
+
+    /// Pushes the exclusion list to the agent.
+    ///
+    /// Every item is sent in the order given, without sorting, merging or
+    /// deduplicating; the agent attributes a skipped raw event to the first
+    /// matching entry in that order. `Ok(())` means the agent accepted the list.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::IncompatibleProtocol`], before anything is sent,
+    /// when the agent's handshake version is below `0.50.0`, whose list payload
+    /// can decode as a different item list. Otherwise returns classified
+    /// transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn send_exclusion_list(
+        &self,
+        exclusion_list: &[NetworkListItem],
+    ) -> Result<(), SessionError> {
+        check_network_lists(&self.0)?;
+        self.push(crate::client::RequestCode::ExclusionList, exclusion_list)
+            .await
+    }
+
+    /// Pushes the watchlist to the agent.
+    ///
+    /// Every item is sent in the order given, without sorting, merging or
+    /// deduplicating. `Ok(())` means the agent accepted the list.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::IncompatibleProtocol`], before anything is sent,
+    /// when the agent's handshake version is below `0.50.0`, whose list payload
+    /// can decode as a different item list. Otherwise returns classified
+    /// transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn send_watchlist(&self, watchlist: &[NetworkListItem]) -> Result<(), SessionError> {
+        check_network_lists(&self.0)?;
+        self.push(crate::client::RequestCode::Watchlist, watchlist)
+            .await
+    }
+
+    /// Tells the agent that its configuration changed and should be fetched again.
+    ///
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn send_config_update_cmd(&self) -> Result<(), SessionError> {
+        self.push(crate::client::RequestCode::UpdateConfig, ())
+            .await
+    }
+
+    /// Asks the agent to delete customer-owned filesystem data.
+    ///
+    /// The request's opaque ID comes back unchanged in the agent's deletion
+    /// report. `Ok(())` acknowledges the command, not the deletion.
+    ///
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn send_delete_customer_data_cmd(
+        &self,
+        request: &CustomerDataDeletionRequest,
+    ) -> Result<(), SessionError> {
+        self.push(crate::client::RequestCode::DeleteCustomerData, request)
+            .await
+    }
+
+    /// Pushes the traffic filtering rules to the agent, in the order given.
+    ///
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn send_filtering_rules(
+        &self,
+        list: &[TrafficFilterRule],
+    ) -> Result<(), SessionError> {
+        self.push(crate::client::RequestCode::ReloadFilterRule, list)
+            .await
+    }
+
+    /// Pushes the internal network list to the agent.
+    ///
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn send_internal_network_list(
+        &self,
+        list: &HostNetworkGroup,
+    ) -> Result<(), SessionError> {
+        self.push(crate::client::RequestCode::InternalNetworkList, list)
+            .await
+    }
+
+    /// Pushes the time-series generation policies to the agent, in the order given.
+    ///
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn send_time_series_generation_policies(
+        &self,
+        list: &[TimeSeriesGenerationPolicy],
+    ) -> Result<(), SessionError> {
+        self.push(
+            crate::client::RequestCode::TimeSeriesGenerationPolicyList,
+            list,
+        )
+        .await
+    }
+
+    /// Pushes the Tor exit node list to the agent, in the order given.
+    ///
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn send_tor_exit_node_list(&self, list: &[String]) -> Result<(), SessionError> {
+        self.push(crate::client::RequestCode::TorExitNodeList, list)
+            .await
+    }
+
+    /// Pushes the trusted domain list to the agent, in the order given.
+    ///
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn send_trusted_domain_list(&self, list: &[String]) -> Result<(), SessionError> {
+        self.push(crate::client::RequestCode::TrustedDomainList, list)
+            .await
+    }
+
+    /// Pushes the trusted user-agent list to the agent, in the order given.
+    ///
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn send_trusted_user_agent_list(&self, list: &[String]) -> Result<(), SessionError> {
+        self.push(crate::client::RequestCode::TrustedUserAgentList, list)
+            .await
+    }
+
+    /// Sends one configuration or list push through the bounded unary exchange,
+    /// expecting a `Result<(), String>` acknowledgment.
+    async fn push<I: Serialize>(
+        &self,
+        code: crate::client::RequestCode,
+        input: I,
+    ) -> Result<(), SessionError> {
+        unary(&self.0.connection, &self.0.options, u32::from(code), input).await
     }
 
     /// Sends a typed node service operation.
@@ -1955,5 +2097,136 @@ fn terminal_preflight(
         P::EnrollmentUnsupported => Some(T::EnrollmentUnsupported),
         P::ConfigTemplateOnUpdate => Some(T::ConfigTemplateOnUpdate),
         P::UnknownConfigTemplate { id } => Some(T::UnknownConfigTemplate { id }),
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::{client::RequestCode, session::ServerHandle};
+
+    /// How the session API covers one manager-to-agent request code.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Coverage {
+        /// The `ServerHandle` method that sends the code.
+        ServerHandle(&'static str),
+        /// The legacy `server::Connection` has no sender for the code either.
+        NoLegacySender,
+        /// The single documented exception: legacy `send_ping` (code 17).
+        PingNotProvided,
+    }
+
+    /// Names a `ServerHandle` method, so a renamed or removed method fails to
+    /// compile, and records it as the code's sender.
+    macro_rules! handle {
+        ($method:ident) => {{
+            let _ = ServerHandle::$method;
+            Coverage::ServerHandle(stringify!($method))
+        }};
+    }
+
+    /// Classifies every request code the manager can send to an agent.
+    ///
+    /// The `match` has no wildcard arm, so a new `client::RequestCode` fails to
+    /// compile until it is classified here. Each code maps to exactly one of:
+    ///
+    /// - the `ServerHandle` method that sends it: the ten configuration and list
+    ///   pushes, the four engine commands, and the eleven `node_*` families
+    ///   (`NodePackage` also covers `node_package_install`);
+    /// - no legacy `server::Connection` sender, so nothing to carry over;
+    /// - `EchoRequest`, the one documented exception: legacy `send_ping` is
+    ///   intentionally not provided on `ServerHandle`, because transport
+    ///   keepalive and idle timeout (`ServerTransportOptions`) cover liveness.
+    ///
+    /// The legacy surface that is not keyed by a request code maps as follows:
+    ///
+    /// - the `node()` namespace and the `node_*_authorized` and
+    ///   `node_*_with_context` variants map to `ServerHandle::node_*`, with the
+    ///   application authorizing before the call. `node().reboot()` and
+    ///   `node().shutdown()` send code 106, so they map to `node_power`, not to
+    ///   codes 4 (`Reboot`) and 21 (`Shutdown`);
+    /// - the inbound `accept_detection_event_stream`,
+    ///   `handle_detection_event_stream`, `server::handshake` and
+    ///   `respond_with_labeldb_patterns` are covered by `ServerIncoming` and
+    ///   `ServerListener`;
+    /// - `from_quinn`, `as_quinn`, `open_bi`, `accept_uni` and `peer_identity`
+    ///   are raw-transport access and intentionally not provided;
+    /// - `close` maps to `ServerSessionControl::close` and `abort`;
+    /// - the free functions `server::notify_config_update` and the deprecated
+    ///   `server::send_trusted_domain_list` map to `send_config_update_cmd` and
+    ///   `send_trusted_domain_list`.
+    fn coverage(code: RequestCode) -> Coverage {
+        match code {
+            RequestCode::ExclusionList => handle!(send_exclusion_list),
+            RequestCode::Watchlist => handle!(send_watchlist),
+            RequestCode::UpdateConfig => handle!(send_config_update_cmd),
+            RequestCode::DeleteCustomerData => handle!(send_delete_customer_data_cmd),
+            RequestCode::ReloadFilterRule => handle!(send_filtering_rules),
+            RequestCode::InternalNetworkList => handle!(send_internal_network_list),
+            RequestCode::TimeSeriesGenerationPolicyList => {
+                handle!(send_time_series_generation_policies)
+            }
+            RequestCode::TorExitNodeList => handle!(send_tor_exit_node_list),
+            RequestCode::TrustedDomainList => handle!(send_trusted_domain_list),
+            RequestCode::TrustedUserAgentList => handle!(send_trusted_user_agent_list),
+            RequestCode::TrainModel => handle!(send_train_model),
+            RequestCode::CloneModel => handle!(send_clone_model),
+            RequestCode::CancelRun => handle!(send_cancel_run),
+            RequestCode::RunDetectorOnce => handle!(send_run_detector_once),
+            RequestCode::NodeService => handle!(node_service),
+            RequestCode::NodeNetworkInterface => handle!(node_network_interface),
+            RequestCode::NodeHostname => handle!(node_hostname),
+            RequestCode::NodeTimeSync => handle!(node_time_sync),
+            RequestCode::NodeLogging => handle!(node_logging),
+            RequestCode::NodeRemoteAccess => handle!(node_remote_access),
+            RequestCode::NodePower => handle!(node_power),
+            RequestCode::NodeObservation => handle!(node_observation),
+            RequestCode::NodeVersion => handle!(node_version),
+            RequestCode::NodePackage => handle!(node_package),
+            RequestCode::NodeEnroll => handle!(node_enroll),
+            RequestCode::DnsStart
+            | RequestCode::DnsStop
+            | RequestCode::Reboot
+            | RequestCode::ReloadConfig
+            | RequestCode::ReloadTi
+            | RequestCode::ResourceUsage
+            | RequestCode::DeleteTimeSeriesGenerationPolicy
+            | RequestCode::ProcessList
+            | RequestCode::SemiSupervisedModels
+            | RequestCode::Shutdown
+            | RequestCode::Unknown => Coverage::NoLegacySender,
+            RequestCode::EchoRequest => Coverage::PingNotProvided,
+        }
+    }
+
+    #[test]
+    fn every_request_code_is_classified_for_server_handle() {
+        let mut methods = BTreeSet::new();
+        let mut unsent = BTreeSet::new();
+        let mut exceptions = Vec::new();
+        // Every defined code is below 1024; anything else decodes as `Unknown`.
+        for number in (0..1024).chain([u32::MAX]) {
+            let code = RequestCode::from(number);
+            if code == RequestCode::Unknown && number != u32::MAX {
+                continue;
+            }
+            assert_eq!(u32::from(code), number);
+            match coverage(code) {
+                Coverage::ServerHandle(method) => {
+                    assert!(methods.insert(method), "{method} sends two codes");
+                }
+                Coverage::NoLegacySender => {
+                    unsent.insert(number);
+                }
+                Coverage::PingNotProvided => exceptions.push(number),
+            }
+        }
+        assert_eq!(methods.len(), 25, "{methods:?}");
+        assert_eq!(
+            unsent,
+            BTreeSet::from([1, 2, 4, 5, 6, 7, 13, 19, 20, 21, u32::MAX])
+        );
+        assert_eq!(exceptions, [17], "only EchoRequest is an exception");
     }
 }

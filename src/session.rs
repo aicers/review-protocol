@@ -11,10 +11,19 @@
 //!
 //! `ServerHandle` is the manager's cloneable handle for calling an agent. Its node
 //! methods preserve typed responses, including immediate power `Sent` outcomes and
-//! terminal package preflight outcomes. `AgentHandle` is the agent's cloneable handle
-//! for calling the manager, including configuration and model transfers. Handles
-//! expose domain operations, identity, handshake metadata, certificates, and closure.
-//! They do not expose protocol streams.
+//! terminal package preflight outcomes. It also sends the engine commands and the
+//! configuration and list pushes (`send_exclusion_list`, `send_watchlist`,
+//! `send_config_update_cmd`, `send_delete_customer_data_cmd`,
+//! `send_filtering_rules`, `send_internal_network_list`,
+//! `send_time_series_generation_policies`, `send_tor_exit_node_list`,
+//! `send_trusted_domain_list`, `send_trusted_user_agent_list`), each one bounded
+//! unary exchange that sends lists in the order given. The exclusion-list and
+//! watchlist pushes refuse an agent below protocol `0.50.0` before sending. No
+//! ping is provided: transport keepalive and idle timeout cover liveness.
+//! `AgentHandle` is the agent's cloneable handle for calling the manager,
+//! including configuration and model transfers. Handles expose domain operations,
+//! identity, handshake metadata, certificates, and closure. They do not expose
+//! protocol streams.
 //!
 //! With the server feature, use `ServerListener::bind` or
 //! `ServerListener::from_socket` with application-supplied rustls configuration,
@@ -24,23 +33,30 @@
 //! policy for future connections on the same socket.
 //!
 //! Acquire a pending-work permit before `ServerListener::accept`, then supervise
-//! each `PendingSession::handshake` independently. The deadline covers both TLS
-//! and the protocol handshake from the moment the listener returns the pending
-//! owner. `UnadmittedSession` provides agent claims, the verified certificate
-//! chain where present, and `ServerSessionControl`. Dropping the owner aborts
-//! the connection. `UnadmittedSession::admit` consumes it and binds the
+//! each `PendingSession::handshake` independently. `PendingSession::remote_addr`
+//! returns the attempt's peer address before the handshake consumes the owner, so a
+//! TLS or protocol-handshake failure can be logged with it. The deadline covers
+//! both TLS and the protocol handshake from the moment the listener returns the
+//! pending owner. `UnadmittedSession` provides agent claims, the verified
+//! certificate chain where present, and `ServerSessionControl`. Dropping the owner
+//! aborts the connection. `UnadmittedSession::admit` consumes it and binds the
 //! application's authorization context and policy to incoming requests. Admission
 //! sends no wire frame. The peer can attempt traffic once it reads the protocol
 //! success reply, and the application can dispatch only after admitting it.
 //!
 //! To shut down, call `ServerListener::shutdown` to end listener acceptance.
-//! Already accepted work retains its endpoint resources even after listener
-//! drop. Use `ServerSessionControl::drain` to stop receiving new streams while
-//! accepted work completes, then close each connection after joining the work.
-//! A listener or session abort immediately closes transport. The application
-//! owns task cancellation and joins. The listener and incoming accept futures
-//! are cancel-safe. `ServerIncoming::accept_next` reports clean exhaustion as
-//! `None`. `ServerListener::wait_idle` waits for transport shutdown.
+//! Already accepted work retains its endpoint resources even after listener drop.
+//! Use `ServerSessionControl::drain` to stop receiving new streams while accepted
+//! work completes, then close each connection after joining the work.
+//! `ServerListener::close` instead closes every connection on the endpoint at once
+//! with application code zero, the code of normal shutdown, and
+//! `ServerListener::abort` with code one, the code of refusal; whichever runs first
+//! sets the code and reason peers observe, even if sessions are closed through
+//! `ServerSessionControl` or dropped right after. A listener or session abort
+//! immediately closes transport. The application owns task cancellation and
+//! joins. The listener and incoming accept futures are cancel-safe.
+//! `ServerIncoming::accept_next` reports clean exhaustion as `None`.
+//! `ServerListener::wait_idle` waits for transport shutdown.
 //!
 //! The lower-level `from_transport` constructors still take an established
 //! `Connection`. To use them, construct an oinq `Endpoint` with the application's
@@ -615,6 +631,10 @@ struct Shared {
     /// The handshake version that keeps this session off the exclusion-list and
     /// watchlist exchanges, or `None` when both sides speak the item lists.
     network_list_blocker: Option<String>,
+    /// The close of the listener that accepted this session, which dropping
+    /// the session repeats.
+    #[cfg(feature = "server")]
+    listener: Option<listener::ListenerClose>,
 }
 
 impl Shared {
@@ -623,19 +643,33 @@ impl Shared {
         options: SessionOptions,
         metadata: HandshakeMetadata,
         network_list_blocker: Option<String>,
-    ) -> Arc<Self> {
+    ) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let certificates = connection.peer_certificates().map(|chain| {
             PeerCertificates(chain.iter().map(|cert| cert.as_ref().to_vec()).collect())
         });
-        Arc::new(Self {
+        Self {
             certificates,
             connection,
             options,
             id: SessionId(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
             metadata,
             network_list_blocker,
-        })
+            #[cfg(feature = "server")]
+            listener: None,
+        }
+    }
+}
+
+/// Dropping the last handle to a connection closes it implicitly with code
+/// zero and no reason, which would apply before the endpoint's asynchronous
+/// listener-wide close reaches the connection.
+#[cfg(feature = "server")]
+impl Drop for Shared {
+    fn drop(&mut self) {
+        if let Some(listener) = &self.listener {
+            listener::repeat_listener_close(&self.connection, listener);
+        }
     }
 }
 

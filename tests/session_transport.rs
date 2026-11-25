@@ -143,11 +143,15 @@ async fn sessions_at(
     (server, server_incoming, agent, agent_incoming)
 }
 
-async fn raw_agent(options: SessionOptions) -> (ServerHandle, Connection) {
+/// Connects a manager session to an agent transport whose streams the test
+/// answers by hand, with the agent advertising `version` and the manager
+/// replying with `version` as its ceiling.
+async fn raw_agent(options: SessionOptions, version: &str) -> (ServerHandle, Connection) {
     let (server, agent) = connections().await;
-    let claims = claims();
+    let mut claims = claims();
+    claims.protocol_version = version.into();
     let (server, _) = tokio::join!(
-        ServerHandle::from_transport(server, options.clone(), ">=0.48.0", "0.49.0"),
+        ServerHandle::from_transport(server, options.clone(), ">=0.48.0", version),
         AgentHandle::from_transport(agent.clone(), options, &claims)
     );
     (server.unwrap().0, agent)
@@ -280,7 +284,7 @@ async fn sent_mutation_transport_failure_is_unknown() {
 
 #[tokio::test]
 async fn abandoning_outbound_exchange_resets_and_stops_both_directions() {
-    let (server, agent) = raw_agent(SessionOptions::legacy_compatible()).await;
+    let (server, agent) = raw_agent(SessionOptions::legacy_compatible(), "0.49.0").await;
     let caller = server.clone();
     let operation =
         tokio::spawn(async move { caller.node_power(NodePowerRequest::GracefulReboot).await });
@@ -356,7 +360,7 @@ async fn retained_request_stream_resumes_partial_frame() {
 async fn timeout_reports_certainty_and_aborts_exchange() {
     let mut options = SessionOptions::legacy_compatible();
     options.operation_timeout = Some(Duration::from_secs(1));
-    let (server, agent) = raw_agent(options).await;
+    let (server, agent) = raw_agent(options, "0.49.0").await;
     let (result, ()) = tokio::join!(server.node_power(NodePowerRequest::GracefulReboot), async {
         let (send, recv) = agent.accept_bi().await.unwrap();
         let mut reader = oinq::frame::FramedReader::new(recv, FrameLimit::new(1024).unwrap());
@@ -1422,6 +1426,13 @@ fn assert_legacy_list_reply_decodes_in_full() {
 /// Answers the next request stream `manager` accepts with `reply` and returns
 /// the request's code.
 async fn answer_raw(manager: &Connection, reply: &[u8]) -> u32 {
+    let request = answer_raw_frame(manager, reply).await;
+    u32::from_le_bytes(*request.first_chunk::<4>().unwrap())
+}
+
+/// Answers the next request stream `manager` accepts with `reply` and returns
+/// the whole request frame: the little-endian request code and the body.
+async fn answer_raw_frame(manager: &Connection, reply: &[u8]) -> Vec<u8> {
     use oinq::frame::{FramedReader, FramedWriter};
 
     let (send, recv) = manager.accept_bi().await.unwrap();
@@ -1432,7 +1443,7 @@ async fn answer_raw(manager: &Connection, reply: &[u8]) -> u32 {
     writer.start_raw(reply).unwrap();
     writer.flush().await.unwrap();
     let _ = writer.into_inner().finish();
-    u32::from_le_bytes(*request.first_chunk::<4>().unwrap())
+    request
 }
 
 /// Checks that `agent` refuses both list pulls for `version` without sending
@@ -1516,7 +1527,7 @@ async fn list_pulls_refuse_a_manager_replying_0_49_0() {
 async fn time_sync_status_decodes_current_release_bytes() {
     use oinq::frame::{FramedReader, FramedWriter};
     use review_protocol::types::node::{NodeTimeSyncRequest, NodeTimeSyncResponse};
-    let (manager, agent) = raw_agent(SessionOptions::legacy_compatible()).await;
+    let (manager, agent) = raw_agent(SessionOptions::legacy_compatible(), "0.49.0").await;
     let (result, ()) = tokio::join!(manager.node_time_sync(NodeTimeSyncRequest::Status), async {
         let (send, recv) = agent.accept_bi().await.unwrap();
         let limit = FrameLimit::new(1024).unwrap();
@@ -1787,3 +1798,5 @@ async fn incomplete_install_cannot_send_a_terminal_success() {
 mod server_integration;
 #[path = "session_transport/server_processing.rs"]
 mod server_processing;
+#[path = "session_transport/server_pushes.rs"]
+mod server_pushes;

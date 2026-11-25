@@ -12,6 +12,7 @@ use review_protocol::{
         ServerListenerOptions, ServerSessionClose, ServerSessionControl, ServerStream,
         ServerTransportOptions, SessionError, UnadmittedSession,
     },
+    types::NetworkListItem,
 };
 
 fn options() -> Result<ServerListenerOptions, SessionError> {
@@ -44,7 +45,10 @@ pub async fn accept(listener: &ServerListener) -> Result<Option<UnadmittedSessio
     let _: SocketAddr = listener.local_addr()?;
     let pending: Option<PendingSession> = listener.accept().await?;
     match pending {
-        Some(pending) => pending.handshake().await.map(Some),
+        Some(pending) => {
+            let _: SocketAddr = pending.remote_addr();
+            pending.handshake().await.map(Some)
+        }
         None => Ok(None),
     }
 }
@@ -57,7 +61,9 @@ pub async fn admit(
     let _: Option<&review_protocol::session::PeerCertificates> = owner.peer_certificates();
     let _: &review_protocol::AgentInfo = owner.agent_claims();
     let control: ServerSessionControl = owner.control().clone();
-    let (_handle, mut incoming): (ServerHandle, ServerIncoming) = owner.admit(context, policy);
+    let (handle, mut incoming): (ServerHandle, ServerIncoming) = owner.admit(context, policy);
+    let list: &[NetworkListItem] = &[];
+    handle.send_exclusion_list(list).await?;
     control.drain();
     let _: Option<ServerStream> = incoming.accept_next().await?;
     control.close(b"drained");
@@ -71,6 +77,7 @@ pub async fn shutdown(
 ) -> Result<(), SessionError> {
     listener.reload_tls(tls)?;
     listener.shutdown();
+    listener.close(b"shutdown");
     listener.abort(b"shutdown");
     listener.wait_idle().await;
     Ok(())
