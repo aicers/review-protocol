@@ -145,7 +145,7 @@ impl std::fmt::Debug for PackageSource<'_> {
     }
 }
 
-pub(crate) trait SessionPackageSource: Send {
+pub(crate) trait SessionPackageSource: Send + Sync {
     fn next_chunk<'a>(
         &'a mut self,
         buf: &'a mut Vec<u8>,

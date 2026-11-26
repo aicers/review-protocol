@@ -1014,6 +1014,59 @@ async fn wire_reply_snapshots_and_handshake_tail_boundaries() {
 
 #[cfg(feature = "client")]
 #[tokio::test]
+async fn agent_connector_deadline_covers_connection_establishment() {
+    use review_protocol::session::{AgentConnector, AgentTransportOptions, OutcomeCertainty};
+
+    let server = Certificate::generate();
+    let client = Certificate::generate();
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots(&server))
+    .with_client_auth_cert(
+        vec![client.der.clone()],
+        PrivatePkcs8KeyDer::from(client.key.clone()).into(),
+    )
+    .unwrap();
+    let mut session = SessionOptions::legacy_compatible();
+    session.operation_timeout = Some(Duration::from_millis(50));
+    let connector = AgentConnector::bind(
+        LOOPBACK,
+        Arc::new(tls),
+        AgentTransportOptions::default(),
+        session,
+    )
+    .unwrap();
+    let silent = UdpSocket::bind(LOOPBACK).unwrap();
+    let claims: review_protocol::AgentInfo =
+        bincode::serde::decode_from_slice(FULL, bincode::config::standard())
+            .unwrap()
+            .0;
+    let started = std::time::Instant::now();
+    let error = timeout(
+        TEST_TIMEOUT,
+        connector.connect(silent.local_addr().unwrap(), "localhost", &claims),
+    )
+    .await
+    .unwrap()
+    .err()
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(matches!(
+        error,
+        SessionError::Deadline {
+            certainty: OutcomeCertainty::NotSent,
+            ..
+        }
+    ));
+    connector.abort(b"deadline");
+    connector.wait_idle().await;
+}
+
+#[cfg(feature = "client")]
+#[tokio::test]
 async fn agent_connector_preserves_tls_name_and_session_lifetime() {
     use review_protocol::session::{AgentConnector, AgentTransportOptions};
 
@@ -1038,7 +1091,8 @@ async fn agent_connector_preserves_tls_name_and_session_lifetime() {
         SessionOptions::legacy_compatible(),
     )
     .unwrap();
-    assert_ne!(connector.local_addr().unwrap().port(), 0);
+    let local = connector.local_addr().unwrap();
+    assert_ne!(local.port(), 0);
     let claims: review_protocol::AgentInfo =
         bincode::serde::decode_from_slice(FULL, bincode::config::standard())
             .unwrap()
@@ -1057,6 +1111,7 @@ async fn agent_connector_preserves_tls_name_and_session_lifetime() {
     let server = server.unwrap();
     drop(connector);
     assert_eq!(agent.remote_addr(), address);
+    assert_eq!(agent.local_addr().unwrap(), local);
     agent.close(ApplicationCode::new(0).unwrap(), b"done");
     drop(server);
     listener.close(b"done");

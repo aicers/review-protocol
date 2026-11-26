@@ -112,36 +112,42 @@ impl super::AgentHandle {
         options: SessionOptions,
         agent: &crate::AgentInfo,
     ) -> Result<(Self, super::AgentIncoming), SessionError> {
+        let timeout = options.operation_timeout;
         let mut certainty = OutcomeCertainty::NotSent;
-        let operation = async {
-            let (send, recv) = connection
-                .open_bi()
-                .await
-                .map_err(|e| SessionError::transport(e, certainty))?;
-            let mut exchange = Exchange::new(send, recv, options.handshake);
-            exchange.start(agent)?;
-            certainty = OutcomeCertainty::Unknown;
-            exchange.flush().await?;
-            let response: Result<String, String> = exchange.receive().await?;
-            exchange.complete();
-            response.map_err(|required| SessionError::IncompatibleProtocol {
-                version: agent.protocol_version.clone(),
-                required,
-            })
-        };
-        let protocol_version = if let Some(timeout) = options.operation_timeout {
+        let operation = Self::from_transport_inner(connection, options, agent, &mut certainty);
+        if let Some(timeout) = timeout {
             match tokio::time::timeout(timeout, operation).await {
-                Ok(result) => result?,
-                Err(source) => {
-                    return Err(SessionError::Deadline {
-                        certainty,
-                        source: Some(source),
-                    });
-                }
+                Ok(result) => result,
+                Err(source) => Err(SessionError::Deadline {
+                    certainty,
+                    source: Some(source),
+                }),
             }
         } else {
-            operation.await?
-        };
+            operation.await
+        }
+    }
+
+    pub(super) async fn from_transport_inner(
+        connection: Connection,
+        options: SessionOptions,
+        agent: &crate::AgentInfo,
+        certainty: &mut OutcomeCertainty,
+    ) -> Result<(Self, super::AgentIncoming), SessionError> {
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| SessionError::transport(e, *certainty))?;
+        let mut exchange = Exchange::new(send, recv, options.handshake);
+        exchange.start(agent)?;
+        *certainty = OutcomeCertainty::Unknown;
+        exchange.flush().await?;
+        let response: Result<String, String> = exchange.receive().await?;
+        exchange.complete();
+        let protocol_version = response.map_err(|required| SessionError::IncompatibleProtocol {
+            version: agent.protocol_version.clone(),
+            required,
+        })?;
         // The agent's own advertised version counts as well as the manager's
         // reply, which is only the manager's ceiling: a `0.50.0` manager
         // refuses the list pulls of an agent that advertised `0.49.0`.

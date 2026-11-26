@@ -12,6 +12,7 @@ pub(super) struct Exchange {
     writer: Option<FramedWriter<SendStream>>,
     finishing: Option<SendStream>,
     limit: FrameLimit,
+    read_ended: bool,
     pub(super) certainty: OutcomeCertainty,
 }
 
@@ -20,6 +21,7 @@ impl Exchange {
         Self {
             finishing: None,
             limit,
+            read_ended: false,
             reader: Some(FramedReader::new(recv, limit)),
             writer: Some(FramedWriter::new(send, limit)),
             certainty: OutcomeCertainty::NotSent,
@@ -69,7 +71,49 @@ impl Exchange {
         })
     }
 
+    #[cfg(feature = "client")]
+    pub(super) async fn frame_for_package(&mut self) -> Result<Frame, SessionError> {
+        if let Some(frame) = self.package_frame().await? {
+            Ok(frame)
+        } else {
+            self.read_ended = true;
+            self.stop_reader();
+            Err(SessionError::transport(
+                std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+                self.certainty,
+            ))
+        }
+    }
+
+    #[cfg(feature = "client")]
+    async fn package_frame(&mut self) -> Result<Option<Frame>, SessionError> {
+        let result = self
+            .reader
+            .as_mut()
+            .ok_or_else(|| SessionError::frame(oinq::frame::FrameError::Poisoned, self.certainty))?
+            .read()
+            .await;
+        match result {
+            Ok(frame) => Ok(frame),
+            Err(error) => {
+                self.read_ended = true;
+                self.stop_reader();
+                Err(SessionError::frame(error, self.certainty))
+            }
+        }
+    }
+
+    #[cfg(feature = "client")]
+    fn stop_reader(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.into_inner().stop(abort_code());
+        }
+    }
+
     pub(super) async fn next_frame(&mut self) -> Result<Option<Frame>, SessionError> {
+        if self.read_ended {
+            return Ok(None);
+        }
         let result = self
             .reader
             .as_mut()

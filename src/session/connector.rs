@@ -98,19 +98,39 @@ impl AgentConnector {
     /// policy belongs to the application.
     ///
     /// # Errors
-    /// Returns a classified connection or protocol handshake error.
+    /// Returns a classified connection, protocol handshake, or deadline error.
     pub async fn connect(
         &self,
         remote: SocketAddr,
         server_name: &str,
         agent: &crate::AgentInfo,
     ) -> Result<(AgentHandle, AgentIncoming), SessionError> {
-        let connection = self
-            .endpoint
-            .connect(remote, server_name)
+        let timeout = self.session.operation_timeout;
+        let mut certainty = OutcomeCertainty::NotSent;
+        let operation = async {
+            let connection = self
+                .endpoint
+                .connect(remote, server_name)
+                .await
+                .map_err(|error| SessionError::transport(error, certainty))?;
+            AgentHandle::from_transport_inner(
+                connection,
+                self.session.clone(),
+                agent,
+                &mut certainty,
+            )
             .await
-            .map_err(unsent)?;
-        AgentHandle::from_transport(connection, self.session.clone(), agent).await
+        };
+        if let Some(timeout) = timeout {
+            tokio::time::timeout(timeout, operation)
+                .await
+                .map_err(|source| SessionError::Deadline {
+                    certainty,
+                    source: Some(source),
+                })?
+        } else {
+            operation.await
+        }
     }
 
     /// Returns the bound socket address.

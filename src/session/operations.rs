@@ -114,7 +114,29 @@ impl ExchangeLease<'_> {
         frame: oinq::frame::Frame,
         limit: usize,
     ) -> Result<T, SessionError> {
-        let result = arguments(&frame, limit);
+        self.arguments_as(code, frame, limit, super::exchange::Decoding::Prefix)
+            .await
+    }
+
+    #[cfg(feature = "client")]
+    async fn arguments_exact<T: DeserializeOwned>(
+        &mut self,
+        code: u32,
+        frame: oinq::frame::Frame,
+        limit: usize,
+    ) -> Result<T, SessionError> {
+        self.arguments_as(code, frame, limit, super::exchange::Decoding::Exact)
+            .await
+    }
+
+    async fn arguments_as<T: DeserializeOwned>(
+        &mut self,
+        code: u32,
+        frame: oinq::frame::Frame,
+        limit: usize,
+        decoding: super::exchange::Decoding,
+    ) -> Result<T, SessionError> {
+        let result = arguments(&frame, limit, decoding);
         self.recycle(frame)?;
         let error = match result {
             Ok(arguments) => return Ok(arguments),
@@ -145,7 +167,7 @@ impl ExchangeLease<'_> {
         }
 
         // The legacy server dispatcher returns argument errors without a response.
-        let result = arguments(&frame, limit);
+        let result = arguments(&frame, limit, super::exchange::Decoding::Prefix);
         self.recycle(frame)?;
         if result.is_err() {
             self.complete();
@@ -266,33 +288,13 @@ fn server_network_list_refusal(code: u32, blocker: Option<&str>) -> Option<Strin
     })
 }
 
-/// Whether [`AgentRequestStream::next`] dispatches request `code`.
+/// Whether the original [`AgentRequestStream::next`] surface dispatches `code`.
 #[cfg(feature = "client")]
 fn agent_serves(code: u32) -> bool {
     use crate::client::RequestCode as C;
     matches!(
         C::from(code),
-        C::SemiSupervisedModels
-            | C::DnsStart
-            | C::DnsStop
-            | C::Reboot
-            | C::ReloadConfig
-            | C::ReloadTi
-            | C::ResourceUsage
-            | C::TorExitNodeList
-            | C::TrustedDomainList
-            | C::TrustedUserAgentList
-            | C::TimeSeriesGenerationPolicyList
-            | C::DeleteTimeSeriesGenerationPolicy
-            | C::ReloadFilterRule
-            | C::InternalNetworkList
-            | C::ExclusionList
-            | C::Watchlist
-            | C::EchoRequest
-            | C::DeleteCustomerData
-            | C::ProcessList
-            | C::Shutdown
-            | C::NodeService
+        C::NodeService
             | C::NodeNetworkInterface
             | C::NodeHostname
             | C::NodeTimeSync
@@ -308,7 +310,57 @@ fn agent_serves(code: u32) -> bool {
             | C::CancelRun
             | C::RunDetectorOnce
             | C::SignatureRules
-            | C::UpdateConfig
+    )
+}
+
+/// Whether the complete command surface dispatches request `code`.
+#[cfg(feature = "client")]
+fn command_serves(code: u32) -> bool {
+    use crate::client::RequestCode as C;
+    agent_serves(code)
+        || matches!(
+            C::from(code),
+            C::SemiSupervisedModels
+                | C::DnsStart
+                | C::DnsStop
+                | C::Reboot
+                | C::ReloadConfig
+                | C::ReloadTi
+                | C::ResourceUsage
+                | C::TorExitNodeList
+                | C::TrustedDomainList
+                | C::TrustedUserAgentList
+                | C::TimeSeriesGenerationPolicyList
+                | C::DeleteTimeSeriesGenerationPolicy
+                | C::ReloadFilterRule
+                | C::InternalNetworkList
+                | C::ExclusionList
+                | C::Watchlist
+                | C::EchoRequest
+                | C::DeleteCustomerData
+                | C::ProcessList
+                | C::Shutdown
+                | C::UpdateConfig
+        )
+}
+
+/// Whether the node-only runner dispatches request `code`.
+#[cfg(feature = "client")]
+fn node_serves(code: u32) -> bool {
+    use crate::client::RequestCode as C;
+    matches!(
+        C::from(code),
+        C::NodeService
+            | C::NodeNetworkInterface
+            | C::NodeHostname
+            | C::NodeTimeSync
+            | C::NodeLogging
+            | C::NodeRemoteAccess
+            | C::NodeObservation
+            | C::NodeVersion
+            | C::NodeEnroll
+            | C::NodePower
+            | C::NodePackage
     )
 }
 
@@ -321,12 +373,20 @@ fn agent_unserved(code: u32) -> String {
 fn arguments<'a, T: Deserialize<'a>>(
     frame: &'a oinq::frame::Frame,
     limit: usize,
+    decoding: super::exchange::Decoding,
 ) -> Result<T, SessionError> {
     let bytes = frame
         .as_bytes()
         .get(4..)
         .ok_or_else(|| malformed("request code is truncated"))?;
-    decode(bytes, &super::decode::Budget::new(limit)).map(|(value, _)| value)
+    let (value, consumed) = decode(bytes, &super::decode::Budget::new(limit))?;
+    let trailing = bytes.len().saturating_sub(consumed);
+    if decoding == super::exchange::Decoding::Exact && trailing != 0 {
+        return Err(SessionError::malformed(format!(
+            "{trailing} unexpected trailing bytes after the payload"
+        )));
+    }
+    Ok(value)
 }
 
 /// An accepted manager-side stream, ready for application supervision.
@@ -521,6 +581,7 @@ impl ServerRequestStream {
             let Some((code, frame)) = self.owner.next(server_serves, server_unserved).await? else {
                 return Ok(None);
             };
+            self.owner.exchange.certainty = OutcomeCertainty::Unknown;
             if let Some(message) =
                 server_network_list_refusal(code, self.session.network_list_blocker.as_deref())
             {
@@ -619,7 +680,11 @@ impl ServerRequestStream {
         // Keep the frame alive through the handler call so the argument vector
         // can borrow the names directly from the guarded decoder.
         let response = {
-            let names = match arguments::<Vec<(&str, &str)>>(&frame, limit) {
+            let names = match arguments::<Vec<(&str, &str)>>(
+                &frame,
+                limit,
+                super::exchange::Decoding::Prefix,
+            ) {
                 Ok(names) => names,
                 Err(error) => {
                     exchange.recycle(frame)?;
@@ -951,20 +1016,36 @@ server_operations! {
 /// An owned, sent run report awaiting its response.
 ///
 /// Cancelling `response` retains framing progress; dropping this owner aborts
-/// the exchange. A transport failure after sending leaves the outcome unknown.
+/// the exchange. The configured operation timeout applies to the response phase.
+/// A transport failure after sending leaves the outcome unknown.
 #[cfg(feature = "client")]
-pub struct ReportRunExchange(Exchange);
+pub struct ReportRunExchange {
+    exchange: Exchange,
+    operation_timeout: Option<std::time::Duration>,
+}
 
 #[cfg(feature = "client")]
 impl ReportRunExchange {
     /// Receives the report response, retaining progress across cancellation.
     ///
     /// # Errors
-    /// Returns a classified transport, framing, or remote rejection error.
+    /// Returns a classified transport, framing, deadline, or remote rejection error.
     pub async fn response(&mut self) -> Result<(), SessionError> {
-        let response: Result<(), String> = self.0.receive().await?;
-        self.0.complete();
-        response.map_err(SessionError::RemoteRejection)
+        let operation = async {
+            let response: Result<(), String> = self.exchange.receive().await?;
+            self.exchange.complete();
+            response.map_err(SessionError::RemoteRejection)
+        };
+        if let Some(timeout) = self.operation_timeout {
+            tokio::time::timeout(timeout, operation)
+                .await
+                .map_err(|source| SessionError::Deadline {
+                    certainty: self.exchange.certainty,
+                    source: Some(source),
+                })?
+        } else {
+            operation.await
+        }
     }
 }
 
@@ -1017,17 +1098,87 @@ impl AgentRequestStream {
     /// Authorize every returned request. Respond before reading another request.
     /// # Errors
     /// Returns classified transport, malformed request, or limit errors and aborts the stream.
-    #[allow(clippy::too_many_lines)]
     pub async fn next(&mut self) -> Result<Option<AgentRequest<'_>>, SessionError> {
-        let Some((code, frame)) = self.0.next(agent_serves, agent_unserved).await? else {
+        let Some(command) = self.next_with(agent_serves).await? else {
             return Ok(None);
         };
+        match command {
+            AgentCommand::TrainModel { request, reply } => {
+                Ok(Some(AgentRequest::TrainModel { request, reply }))
+            }
+            AgentCommand::CloneModel { request, reply } => {
+                Ok(Some(AgentRequest::CloneModel { request, reply }))
+            }
+            AgentCommand::CancelRun { request, reply } => {
+                Ok(Some(AgentRequest::CancelRun { request, reply }))
+            }
+            AgentCommand::RunDetectorOnce { request, reply } => {
+                Ok(Some(AgentRequest::RunDetectorOnce { request, reply }))
+            }
+            AgentCommand::SignatureRules { request, reply } => {
+                Ok(Some(AgentRequest::SignatureRules { request, reply }))
+            }
+            AgentCommand::Service { request, reply } => {
+                Ok(Some(AgentRequest::Service { request, reply }))
+            }
+            AgentCommand::NetworkInterface { request, reply } => {
+                Ok(Some(AgentRequest::NetworkInterface { request, reply }))
+            }
+            AgentCommand::Hostname { request, reply } => {
+                Ok(Some(AgentRequest::Hostname { request, reply }))
+            }
+            AgentCommand::TimeSync { request, reply } => {
+                Ok(Some(AgentRequest::TimeSync { request, reply }))
+            }
+            AgentCommand::Logging { request, reply } => {
+                Ok(Some(AgentRequest::Logging { request, reply }))
+            }
+            AgentCommand::RemoteAccess { request, reply } => {
+                Ok(Some(AgentRequest::RemoteAccess { request, reply }))
+            }
+            AgentCommand::Observation { request, reply } => {
+                Ok(Some(AgentRequest::Observation { request, reply }))
+            }
+            AgentCommand::Version { request, reply } => {
+                Ok(Some(AgentRequest::Version { request, reply }))
+            }
+            AgentCommand::Enroll { request, reply } => {
+                Ok(Some(AgentRequest::Enroll { request, reply }))
+            }
+            AgentCommand::Power { request, reply } => {
+                Ok(Some(AgentRequest::Power { request, reply }))
+            }
+            AgentCommand::Package { request, reply } => {
+                Ok(Some(AgentRequest::Package { request, reply }))
+            }
+            _ => unreachable!("the original request filter admits only AgentRequest variants"),
+        }
+    }
+
+    /// Reads the next supported command, including legacy flat commands.
+    ///
+    /// Authorize every returned command. Respond before reading another command.
+    /// # Errors
+    /// Returns classified transport, malformed request, or limit errors and aborts the stream.
+    pub async fn next_command(&mut self) -> Result<Option<AgentCommand<'_>>, SessionError> {
+        self.next_with(command_serves).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn next_with(
+        &mut self,
+        serves: fn(u32) -> bool,
+    ) -> Result<Option<AgentCommand<'_>>, SessionError> {
+        let Some((code, frame)) = self.0.next(serves, agent_unserved).await? else {
+            return Ok(None);
+        };
+        self.0.exchange.certainty = OutcomeCertainty::Unknown;
         let limit = self.0.options.unary.get();
         let mut exchange = ExchangeLease(Some(&mut self.0.exchange));
         let request = match code {
             code if code == u32::from(crate::client::RequestCode::NodeService) => {
                 let request: NodeServiceRequest = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::Service {
+                AgentCommand::Service {
                     request,
                     reply: Reply {
                         exchange,
@@ -1038,7 +1189,7 @@ impl AgentRequestStream {
             code if code == u32::from(crate::client::RequestCode::NodeNetworkInterface) => {
                 let request: NodeNetworkInterfaceRequest =
                     exchange.arguments(code, frame, limit).await?;
-                AgentRequest::NetworkInterface {
+                AgentCommand::NetworkInterface {
                     request,
                     reply: Reply {
                         exchange,
@@ -1048,7 +1199,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::NodeHostname) => {
                 let request: NodeHostnameRequest = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::Hostname {
+                AgentCommand::Hostname {
                     request,
                     reply: Reply {
                         exchange,
@@ -1058,7 +1209,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::NodeTimeSync) => {
                 let request: NodeTimeSyncRequest = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::TimeSync {
+                AgentCommand::TimeSync {
                     request,
                     reply: Reply {
                         exchange,
@@ -1068,7 +1219,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::NodeLogging) => {
                 let request: NodeLoggingRequest = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::Logging {
+                AgentCommand::Logging {
                     request,
                     reply: Reply {
                         exchange,
@@ -1079,7 +1230,7 @@ impl AgentRequestStream {
             code if code == u32::from(crate::client::RequestCode::NodeRemoteAccess) => {
                 let request: NodeRemoteAccessRequest =
                     exchange.arguments(code, frame, limit).await?;
-                AgentRequest::RemoteAccess {
+                AgentCommand::RemoteAccess {
                     request,
                     reply: Reply {
                         exchange,
@@ -1090,7 +1241,7 @@ impl AgentRequestStream {
             code if code == u32::from(crate::client::RequestCode::NodeObservation) => {
                 let request: NodeObservationRequest =
                     exchange.arguments(code, frame, limit).await?;
-                AgentRequest::Observation {
+                AgentCommand::Observation {
                     request,
                     reply: Reply {
                         exchange,
@@ -1100,7 +1251,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::NodeVersion) => {
                 let request: NodeVersionRequest = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::Version {
+                AgentCommand::Version {
                     request,
                     reply: Reply {
                         exchange,
@@ -1110,7 +1261,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::NodeEnroll) => {
                 let request: NodeEnrollRequest = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::Enroll {
+                AgentCommand::Enroll {
                     request,
                     reply: Reply {
                         exchange,
@@ -1120,7 +1271,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::NodePower) => {
                 let request: NodePowerRequest = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::Power {
+                AgentCommand::Power {
                     request,
                     reply: Reply {
                         exchange,
@@ -1134,7 +1285,7 @@ impl AgentRequestStream {
                     NodePackageRequest::Install { size, .. } => Some(*size),
                     _ => None,
                 };
-                AgentRequest::Package {
+                AgentCommand::Package {
                     request,
                     reply: PackageReply {
                         exchange,
@@ -1142,12 +1293,13 @@ impl AgentRequestStream {
                         size: remaining,
                         options: self.0.options.clone(),
                         receiving: false,
+                        failed: false,
                     },
                 }
             }
             code if code == u32::from(crate::client::RequestCode::UpdateConfig) => {
                 let request: () = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::UpdateConfig {
+                AgentCommand::UpdateConfig {
                     request,
                     reply: Reply {
                         exchange,
@@ -1157,7 +1309,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::TrainModel) => {
                 let request: TrainModelRequest = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::TrainModel {
+                AgentCommand::TrainModel {
                     request,
                     reply: Reply {
                         exchange,
@@ -1167,7 +1319,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::CloneModel) => {
                 let request: CloneModelRequest = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::CloneModel {
+                AgentCommand::CloneModel {
                     request,
                     reply: Reply {
                         exchange,
@@ -1177,7 +1329,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::CancelRun) => {
                 let request: u32 = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::CancelRun {
+                AgentCommand::CancelRun {
                     request,
                     reply: Reply {
                         exchange,
@@ -1187,7 +1339,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::RunDetectorOnce) => {
                 let request: i32 = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::RunDetectorOnce {
+                AgentCommand::RunDetectorOnce {
                     request,
                     reply: Reply {
                         exchange,
@@ -1197,7 +1349,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::SignatureRules) => {
                 let request: SignatureRules = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::SignatureRules {
+                AgentCommand::SignatureRules {
                     request,
                     reply: Reply {
                         exchange,
@@ -1207,7 +1359,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::DnsStart) => {
                 let request: () = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::DnsStart {
+                AgentCommand::DnsStart {
                     request,
                     reply: Reply {
                         exchange,
@@ -1217,7 +1369,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::DnsStop) => {
                 let request: () = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::DnsStop {
+                AgentCommand::DnsStop {
                     request,
                     reply: Reply {
                         exchange,
@@ -1227,7 +1379,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::Reboot) => {
                 let request: () = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::Reboot {
+                AgentCommand::Reboot {
                     request,
                     reply: Reply {
                         exchange,
@@ -1237,7 +1389,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::ReloadConfig) => {
                 let request: () = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::ReloadConfig {
+                AgentCommand::ReloadConfig {
                     request,
                     reply: Reply {
                         exchange,
@@ -1247,7 +1399,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::ReloadTi) => {
                 let request: String = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::ReloadTi {
+                AgentCommand::ReloadTi {
                     request,
                     reply: Reply {
                         exchange,
@@ -1257,7 +1409,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::ResourceUsage) => {
                 let request: () = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::ResourceUsage {
+                AgentCommand::ResourceUsage {
                     request,
                     reply: Reply {
                         exchange,
@@ -1267,7 +1419,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::TorExitNodeList) => {
                 let request: Vec<String> = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::TorExitNodeList {
+                AgentCommand::TorExitNodeList {
                     request,
                     reply: Reply {
                         exchange,
@@ -1277,7 +1429,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::TrustedDomainList) => {
                 let request: Vec<String> = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::TrustedDomainList {
+                AgentCommand::TrustedDomainList {
                     request,
                     reply: Reply {
                         exchange,
@@ -1287,7 +1439,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::TrustedUserAgentList) => {
                 let request: Vec<String> = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::TrustedUserAgentList {
+                AgentCommand::TrustedUserAgentList {
                     request,
                     reply: Reply {
                         exchange,
@@ -1300,7 +1452,7 @@ impl AgentRequestStream {
             {
                 let request: Vec<crate::types::TimeSeriesGenerationPolicy> =
                     exchange.arguments(code, frame, limit).await?;
-                AgentRequest::TimeSeriesGenerationPolicyList {
+                AgentCommand::TimeSeriesGenerationPolicyList {
                     request,
                     reply: Reply {
                         exchange,
@@ -1312,7 +1464,7 @@ impl AgentRequestStream {
                 == u32::from(crate::client::RequestCode::DeleteTimeSeriesGenerationPolicy) =>
             {
                 let request: Vec<u32> = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::DeleteTimeSeriesGenerationPolicy {
+                AgentCommand::DeleteTimeSeriesGenerationPolicy {
                     request,
                     reply: Reply {
                         exchange,
@@ -1323,7 +1475,7 @@ impl AgentRequestStream {
             code if code == u32::from(crate::client::RequestCode::ReloadFilterRule) => {
                 let request: Vec<crate::types::TrafficFilterRule> =
                     exchange.arguments(code, frame, limit).await?;
-                AgentRequest::ReloadFilterRule {
+                AgentCommand::ReloadFilterRule {
                     request,
                     reply: Reply {
                         exchange,
@@ -1334,7 +1486,7 @@ impl AgentRequestStream {
             code if code == u32::from(crate::client::RequestCode::InternalNetworkList) => {
                 let request: crate::types::HostNetworkGroup =
                     exchange.arguments(code, frame, limit).await?;
-                AgentRequest::InternalNetworkList {
+                AgentCommand::InternalNetworkList {
                     request,
                     reply: Reply {
                         exchange,
@@ -1343,8 +1495,9 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::ExclusionList) => {
-                let request: Vec<NetworkListItem> = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::ExclusionList {
+                let request: Vec<NetworkListItem> =
+                    exchange.arguments_exact(code, frame, limit).await?;
+                AgentCommand::ExclusionList {
                     request,
                     reply: Reply {
                         exchange,
@@ -1353,8 +1506,9 @@ impl AgentRequestStream {
                 }
             }
             code if code == u32::from(crate::client::RequestCode::Watchlist) => {
-                let request: Vec<NetworkListItem> = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::Watchlist {
+                let request: Vec<NetworkListItem> =
+                    exchange.arguments_exact(code, frame, limit).await?;
+                AgentCommand::Watchlist {
                     request,
                     reply: Reply {
                         exchange,
@@ -1364,7 +1518,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::EchoRequest) => {
                 let request: () = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::EchoRequest {
+                AgentCommand::EchoRequest {
                     request,
                     reply: Reply {
                         exchange,
@@ -1375,7 +1529,7 @@ impl AgentRequestStream {
             code if code == u32::from(crate::client::RequestCode::DeleteCustomerData) => {
                 let request: crate::types::CustomerDataDeletionRequest =
                     exchange.arguments(code, frame, limit).await?;
-                AgentRequest::DeleteCustomerData {
+                AgentCommand::DeleteCustomerData {
                     request,
                     reply: Reply {
                         exchange,
@@ -1385,7 +1539,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::ProcessList) => {
                 let request: () = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::ProcessList {
+                AgentCommand::ProcessList {
                     request,
                     reply: Reply {
                         exchange,
@@ -1395,7 +1549,7 @@ impl AgentRequestStream {
             }
             code if code == u32::from(crate::client::RequestCode::Shutdown) => {
                 let request: () = exchange.arguments(code, frame, limit).await?;
-                AgentRequest::Shutdown {
+                AgentCommand::Shutdown {
                     request,
                     reply: Reply {
                         exchange,
@@ -1410,7 +1564,7 @@ impl AgentRequestStream {
                     .ok_or_else(|| malformed("request code is truncated"))?
                     .to_vec();
                 exchange.recycle(frame)?;
-                AgentRequest::SemiSupervisedModels {
+                AgentCommand::SemiSupervisedModels {
                     request,
                     reply: Reply {
                         exchange,
@@ -1425,9 +1579,147 @@ impl AgentRequestStream {
     }
 }
 
-/// A typed agent-side invocation borrowing its stream until responded to.
+/// The original typed agent-side invocation surface.
+///
+/// Use [`AgentRequestStream::next_command`] to receive every supported command,
+/// including legacy flat commands.
 #[cfg(feature = "client")]
 pub enum AgentRequest<'a> {
+    /// The `TrainModel` engine operation.
+    TrainModel {
+        /// The peer-supplied arguments.
+        request: TrainModelRequest,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, ()>,
+    },
+    /// The `CloneModel` engine operation.
+    CloneModel {
+        /// The peer-supplied arguments.
+        request: CloneModelRequest,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, ()>,
+    },
+    /// The `CancelRun` engine operation.
+    CancelRun {
+        /// The peer-supplied run identifier.
+        request: u32,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, ()>,
+    },
+    /// The `RunDetectorOnce` engine operation.
+    RunDetectorOnce {
+        /// The peer-supplied detector identifier.
+        request: i32,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, ()>,
+    },
+    /// The signature-rule push to a Semi-supervised Engine.
+    SignatureRules {
+        /// The peer-supplied rule sets.
+        request: SignatureRules,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, ()>,
+    },
+    /// The node service family.
+    Service {
+        /// The peer-supplied request.
+        request: NodeServiceRequest,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, NodeServiceResponse>,
+    },
+    /// The node network-interface family.
+    NetworkInterface {
+        /// The peer-supplied request.
+        request: NodeNetworkInterfaceRequest,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, NodeNetworkInterfaceResponse>,
+    },
+    /// The node hostname family.
+    Hostname {
+        /// The peer-supplied request.
+        request: NodeHostnameRequest,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, NodeHostnameResponse>,
+    },
+    /// The node time-synchronization family.
+    TimeSync {
+        /// The peer-supplied request.
+        request: NodeTimeSyncRequest,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, NodeTimeSyncResponse>,
+    },
+    /// The node logging-configuration family.
+    Logging {
+        /// The peer-supplied request.
+        request: NodeLoggingRequest,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, NodeLoggingResponse>,
+    },
+    /// The node remote-access family.
+    RemoteAccess {
+        /// The peer-supplied request.
+        request: NodeRemoteAccessRequest,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, NodeRemoteAccessResponse>,
+    },
+    /// The node host-observation family.
+    Observation {
+        /// The peer-supplied request.
+        request: NodeObservationRequest,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, NodeObservationResponse>,
+    },
+    /// The node version-management family.
+    Version {
+        /// The peer-supplied request.
+        request: NodeVersionRequest,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, NodeVersionResponse>,
+    },
+    /// The node service-enrollment family.
+    Enroll {
+        /// The peer-supplied request.
+        request: NodeEnrollRequest,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, NodeEnrollResponse>,
+    },
+    /// The node power-control family.
+    Power {
+        /// The peer-supplied request.
+        request: NodePowerRequest,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, NodePowerResponse>,
+    },
+    /// The package family, including the streaming install exchange.
+    Package {
+        /// The peer-supplied request.
+        request: NodePackageRequest,
+        /// The package exchange borrowing this request stream.
+        reply: PackageReply<'a>,
+    },
+}
+
+/// A failure while running an agent command stream.
+#[cfg(feature = "client")]
+#[derive(Debug, thiserror::Error)]
+pub enum AgentRunError {
+    /// A transport, framing, limit, or remote-response failure.
+    #[error(transparent)]
+    Session(#[from] SessionError),
+    /// The application policy denied a command before handler execution.
+    #[error("authorization denied for {service}")]
+    AuthorizationDenied {
+        /// The logical service that was denied.
+        service: crate::service_id::ServiceId,
+        /// The application's authorization failure.
+        #[source]
+        source: crate::auth::AuthorizationError,
+    },
+}
+
+/// A typed agent-side command, including the original requests and legacy flat commands.
+#[cfg(feature = "client")]
+pub enum AgentCommand<'a> {
     /// Legacy `DnsStart` command.
     DnsStart {
         /// Peer-supplied arguments.
@@ -1624,7 +1916,7 @@ pub enum AgentRequest<'a> {
         /// The response capability borrowing this request stream.
         reply: Reply<'a, NodeServiceResponse>,
     },
-    /// The node networkinterface family.
+    /// The node network-interface family.
     NetworkInterface {
         /// The peer-supplied arguments.
         request: NodeNetworkInterfaceRequest,
@@ -1638,49 +1930,49 @@ pub enum AgentRequest<'a> {
         /// The response capability borrowing this request stream.
         reply: Reply<'a, NodeHostnameResponse>,
     },
-    /// The node timesync family.
+    /// The node time-synchronization family.
     TimeSync {
         /// The peer-supplied arguments.
         request: NodeTimeSyncRequest,
         /// The response capability borrowing this request stream.
         reply: Reply<'a, NodeTimeSyncResponse>,
     },
-    /// The node logging family.
+    /// The node logging-configuration family.
     Logging {
         /// The peer-supplied arguments.
         request: NodeLoggingRequest,
         /// The response capability borrowing this request stream.
         reply: Reply<'a, NodeLoggingResponse>,
     },
-    /// The node remoteaccess family.
+    /// The node remote-access family.
     RemoteAccess {
         /// The peer-supplied arguments.
         request: NodeRemoteAccessRequest,
         /// The response capability borrowing this request stream.
         reply: Reply<'a, NodeRemoteAccessResponse>,
     },
-    /// The node observation family.
+    /// The node host-observation family.
     Observation {
         /// The peer-supplied arguments.
         request: NodeObservationRequest,
         /// The response capability borrowing this request stream.
         reply: Reply<'a, NodeObservationResponse>,
     },
-    /// The node version family.
+    /// The node version-management family.
     Version {
         /// The peer-supplied arguments.
         request: NodeVersionRequest,
         /// The response capability borrowing this request stream.
         reply: Reply<'a, NodeVersionResponse>,
     },
-    /// The node enroll family.
+    /// The node service-enrollment family.
     Enroll {
         /// The peer-supplied arguments.
         request: NodeEnrollRequest,
         /// The response capability borrowing this request stream.
         reply: Reply<'a, NodeEnrollResponse>,
     },
-    /// The node power family.
+    /// The node power-control family.
     Power {
         /// The peer-supplied arguments.
         request: NodePowerRequest,
@@ -1697,7 +1989,7 @@ pub enum AgentRequest<'a> {
 }
 
 #[cfg(feature = "client")]
-impl AgentRequest<'_> {
+impl AgentCommand<'_> {
     /// Returns the logical service used for authorization, including node subcommands.
     #[must_use]
     pub fn service_id(&self) -> crate::service_id::ServiceId {
@@ -1784,7 +2076,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Fetches an indicator by name.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -1801,7 +2093,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Fetches the internal-network list.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -1817,7 +2109,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Fetches label-database patterns for the requested databases.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -1834,7 +2126,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Fetches the Tor exit-node list.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -1848,7 +2140,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Fetches the trusted-domain list.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -1862,7 +2154,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Fetches the trusted-user-agent list.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -1876,7 +2168,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Fetches the time-series generation policies.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -1892,7 +2184,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Requests a renewed certificate and private key.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -1906,7 +2198,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Inserts column statistics for a model batch.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -1925,7 +2217,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Inserts time-series updates for a model batch.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -1944,7 +2236,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Updates a model's clusters.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -1962,7 +2254,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Updates a model's outliers at a timestamp.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -1981,7 +2273,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Inserts a model round's detection events.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -2000,7 +2292,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Inserts a data source and returns its identifier.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -2017,7 +2309,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Fetches a model's outliers at a timestamp.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -2035,7 +2327,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Fetches the DAI extractor configuration for sensors.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -2052,7 +2344,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Fetches DAI read cursors for sensors.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -2069,7 +2361,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Sends a DAI observation batch.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -2086,7 +2378,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Starts a DAI range-day round.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -2104,7 +2396,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Renews a DAI range-day lease.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -2122,7 +2414,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Sends DAI range-day counts.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -2139,7 +2431,7 @@ impl super::AgentHandle {
         .await
     }
 
-    /// Executes the corresponding typed manager operation.
+    /// Reports late DAI range days and returns their assigned marks.
     ///
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
@@ -2172,8 +2464,8 @@ impl super::AgentHandle {
     /// Sends a run report and returns an owned response exchange.
     ///
     /// # Errors
-    /// Returns a classified transport, encoding or limit error. Once sending
-    /// begins, failure may leave the mutation outcome unknown.
+    /// Returns a classified transport, encoding, limit, or deadline error. Once
+    /// sending begins, failure may leave the mutation outcome unknown.
     pub async fn start_report_run(
         &self,
         run_id: u32,
@@ -2195,7 +2487,10 @@ impl super::AgentHandle {
             )?;
             certainty = OutcomeCertainty::Unknown;
             exchange.flush().await?;
-            Ok(ReportRunExchange(exchange))
+            Ok(ReportRunExchange {
+                exchange,
+                operation_timeout: self.0.options.operation_timeout,
+            })
         };
         if let Some(timeout) = self.0.options.operation_timeout {
             match tokio::time::timeout(timeout, operation).await {
@@ -2829,6 +3124,7 @@ pub struct PackageReply<'a> {
     size: Option<u64>,
     options: super::SessionOptions,
     receiving: bool,
+    failed: bool,
 }
 
 #[cfg(feature = "client")]
@@ -2873,29 +3169,42 @@ impl PackageReply<'_> {
     ///
     /// The previous buffer is recycled for the next frame. Returns false after
     /// exactly the declared number of bytes, without reading into another frame.
+    /// After a failed read or overrun, only an error response may complete the exchange.
     /// # Errors
     /// Returns malformed-state, oversized, overrun, truncation, or transport errors.
     pub async fn next_chunk(&mut self, buffer: &mut Vec<u8>) -> Result<bool, SessionError> {
         if !self.receiving {
             return Err(malformed("package preflight has not proceeded"));
         }
+        if self.failed {
+            return Err(malformed("the package transfer already failed"));
+        }
         let remaining = self
             .remaining
-            .as_mut()
             .ok_or_else(|| malformed("chunk reads require an install"))?;
-        if *remaining == 0 {
+        if remaining == 0 {
             buffer.clear();
             return Ok(false);
         }
-        let frame = self.exchange.frame().await?;
+        let frame = match self.exchange.frame_for_package().await {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.failed = true;
+                return Err(error);
+            }
+        };
         let length = u64::try_from(frame.as_bytes().len()).map_err(SessionError::malformed)?;
-        if length > *remaining {
-            self.exchange.cancel();
+        if length > remaining {
+            self.exchange.recycle(frame)?;
+            self.failed = true;
             return Err(malformed("package chunk exceeds the declared size"));
         }
-        *remaining -= length;
+        self.remaining = Some(remaining - length);
         let previous = std::mem::replace(buffer, frame.into_bytes());
-        self.exchange.recycle_bytes(previous)?;
+        if let Err(error) = self.exchange.recycle_bytes(previous) {
+            self.failed = true;
+            return Err(error);
+        }
         Ok(true)
     }
 
@@ -2903,10 +3212,9 @@ impl PackageReply<'_> {
     ///
     /// An incomplete install cannot send a terminal success: an `Ok` response
     /// before every declared byte was received is refused and aborts the stream.
-    /// An `Err` response, for example because the agent failed to store the
-    /// payload, first reads and discards the rest of the declared bytes, as the
-    /// legacy dispatcher drains for a failed handler, so the manager receives
-    /// the rejection rather than a reset.
+    /// An `Err` response first reads and discards any unread payload when the
+    /// transfer is still aligned. After a failed read or overrun, the failure is
+    /// already terminal and the rejection is sent without another drain.
     /// # Errors
     /// Returns malformed-state, encoding, limit, or transport errors.
     pub async fn respond(
@@ -2919,9 +3227,13 @@ impl PackageReply<'_> {
                 "install payload has not been completely received",
             ));
         }
-        if incomplete {
+        if incomplete && !self.failed {
             let mut discard = Vec::new();
-            while self.next_chunk(&mut discard).await? {}
+            while self.remaining.is_some_and(|remaining| remaining != 0) {
+                if self.next_chunk(&mut discard).await.is_err() {
+                    break;
+                }
+            }
         }
         self.exchange.start(response)?;
         self.exchange.flush().await?;
@@ -3000,9 +3312,14 @@ impl super::ServerHandle {
             certainty = OutcomeCertainty::Unknown;
             exchange.flush().await?;
             let verdict: Result<InstallPreflight, String> = exchange.receive().await?;
-            if let Some(terminal) =
-                terminal_preflight(verdict.map_err(SessionError::RemoteRejection)?)
-            {
+            let terminal = match verdict {
+                Ok(verdict) => terminal_preflight(verdict),
+                Err(message) => {
+                    exchange.complete();
+                    return Err(SessionError::RemoteRejection(message));
+                }
+            };
+            if let Some(terminal) = terminal {
                 exchange.complete();
                 return Ok(InstallOutcome::Preflight(terminal));
             }
@@ -3227,43 +3544,66 @@ impl crate::request::SessionPackageSource for PackageReply<'_> {
         Box::pin(async move {
             PackageReply::next_chunk(self, buf)
                 .await
-                .map_err(std::io::Error::other)
+                .map_err(|error| match error {
+                    SessionError::Transport { source, .. } => {
+                        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, source)
+                    }
+                    SessionError::Malformed { source, .. } => {
+                        let kind = if source
+                            .as_ref()
+                            .downcast_ref::<oinq::frame::FrameError>()
+                            .is_some_and(|error| {
+                                matches!(error, oinq::frame::FrameError::Truncated { .. })
+                            }) {
+                            std::io::ErrorKind::UnexpectedEof
+                        } else {
+                            std::io::ErrorKind::InvalidData
+                        };
+                        std::io::Error::new(kind, source)
+                    }
+                    SessionError::LimitExceeded { source, .. } => {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, source)
+                    }
+                    error => std::io::Error::other(error),
+                })
         })
     }
 }
 
 #[cfg(feature = "client")]
 impl AgentRequestStream {
-    /// Runs commands with a node-only handler and authenticated authorization policy.
-    /// Commands outside the node handler surface receive the default unsupported response.
+    /// Runs node-family commands with a node-only handler and authenticated policy.
+    /// Non-node commands receive the legacy unknown-code response without authorization or dispatch.
     ///
     /// # Errors
-    /// Returns a session error if receiving or responding fails.
+    /// Returns an authorization failure before handler execution, or a session failure.
     pub async fn run_node_authorized<H: crate::request::NodeHandler>(
         self,
         handler: &mut H,
         context: &crate::auth::AuthorizationContext,
         policy: &dyn crate::auth::AuthorizerV2,
-    ) -> Result<(), SessionError> {
-        self.run_authorized(&mut NodeHandlerAdapter(handler), context, policy)
-            .await
+    ) -> Result<(), AgentRunError> {
+        self.run_with(&mut NodeHandlerAdapter(handler), true, |command| {
+            policy.authorize_with_context(context, &command.service_id())
+        })
+        .await
     }
 
     /// Runs commands with an authenticated context and an application policy.
     /// The policy is consulted for every invocation; handshake claims do not grant access.
+    /// A denial sends a constant remote rejection, stops the runner, and returns the
+    /// typed policy error locally.
     ///
     /// # Errors
-    /// Returns a session error if receiving or responding fails.
+    /// Returns an authorization failure before handler execution, or a session failure.
     pub async fn run_authorized<H: crate::request::Handler>(
         self,
         handler: &mut H,
         context: &crate::auth::AuthorizationContext,
         policy: &dyn crate::auth::AuthorizerV2,
-    ) -> Result<(), SessionError> {
+    ) -> Result<(), AgentRunError> {
         self.run(handler, |command| {
-            policy
-                .authorize_with_context(context, &command.service_id())
-                .map_err(|error| error.to_string())
+            policy.authorize_with_context(context, &command.service_id())
         })
         .await
     }
@@ -3274,46 +3614,81 @@ impl AgentRequestStream {
     /// captured by the caller, rather than handshake capability claims.
     ///
     /// # Errors
-    /// Returns a session error if receiving or responding fails.
+    /// Returns an authorization failure before handler execution, or a session failure.
     // The dispatch table mirrors the legacy handler contracts; each arm completes a response.
     #[allow(clippy::too_many_lines, clippy::semicolon_if_nothing_returned)]
-    pub async fn run<H, A>(mut self, handler: &mut H, mut authorize: A) -> Result<(), SessionError>
+    pub async fn run<H, A>(self, handler: &mut H, authorize: A) -> Result<(), AgentRunError>
     where
         H: crate::request::Handler,
-        A: FnMut(&AgentRequest<'_>) -> Result<(), String>,
+        A: FnMut(&AgentCommand<'_>) -> Result<(), crate::auth::AuthorizationError>,
     {
-        while let Some(command) = self.next().await? {
+        self.run_with(handler, false, authorize).await
+    }
+
+    #[allow(clippy::too_many_lines, clippy::semicolon_if_nothing_returned)]
+    async fn run_with<H, A>(
+        mut self,
+        handler: &mut H,
+        node_only: bool,
+        mut authorize: A,
+    ) -> Result<(), AgentRunError>
+    where
+        H: crate::request::Handler,
+        A: FnMut(&AgentCommand<'_>) -> Result<(), crate::auth::AuthorizationError>,
+    {
+        let serves = if node_only {
+            node_serves
+        } else {
+            command_serves
+        };
+        let mut authorization_denied = None;
+        while let Some(command) = self.next_with(serves).await? {
+            let service = command.service_id();
             let authorization = authorize(&command);
+            macro_rules! record_denied {
+                ($source:expr) => {{
+                    authorization_denied = Some(AgentRunError::AuthorizationDenied {
+                        service,
+                        source: $source,
+                    });
+                }};
+            }
             macro_rules! dispatch {
                 ($reply:ident, $call:expr) => {{
                     let result = match authorization {
                         Ok(()) => $call.await,
-                        Err(error) => Err(error),
+                        Err(source) => {
+                            record_denied!(source);
+                            let _ = $reply
+                                .respond(Err(crate::server::AUTHORIZATION_DENIED.to_owned()))
+                                .await;
+                            break;
+                        }
                     };
                     $reply.respond(result).await?;
                 }};
             }
             match command {
-                AgentRequest::DnsStart { request: (), reply } => {
+                AgentCommand::DnsStart { request: (), reply } => {
                     dispatch!(reply, handler.dns_start())
                 }
-                AgentRequest::DnsStop { request: (), reply } => {
+                AgentCommand::DnsStop { request: (), reply } => {
                     dispatch!(reply, handler.dns_stop())
                 }
-                AgentRequest::Reboot { request: (), reply } => dispatch!(reply, async {
+                AgentCommand::Reboot { request: (), reply } => dispatch!(reply, async {
                     handler
                         .node_power(NodePowerRequest::Reboot)
                         .await
                         .map(|_| ())
                 }),
                 #[allow(deprecated)]
-                AgentRequest::ReloadConfig { request: (), reply } => {
+                AgentCommand::ReloadConfig { request: (), reply } => {
                     dispatch!(reply, handler.reload_config())
                 }
-                AgentRequest::ReloadTi { request, reply } => {
+                AgentCommand::ReloadTi { request, reply } => {
                     dispatch!(reply, handler.reload_ti(&request))
                 }
-                AgentRequest::ResourceUsage { request: (), reply } => dispatch!(reply, async {
+                AgentCommand::ResourceUsage { request: (), reply } => dispatch!(reply, async {
                     handler
                         .node_observation(NodeObservationRequest::ResourceUsage)
                         .await
@@ -3327,50 +3702,50 @@ impl AgentRequestStream {
                             }
                         })
                 }),
-                AgentRequest::TorExitNodeList { request, reply } => dispatch!(
+                AgentCommand::TorExitNodeList { request, reply } => dispatch!(
                     reply,
                     handler.tor_exit_node_list(
                         &request.iter().map(String::as_str).collect::<Vec<_>>()
                     )
                 ),
-                AgentRequest::TrustedDomainList { request, reply } => dispatch!(
+                AgentCommand::TrustedDomainList { request, reply } => dispatch!(
                     reply,
                     handler.trusted_domain_list(
                         &request.iter().map(String::as_str).collect::<Vec<_>>()
                     )
                 ),
-                AgentRequest::TrustedUserAgentList { request, reply } => dispatch!(
+                AgentCommand::TrustedUserAgentList { request, reply } => dispatch!(
                     reply,
                     handler.trusted_user_agent_list(
                         &request.iter().map(String::as_str).collect::<Vec<_>>()
                     )
                 ),
-                AgentRequest::TimeSeriesGenerationPolicyList { request, reply } => {
+                AgentCommand::TimeSeriesGenerationPolicyList { request, reply } => {
                     dispatch!(reply, handler.time_series_generation_policy_list(&request))
                 }
-                AgentRequest::DeleteTimeSeriesGenerationPolicy { request, reply } => dispatch!(
+                AgentCommand::DeleteTimeSeriesGenerationPolicy { request, reply } => dispatch!(
                     reply,
                     handler.delete_time_series_generation_policy(&request)
                 ),
-                AgentRequest::ReloadFilterRule { request, reply } => {
+                AgentCommand::ReloadFilterRule { request, reply } => {
                     dispatch!(reply, handler.update_traffic_filter_rules(&request))
                 }
-                AgentRequest::InternalNetworkList { request, reply } => {
+                AgentCommand::InternalNetworkList { request, reply } => {
                     dispatch!(reply, handler.internal_network_list(request))
                 }
-                AgentRequest::ExclusionList { request, reply } => {
+                AgentCommand::ExclusionList { request, reply } => {
                     dispatch!(reply, handler.exclusion_list(request))
                 }
-                AgentRequest::Watchlist { request, reply } => {
+                AgentCommand::Watchlist { request, reply } => {
                     dispatch!(reply, handler.watchlist(request))
                 }
-                AgentRequest::EchoRequest { request: (), reply } => {
+                AgentCommand::EchoRequest { request: (), reply } => {
                     dispatch!(reply, async { Ok(()) })
                 }
-                AgentRequest::DeleteCustomerData { request, reply } => {
+                AgentCommand::DeleteCustomerData { request, reply } => {
                     dispatch!(reply, handler.delete_customer_data(&request))
                 }
-                AgentRequest::ProcessList { request: (), reply } => dispatch!(reply, async {
+                AgentCommand::ProcessList { request: (), reply } => dispatch!(reply, async {
                     handler
                         .node_observation(NodeObservationRequest::ProcessList)
                         .await
@@ -3381,68 +3756,78 @@ impl AgentRequestStream {
                             }
                         })
                 }),
-                AgentRequest::Shutdown { request: (), reply } => dispatch!(reply, async {
+                AgentCommand::Shutdown { request: (), reply } => dispatch!(reply, async {
                     handler
                         .node_power(NodePowerRequest::Shutdown)
                         .await
                         .map(|_| ())
                 }),
-                AgentRequest::SemiSupervisedModels { request, reply } => {
+                AgentCommand::SemiSupervisedModels { request, reply } => {
                     dispatch!(reply, handler.update_semi_supervised_models(&request))
                 }
-                AgentRequest::SignatureRules { request, reply } => {
+                AgentCommand::SignatureRules { request, reply } => {
                     dispatch!(reply, handler.signature_rules(request))
                 }
-                AgentRequest::UpdateConfig { reply, .. } => {
+                AgentCommand::UpdateConfig { reply, .. } => {
                     dispatch!(reply, handler.update_config())
                 }
-                AgentRequest::TrainModel { request, reply } => {
+                AgentCommand::TrainModel { request, reply } => {
                     dispatch!(reply, handler.train_model(&request))
                 }
-                AgentRequest::CloneModel { request, reply } => {
+                AgentCommand::CloneModel { request, reply } => {
                     dispatch!(reply, handler.clone_model(&request))
                 }
-                AgentRequest::CancelRun { request, reply } => {
+                AgentCommand::CancelRun { request, reply } => {
                     dispatch!(reply, handler.cancel_run(request))
                 }
-                AgentRequest::RunDetectorOnce { request, reply } => {
+                AgentCommand::RunDetectorOnce { request, reply } => {
                     dispatch!(reply, handler.run_detector_once(request))
                 }
-                AgentRequest::Service { request, reply } => {
+                AgentCommand::Service { request, reply } => {
                     dispatch!(reply, handler.node_service(request))
                 }
-                AgentRequest::NetworkInterface { request, reply } => {
+                AgentCommand::NetworkInterface { request, reply } => {
                     dispatch!(reply, handler.node_network_interface(request))
                 }
-                AgentRequest::Hostname { request, reply } => {
+                AgentCommand::Hostname { request, reply } => {
                     dispatch!(reply, handler.node_hostname(request))
                 }
-                AgentRequest::TimeSync { request, reply } => {
+                AgentCommand::TimeSync { request, reply } => {
                     dispatch!(reply, handler.node_time_sync(request))
                 }
-                AgentRequest::Logging { request, reply } => {
+                AgentCommand::Logging { request, reply } => {
                     dispatch!(reply, handler.node_logging(request))
                 }
-                AgentRequest::RemoteAccess { request, reply } => {
+                AgentCommand::RemoteAccess { request, reply } => {
                     dispatch!(reply, handler.node_remote_access(request))
                 }
-                AgentRequest::Observation { request, reply } => {
+                AgentCommand::Observation { request, reply } => {
                     dispatch!(reply, handler.node_observation(request))
                 }
-                AgentRequest::Version { request, reply } => {
+                AgentCommand::Version { request, reply } => {
                     dispatch!(reply, handler.node_version(request))
                 }
-                AgentRequest::Enroll { request, reply } => {
+                AgentCommand::Enroll { request, reply } => {
                     dispatch!(reply, handler.node_enroll(request))
                 }
-                AgentRequest::Power { request, reply } => {
+                AgentCommand::Power { request, reply } => {
                     let immediate = matches!(
                         request,
                         NodePowerRequest::Reboot | NodePowerRequest::Shutdown
                     );
                     let result = match authorization {
                         Ok(()) => handler.node_power(request).await,
-                        Err(error) => Err(error),
+                        Err(source) => {
+                            record_denied!(source);
+                            if immediate {
+                                reply.complete_without_response();
+                            } else {
+                                let _ = reply
+                                    .respond(Err(crate::server::AUTHORIZATION_DENIED.to_owned()))
+                                    .await;
+                            }
+                            break;
+                        }
                     };
                     if immediate {
                         reply.complete_without_response();
@@ -3450,11 +3835,17 @@ impl AgentRequestStream {
                         reply.respond(result).await?;
                     }
                 }
-                AgentRequest::Package { request, reply } => {
+                AgentCommand::Package { request, reply } => {
                     if let Some(size) = reply.size() {
                         let verdict = match authorization {
                             Ok(()) => handler.node_package_install_preflight(&request).await,
-                            Err(error) => Err(error),
+                            Err(source) => {
+                                record_denied!(source);
+                                let _ = reply
+                                    .preflight(Err(crate::server::AUTHORIZATION_DENIED.to_owned()))
+                                    .await;
+                                break;
+                            }
                         };
                         if let Some(mut reply) = reply.preflight(verdict).await? {
                             let result = {
@@ -3462,25 +3853,43 @@ impl AgentRequestStream {
                                     crate::request::PackageReader::from_session(&mut reply, size);
                                 let result =
                                     handler.node_package_install(request, &mut reader).await;
-                                let mut buffer = Vec::new();
-                                while reader.remaining() > 0 {
-                                    reader.next_chunk(&mut buffer).await.map_err(|error| {
-                                        SessionError::transport(error, OutcomeCertainty::Unknown)
-                                    })?;
+                                let drained = async {
+                                    let mut buffer = Vec::new();
+                                    while reader.remaining() > 0 {
+                                        reader.next_chunk(&mut buffer).await?;
+                                    }
+                                    std::io::Result::Ok(())
                                 }
-                                result
+                                .await;
+                                match (result, drained) {
+                                    (result, Ok(())) => result,
+                                    (Err(error), Err(_)) => Err(error),
+                                    (Ok(_), Err(error)) => Err(format!(
+                                        "failed to receive the package payload: {error}"
+                                    )),
+                                }
                             };
                             reply.respond(result).await?;
                         }
                     } else {
                         let result = match authorization {
                             Ok(()) => handler.node_package(request).await,
-                            Err(error) => Err(error),
+                            Err(source) => {
+                                record_denied!(source);
+                                let _ = reply
+                                    .respond(Err(crate::server::AUTHORIZATION_DENIED.to_owned()))
+                                    .await;
+                                break;
+                            }
                         };
                         reply.respond(result).await?;
                     }
                 }
             }
+        }
+        if let Some(error) = authorization_denied {
+            let _ = self.finish();
+            return Err(error);
         }
         Ok(())
     }

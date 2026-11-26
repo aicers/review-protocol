@@ -86,7 +86,9 @@
 //! one cancel-safe accept call.
 //!
 //! Request streams provide `next`, returning a typed invocation or `None` at clean
-//! EOF. Each invocation borrows its stream through a single-use `Reply` or
+//! EOF. `AgentRequestStream::next_command` additionally exposes legacy flat commands
+//! through `AgentCommand`; `next` and `AgentRequest` retain their original surface.
+//! Each invocation borrows its stream through a single-use `Reply` or
 //! `PackageReply`; respond before reading another request on that stream. A reply
 //! does not close the stream. Match each domain request, apply authorization before
 //! every handler invocation, and respond with `Ok(typed_value)` or `Err(remote_text)`.
@@ -416,7 +418,8 @@ pub use oinq::{
 pub use operations::Reply;
 #[cfg(feature = "client")]
 pub use operations::{
-    AgentIncoming, AgentRequest, AgentRequestStream, PackageReply, ReportRunExchange,
+    AgentCommand, AgentIncoming, AgentRequest, AgentRequestStream, AgentRunError, PackageReply,
+    ReportRunExchange,
 };
 #[cfg(feature = "server")]
 pub use operations::{
@@ -744,6 +747,16 @@ macro_rules! handle_metadata {
             #[must_use]
             pub fn remote_addr(&self) -> std::net::SocketAddr {
                 self.0.connection.remote_addr()
+            }
+            /// Returns this connection's bound local address.
+            ///
+            /// # Errors
+            /// Returns a classified socket inspection error.
+            pub fn local_addr(&self) -> Result<std::net::SocketAddr, SessionError> {
+                self.0
+                    .connection
+                    .local_addr()
+                    .map_err(|error| SessionError::transport(error, OutcomeCertainty::NotSent))
             }
             /// Waits for typed close information; cancelling this wait leaves the connection open.
             pub async fn closed(&self) -> CloseReason {
