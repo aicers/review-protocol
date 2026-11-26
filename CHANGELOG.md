@@ -5,6 +5,12 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.0](https://github.com/aicers/review-protocol/compare/0.34.0...0.35.0) - 2026-11-26
+
+### Added
+
+- [**breaking**] add the ET and Sigma signature detection models, their rule requests and six Http request header fields ([#382](https://github.com/aicers/review-protocol/pull/382))
+
 ## [0.34.0](https://github.com/aicers/review-protocol/compare/0.33.0...0.34.0) - 2026-11-25
 
 ### Added
