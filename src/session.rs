@@ -25,6 +25,19 @@
 //! identity, handshake metadata, certificates, and closure. They do not expose
 //! protocol streams.
 //!
+//! With the client feature, `AgentConnector::bind` or `AgentConnector::from_socket`
+//! accepts caller-owned TLS policy, transport windows, and explicit session limits.
+//! `connect` takes the server name used for TLS verification and the complete agent
+//! handshake claims. Established sessions retain endpoint resources after the
+//! connector is dropped. Use `local_addr`, `close`, and `wait_idle` for endpoint
+//! lifecycle management; applications own reconnect timing and retries.
+//!
+//! `AgentHandle::start_report_run` sends a report and returns an owned exchange;
+//! its response can be awaited later and a cancelled read can be resumed. A
+//! transmitted mutation may have an unknown outcome after transport failure.
+//! `PackageReply::size` and `remaining` expose the declared and unread payload
+//! byte counts for an install.
+//!
 //! With the server feature, use `ServerListener::bind` or
 //! `ServerListener::from_socket` with application-supplied rustls configuration,
 //! transport options, frame budgets, an explicit protocol window, and a handshake
@@ -77,6 +90,11 @@
 //! `PackageReply`; respond before reading another request on that stream. A reply
 //! does not close the stream. Match each domain request, apply authorization before
 //! every handler invocation, and respond with `Ok(typed_value)` or `Err(remote_text)`.
+//! `AgentRequestStream::run_authorized` binds an application-supplied authenticated
+//! context and `AuthorizerV2`, checks each invocation using its logical service, and
+//! dispatches to an existing `request::Handler`. `run_node_authorized` accepts a
+//! node-only handler. Handshake capabilities are peer claims and grant no access.
+//! The runner drains unread package payload before the terminal response.
 //! For immediate reboot/shutdown, invoke the handler and call
 //! `Reply::complete_without_response` because those operations expect no reply.
 //!
@@ -360,6 +378,8 @@
 //! Existing applications can continue using the legacy API. A migration selects
 //! limits based on real payload requirements and uses a released foundation.
 
+#[cfg(feature = "client")]
+mod connector;
 mod events;
 
 mod exchange;
@@ -381,6 +401,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "client")]
+pub use connector::{AgentConnector, AgentTransportOptions};
 #[cfg(feature = "server")]
 pub use listener::{
     PendingSession, ProtocolWindow, ServerListener, ServerListenerOptions, ServerSessionClose,
@@ -393,7 +415,9 @@ pub use oinq::{
 };
 pub use operations::Reply;
 #[cfg(feature = "client")]
-pub use operations::{AgentIncoming, AgentRequest, AgentRequestStream, PackageReply};
+pub use operations::{
+    AgentIncoming, AgentRequest, AgentRequestStream, PackageReply, ReportRunExchange,
+};
 #[cfg(feature = "server")]
 pub use operations::{
     ServerIncoming, ServerRequest, ServerRequestOutcome, ServerRequestStream, ServerStream,

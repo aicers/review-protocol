@@ -32,6 +32,22 @@ pub async fn agent(
     Ok(())
 }
 
+#[cfg(feature = "client")]
+pub async fn dial_agent(
+    tls: std::sync::Arc<rustls::ClientConfig>,
+    bind: std::net::SocketAddr,
+    remote: std::net::SocketAddr,
+    info: &AgentInfo,
+) -> Result<(), review_protocol::session::SessionError> {
+    use review_protocol::session::{AgentConnector, AgentTransportOptions, ApplicationCode};
+    let connector = AgentConnector::bind(bind, tls, AgentTransportOptions::default(), options())?;
+    let (handle, _incoming) = connector.connect(remote, "manager.example", info).await?;
+    let _: String = handle.get_config().await?;
+    handle.close(ApplicationCode::new(0).expect("zero fits"), b"done");
+    connector.wait_idle().await;
+    Ok(())
+}
+
 #[cfg(feature = "server")]
 pub async fn server(
     connection: review_protocol::session::Connection,
@@ -212,3 +228,43 @@ pub fn exhaustive_session_error(error: review_protocol::session::SessionError) {
 
 #[cfg(feature = "server")]
 pub mod listener;
+
+/// Agent tasks can be supervised independently of outgoing requests.
+#[cfg(feature = "client")]
+pub async fn serve_agent_commands<H: review_protocol::request::Handler>(
+    incoming: &mut review_protocol::session::AgentIncoming,
+    handler: &mut H,
+    context: &review_protocol::auth::AuthorizationContext,
+    policy: &dyn review_protocol::auth::AuthorizerV2,
+) -> Result<(), review_protocol::session::SessionError> {
+    incoming.accept().await?.run_authorized(handler, context, policy).await
+}
+
+/// A caller can receive a package directly, using the same bounded exchange.
+#[cfg(feature = "client")]
+pub async fn receive_package(
+    reply: review_protocol::session::PackageReply<'_>,
+) -> Result<Vec<u8>, review_protocol::session::SessionError> {
+    use review_protocol::types::node::{InstallPreflight, NodePackageResponse};
+    let mut payload = Vec::new();
+    if let Some(mut transfer) = reply.preflight(Ok(InstallPreflight::Proceed)).await? {
+        let mut chunk = Vec::new();
+        while transfer.next_chunk(&mut chunk).await? {
+            payload.extend_from_slice(&chunk);
+        }
+        transfer.respond(Ok(NodePackageResponse::Done)).await?;
+    }
+    Ok(payload)
+}
+
+/// Send an event using the schema expected by the peer.
+#[cfg(feature = "client")]
+pub async fn send_event(
+    handle: &review_protocol::session::AgentHandle,
+    event: &review_protocol::types::DetectionEvent,
+) -> Result<(), review_protocol::session::SessionError> {
+    let mut sender = handle.open_detection_event_stream().await?;
+    sender.start(event)?;
+    sender.flush().await?;
+    sender.finish().await
+}

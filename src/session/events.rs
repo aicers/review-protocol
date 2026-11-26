@@ -188,10 +188,14 @@ impl DetectionEventSender {
             limit,
         }
     }
-    /// Prepares a detection event after the stream header has been flushed.
+    /// Prepares a serialized event after the stream header has been flushed.
+    ///
+    /// The caller must select the peer's event schema. For example, Hog's
+    /// `EventMessage` contains a timestamp, kind, and byte fields and is not
+    /// the same schema as `DetectionEvent`.
     /// # Errors
     /// Returns a pending-header error, encoding error, or payload-limit error.
-    pub fn start(&mut self, event: &crate::types::DetectionEvent) -> Result<(), SessionError> {
+    pub fn start<T: serde::Serialize>(&mut self, event: &T) -> Result<(), SessionError> {
         self.writer
             .as_mut()
             .ok_or_else(|| {

@@ -272,7 +272,27 @@ fn agent_serves(code: u32) -> bool {
     use crate::client::RequestCode as C;
     matches!(
         C::from(code),
-        C::NodeService
+        C::SemiSupervisedModels
+            | C::DnsStart
+            | C::DnsStop
+            | C::Reboot
+            | C::ReloadConfig
+            | C::ReloadTi
+            | C::ResourceUsage
+            | C::TorExitNodeList
+            | C::TrustedDomainList
+            | C::TrustedUserAgentList
+            | C::TimeSeriesGenerationPolicyList
+            | C::DeleteTimeSeriesGenerationPolicy
+            | C::ReloadFilterRule
+            | C::InternalNetworkList
+            | C::ExclusionList
+            | C::Watchlist
+            | C::EchoRequest
+            | C::DeleteCustomerData
+            | C::ProcessList
+            | C::Shutdown
+            | C::NodeService
             | C::NodeNetworkInterface
             | C::NodeHostname
             | C::NodeTimeSync
@@ -288,6 +308,7 @@ fn agent_serves(code: u32) -> bool {
             | C::CancelRun
             | C::RunDetectorOnce
             | C::SignatureRules
+            | C::UpdateConfig
     )
 }
 
@@ -927,6 +948,26 @@ server_operations! {
     }
 }
 
+/// An owned, sent run report awaiting its response.
+///
+/// Cancelling `response` retains framing progress; dropping this owner aborts
+/// the exchange. A transport failure after sending leaves the outcome unknown.
+#[cfg(feature = "client")]
+pub struct ReportRunExchange(Exchange);
+
+#[cfg(feature = "client")]
+impl ReportRunExchange {
+    /// Receives the report response, retaining progress across cancellation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, or remote rejection error.
+    pub async fn response(&mut self) -> Result<(), SessionError> {
+        let response: Result<(), String> = self.0.receive().await?;
+        self.0.complete();
+        response.map_err(SessionError::RemoteRejection)
+    }
+}
+
 /// The unique agent-side owner of incoming command stream acceptance.
 #[cfg(feature = "client")]
 pub struct AgentIncoming(Arc<Shared>);
@@ -1098,8 +1139,19 @@ impl AgentRequestStream {
                     reply: PackageReply {
                         exchange,
                         remaining,
+                        size: remaining,
                         options: self.0.options.clone(),
                         receiving: false,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::UpdateConfig) => {
+                let request: () = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::UpdateConfig {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
                     },
                 }
             }
@@ -1153,6 +1205,219 @@ impl AgentRequestStream {
                     },
                 }
             }
+            code if code == u32::from(crate::client::RequestCode::DnsStart) => {
+                let request: () = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::DnsStart {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::DnsStop) => {
+                let request: () = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::DnsStop {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::Reboot) => {
+                let request: () = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::Reboot {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::ReloadConfig) => {
+                let request: () = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::ReloadConfig {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::ReloadTi) => {
+                let request: String = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::ReloadTi {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::ResourceUsage) => {
+                let request: () = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::ResourceUsage {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<(String, crate::types::ResourceUsage)>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::TorExitNodeList) => {
+                let request: Vec<String> = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::TorExitNodeList {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::TrustedDomainList) => {
+                let request: Vec<String> = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::TrustedDomainList {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::TrustedUserAgentList) => {
+                let request: Vec<String> = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::TrustedUserAgentList {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code
+                == u32::from(crate::client::RequestCode::TimeSeriesGenerationPolicyList) =>
+            {
+                let request: Vec<crate::types::TimeSeriesGenerationPolicy> =
+                    exchange.arguments(code, frame, limit).await?;
+                AgentRequest::TimeSeriesGenerationPolicyList {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code
+                == u32::from(crate::client::RequestCode::DeleteTimeSeriesGenerationPolicy) =>
+            {
+                let request: Vec<u32> = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::DeleteTimeSeriesGenerationPolicy {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::ReloadFilterRule) => {
+                let request: Vec<crate::types::TrafficFilterRule> =
+                    exchange.arguments(code, frame, limit).await?;
+                AgentRequest::ReloadFilterRule {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::InternalNetworkList) => {
+                let request: crate::types::HostNetworkGroup =
+                    exchange.arguments(code, frame, limit).await?;
+                AgentRequest::InternalNetworkList {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::ExclusionList) => {
+                let request: Vec<NetworkListItem> = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::ExclusionList {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::Watchlist) => {
+                let request: Vec<NetworkListItem> = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::Watchlist {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::EchoRequest) => {
+                let request: () = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::EchoRequest {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::DeleteCustomerData) => {
+                let request: crate::types::CustomerDataDeletionRequest =
+                    exchange.arguments(code, frame, limit).await?;
+                AgentRequest::DeleteCustomerData {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::ProcessList) => {
+                let request: () = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::ProcessList {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<Vec<crate::types::Process>>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::Shutdown) => {
+                let request: () = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::Shutdown {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
+            code if code == u32::from(crate::client::RequestCode::SemiSupervisedModels) => {
+                let request = frame
+                    .as_bytes()
+                    .get(4..)
+                    .ok_or_else(|| malformed("request code is truncated"))?
+                    .to_vec();
+                exchange.recycle(frame)?;
+                AgentRequest::SemiSupervisedModels {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
             // `*_serves` admits only the codes matched above.
             _ => return Err(malformed("unknown request code")),
         };
@@ -1163,6 +1428,154 @@ impl AgentRequestStream {
 /// A typed agent-side invocation borrowing its stream until responded to.
 #[cfg(feature = "client")]
 pub enum AgentRequest<'a> {
+    /// Legacy `DnsStart` command.
+    DnsStart {
+        /// Peer-supplied arguments.
+        request: (),
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `DnsStop` command.
+    DnsStop {
+        /// Peer-supplied arguments.
+        request: (),
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `Reboot` command.
+    Reboot {
+        /// Peer-supplied arguments.
+        request: (),
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `ReloadConfig` command.
+    ReloadConfig {
+        /// Peer-supplied arguments.
+        request: (),
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `ReloadTi` command.
+    ReloadTi {
+        /// Peer-supplied arguments.
+        request: String,
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `ResourceUsage` command.
+    ResourceUsage {
+        /// Peer-supplied arguments.
+        request: (),
+        /// Response capability.
+        reply: Reply<'a, (String, crate::types::ResourceUsage)>,
+    },
+    /// Legacy `TorExitNodeList` command.
+    TorExitNodeList {
+        /// Peer-supplied arguments.
+        request: Vec<String>,
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `TrustedDomainList` command.
+    TrustedDomainList {
+        /// Peer-supplied arguments.
+        request: Vec<String>,
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `TrustedUserAgentList` command.
+    TrustedUserAgentList {
+        /// Peer-supplied arguments.
+        request: Vec<String>,
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `TimeSeriesGenerationPolicyList` command.
+    TimeSeriesGenerationPolicyList {
+        /// Peer-supplied arguments.
+        request: Vec<crate::types::TimeSeriesGenerationPolicy>,
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `DeleteTimeSeriesGenerationPolicy` command.
+    DeleteTimeSeriesGenerationPolicy {
+        /// Peer-supplied arguments.
+        request: Vec<u32>,
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `ReloadFilterRule` command.
+    ReloadFilterRule {
+        /// Peer-supplied arguments.
+        request: Vec<crate::types::TrafficFilterRule>,
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `InternalNetworkList` command.
+    InternalNetworkList {
+        /// Peer-supplied arguments.
+        request: crate::types::HostNetworkGroup,
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `ExclusionList` command.
+    ExclusionList {
+        /// Peer-supplied arguments.
+        request: Vec<NetworkListItem>,
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `Watchlist` command.
+    Watchlist {
+        /// Peer-supplied arguments.
+        request: Vec<NetworkListItem>,
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `EchoRequest` command.
+    EchoRequest {
+        /// Peer-supplied arguments.
+        request: (),
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `DeleteCustomerData` command.
+    DeleteCustomerData {
+        /// Peer-supplied arguments.
+        request: crate::types::CustomerDataDeletionRequest,
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy `ProcessList` command.
+    ProcessList {
+        /// Peer-supplied arguments.
+        request: (),
+        /// Response capability.
+        reply: Reply<'a, Vec<crate::types::Process>>,
+    },
+    /// Legacy `Shutdown` command.
+    Shutdown {
+        /// Peer-supplied arguments.
+        request: (),
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// Legacy raw model update.
+    SemiSupervisedModels {
+        /// The raw model bytes.
+        request: Vec<u8>,
+        /// Response capability.
+        reply: Reply<'a, ()>,
+    },
+    /// The configuration update notification.
+    UpdateConfig {
+        /// The empty request body.
+        request: (),
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, ()>,
+    },
+
     /// The `TrainModel` engine operation.
     TrainModel {
         /// The peer-supplied arguments.
@@ -1283,6 +1696,57 @@ pub enum AgentRequest<'a> {
     },
 }
 
+#[cfg(feature = "client")]
+impl AgentRequest<'_> {
+    /// Returns the logical service used for authorization, including node subcommands.
+    #[must_use]
+    pub fn service_id(&self) -> crate::service_id::ServiceId {
+        match self {
+            Self::DnsStart { .. } => crate::service_id::COMMON_DNS_START,
+            Self::DnsStop { .. } => crate::service_id::COMMON_DNS_STOP,
+            Self::Reboot { .. } => crate::service_id::NODE_POWER_REBOOT,
+            Self::ReloadConfig { .. } => crate::service_id::COMMON_RELOAD_CONFIG,
+            Self::ReloadTi { .. } => crate::service_id::COMMON_RELOAD_TI,
+            Self::ResourceUsage { .. } => crate::service_id::NODE_OBSERVATION_RESOURCE_USAGE,
+            Self::TorExitNodeList { .. } => crate::service_id::COMMON_TOR_EXIT_NODE_LIST,
+            Self::TrustedDomainList { .. } => crate::service_id::COMMON_TRUSTED_DOMAIN_LIST,
+            Self::TrustedUserAgentList { .. } => crate::service_id::COMMON_TRUSTED_USER_AGENT_LIST,
+            Self::TimeSeriesGenerationPolicyList { .. } => {
+                crate::service_id::COMMON_TIME_SERIES_GENERATION_POLICY_LIST
+            }
+            Self::DeleteTimeSeriesGenerationPolicy { .. } => {
+                crate::service_id::COMMON_DELETE_TIME_SERIES_GENERATION_POLICY
+            }
+            Self::ReloadFilterRule { .. } => crate::service_id::COMMON_RELOAD_FILTER_RULE,
+            Self::InternalNetworkList { .. } => crate::service_id::COMMON_INTERNAL_NETWORK_LIST,
+            Self::ExclusionList { .. } => crate::service_id::COMMON_EXCLUSION_LIST,
+            Self::Watchlist { .. } => crate::service_id::COMMON_WATCHLIST,
+            Self::EchoRequest { .. } => crate::service_id::COMMON_ECHO,
+            Self::DeleteCustomerData { .. } => crate::service_id::COMMON_DELETE_CUSTOMER_DATA,
+            Self::ProcessList { .. } => crate::service_id::NODE_OBSERVATION_PROCESS_LIST,
+            Self::Shutdown { .. } => crate::service_id::NODE_POWER_SHUTDOWN,
+            Self::SemiSupervisedModels { .. } => crate::service_id::COMMON_SEMI_SUPERVISED_MODELS,
+            Self::SignatureRules { .. } => crate::service_id::COMMON_SIGNATURE_RULES,
+            Self::UpdateConfig { .. } => crate::service_id::COMMON_UPDATE_CONFIG,
+            Self::TrainModel { .. } => crate::service_id::ENGINE_TRAIN_MODEL,
+            Self::CloneModel { .. } => crate::service_id::ENGINE_CLONE_MODEL,
+            Self::CancelRun { .. } => crate::service_id::ENGINE_CANCEL_RUN,
+            Self::RunDetectorOnce { .. } => crate::service_id::ENGINE_RUN_DETECTOR_ONCE,
+            Self::Service { request, .. } => request.service_id(),
+            Self::NetworkInterface { request, .. } => request.service_id(),
+            Self::Hostname { request, .. } => request.service_id(),
+            Self::TimeSync { request, .. } => request.service_id(),
+            Self::Logging { request, .. } => request.service_id(),
+            Self::RemoteAccess { request, .. } => request.service_id(),
+            Self::Observation { request, .. } => request.service_id(),
+            Self::Version { request, .. } => request.service_id(),
+            Self::Enroll { request, .. } => request.service_id(),
+            Self::Power { request, .. } => request.service_id(),
+            Self::Package { request, .. } => request.service_id(),
+        }
+    }
+}
+
 /// Refuses an exclusion-list or watchlist exchange, before anything is sent, on
 /// a session whose handshake shows a side earlier than the item lists.
 fn check_network_lists(shared: &Shared) -> Result<(), SessionError> {
@@ -1303,6 +1767,395 @@ impl super::AgentHandle {
         check_network_lists(&self.0)
     }
 
+    /// Fetches a data source, returning `None` when it does not exist.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn get_data_source(
+        &self,
+        key: &crate::types::DataSourceKey<'_>,
+    ) -> Result<Option<crate::types::DataSource>, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::GetDataSource),
+            key,
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn get_indicator(
+        &self,
+        name: &str,
+    ) -> Result<std::collections::HashSet<Vec<String>>, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::GetIndicator),
+            name,
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn get_internal_network_list(
+        &self,
+    ) -> Result<crate::types::HostNetworkGroup, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::GetInternalNetworkList),
+            (),
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn get_labeldb_patterns(
+        &self,
+        labeldbs: &[(&str, &str)],
+    ) -> Result<Vec<(String, Option<crate::types::LabelDb>)>, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::GetLabelDbPatterns),
+            labeldbs,
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn get_tor_exit_node_list(&self) -> Result<Vec<String>, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::GetTorExitNodeList),
+            (),
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn get_trusted_domain_list(&self) -> Result<Vec<String>, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::GetTrustedDomainList),
+            (),
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn get_trusted_user_agent_list(&self) -> Result<Vec<String>, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::GetTrustedUserAgentList),
+            (),
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn get_time_series_generation_policy_list(
+        &self,
+    ) -> Result<Vec<crate::types::TimeSeriesGenerationPolicy>, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::GetTimeSeriesGenerationPolicyList),
+            (),
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn renew_certificate(&self) -> Result<(String, String), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::RenewCertificate),
+            (),
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn insert_column_statistics(
+        &self,
+        statistics: &[crate::types::ColumnStatisticsUpdate],
+        model_id: u32,
+        batch_ts: i64,
+    ) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::InsertColumnStatistics),
+            &(statistics, model_id, batch_ts),
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn insert_time_series(
+        &self,
+        time_series: &[crate::types::TimeSeriesUpdate],
+        model_id: u32,
+        batch_ts: i64,
+    ) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::InsertTimeSeries),
+            &(time_series, model_id, batch_ts),
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn update_clusters(
+        &self,
+        input: &[crate::types::UpdateClusterRequest],
+        model_id: u32,
+    ) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::UpdateClusters),
+            &(input, model_id),
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn update_outliers(
+        &self,
+        outliers: &[crate::types::OutlierInfo],
+        model_id: u32,
+        timestamp: i64,
+    ) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::UpdateOutliers),
+            &(outliers, model_id, timestamp),
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn insert_detection_events(
+        &self,
+        model_id: u32,
+        round: u32,
+        events: &[crate::types::DetectionEvent],
+    ) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::InsertDetectionEvents),
+            &(model_id, round, events),
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn insert_data_source(
+        &self,
+        data_source: &crate::types::DataSource,
+    ) -> Result<u32, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::InsertDataSource),
+            data_source,
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn get_outliers(
+        &self,
+        model_id: u32,
+        timestamp: i64,
+    ) -> Result<Vec<(String, Vec<i64>)>, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::GetOutliers),
+            &(model_id, timestamp),
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn get_dai_extractor_config(
+        &self,
+        sensors: &[String],
+    ) -> Result<crate::types::DaiExtractorConfig, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::GetDaiExtractorConfig),
+            sensors,
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn get_dai_cursors(
+        &self,
+        sensors: &[String],
+    ) -> Result<crate::types::DaiCursors, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::GetDaiCursors),
+            sensors,
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn send_dai_observations(
+        &self,
+        batch: &crate::types::DaiObservationBatch,
+    ) -> Result<crate::types::DaiStoreAck, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::SendDaiObservations),
+            batch,
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn begin_dai_range_day(
+        &self,
+        unit: &crate::types::DaiRangeUnit,
+        restore_generation: u64,
+    ) -> Result<crate::types::DaiRangeGrant, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::BeginDaiRangeDay),
+            (unit, restore_generation),
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn renew_dai_range_day(
+        &self,
+        unit: &crate::types::DaiRangeUnit,
+        lease_token: u64,
+    ) -> Result<Option<i64>, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::RenewDaiRangeDay),
+            (unit, lease_token),
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn send_dai_range_day(
+        &self,
+        day: &crate::types::DaiRangeDay,
+    ) -> Result<crate::types::DaiStoreAck, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::SendDaiRangeDay),
+            day,
+        )
+        .await
+    }
+
+    /// Executes the corresponding typed manager operation.
+    ///
+    /// # Errors
+    /// Returns a classified transport, framing, limit, or remote rejection error.
+    pub async fn report_dai_range_late(
+        &self,
+        late: &crate::types::DaiRangeLate,
+    ) -> Result<Vec<crate::types::DaiRangeMark>, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::ReportDaiRangeLate),
+            late,
+        )
+        .await
+    }
+
     /// Sends the `upload_run_model` engine operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
@@ -1314,6 +2167,47 @@ impl super::AgentHandle {
             (run_id, model),
         )
         .await
+    }
+
+    /// Sends a run report and returns an owned response exchange.
+    ///
+    /// # Errors
+    /// Returns a classified transport, encoding or limit error. Once sending
+    /// begins, failure may leave the mutation outcome unknown.
+    pub async fn start_report_run(
+        &self,
+        run_id: u32,
+        state: ReportedRunState,
+        reason: Option<&str>,
+    ) -> Result<ReportRunExchange, SessionError> {
+        let mut certainty = OutcomeCertainty::NotSent;
+        let operation = async {
+            let (send, recv) = self
+                .0
+                .connection
+                .open_bi()
+                .await
+                .map_err(|error| SessionError::transport(error, certainty))?;
+            let mut exchange = Exchange::new(send, recv, self.0.options.unary);
+            exchange.start_request(
+                u32::from(crate::server::RequestCode::ReportRun),
+                (run_id, state, reason),
+            )?;
+            certainty = OutcomeCertainty::Unknown;
+            exchange.flush().await?;
+            Ok(ReportRunExchange(exchange))
+        };
+        if let Some(timeout) = self.0.options.operation_timeout {
+            match tokio::time::timeout(timeout, operation).await {
+                Ok(result) => result,
+                Err(source) => Err(SessionError::Deadline {
+                    certainty,
+                    source: Some(source),
+                }),
+            }
+        } else {
+            operation.await
+        }
     }
 
     /// Sends the `report_run` engine operation.
@@ -1932,12 +2826,25 @@ impl super::ServerHandle {
 pub struct PackageReply<'a> {
     exchange: ExchangeLease<'a>,
     remaining: Option<u64>,
+    size: Option<u64>,
     options: super::SessionOptions,
     receiving: bool,
 }
 
 #[cfg(feature = "client")]
 impl PackageReply<'_> {
+    /// Returns the declared install payload size, or `None` for other requests.
+    #[must_use]
+    pub fn size(&self) -> Option<u64> {
+        self.size
+    }
+
+    /// Returns the unread install payload bytes, or `None` for other requests.
+    #[must_use]
+    pub fn remaining(&self) -> Option<u64> {
+        self.remaining
+    }
+
     /// Sends an install preflight, returning ownership only when transfer may proceed.
     /// # Errors
     /// Returns malformed-state, limit, encoding, or transport errors.
@@ -2307,5 +3214,358 @@ mod tests {
             BTreeSet::from([1, 2, 4, 5, 6, 7, 13, 19, 20, 21, u32::MAX])
         );
         assert_eq!(exceptions, [17], "only EchoRequest is an exception");
+    }
+}
+
+#[cfg(feature = "client")]
+impl crate::request::SessionPackageSource for PackageReply<'_> {
+    fn next_chunk<'a>(
+        &'a mut self,
+        buf: &'a mut Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<bool>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            PackageReply::next_chunk(self, buf)
+                .await
+                .map_err(std::io::Error::other)
+        })
+    }
+}
+
+#[cfg(feature = "client")]
+impl AgentRequestStream {
+    /// Runs commands with a node-only handler and authenticated authorization policy.
+    /// Commands outside the node handler surface receive the default unsupported response.
+    ///
+    /// # Errors
+    /// Returns a session error if receiving or responding fails.
+    pub async fn run_node_authorized<H: crate::request::NodeHandler>(
+        self,
+        handler: &mut H,
+        context: &crate::auth::AuthorizationContext,
+        policy: &dyn crate::auth::AuthorizerV2,
+    ) -> Result<(), SessionError> {
+        self.run_authorized(&mut NodeHandlerAdapter(handler), context, policy)
+            .await
+    }
+
+    /// Runs commands with an authenticated context and an application policy.
+    /// The policy is consulted for every invocation; handshake claims do not grant access.
+    ///
+    /// # Errors
+    /// Returns a session error if receiving or responding fails.
+    pub async fn run_authorized<H: crate::request::Handler>(
+        self,
+        handler: &mut H,
+        context: &crate::auth::AuthorizationContext,
+        policy: &dyn crate::auth::AuthorizerV2,
+    ) -> Result<(), SessionError> {
+        self.run(handler, |command| {
+            policy
+                .authorize_with_context(context, &command.service_id())
+                .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Runs sequential commands using an application-provided authorization check.
+    ///
+    /// The check runs for each invocation and must use authenticated context
+    /// captured by the caller, rather than handshake capability claims.
+    ///
+    /// # Errors
+    /// Returns a session error if receiving or responding fails.
+    // The dispatch table mirrors the legacy handler contracts; each arm completes a response.
+    #[allow(clippy::too_many_lines, clippy::semicolon_if_nothing_returned)]
+    pub async fn run<H, A>(mut self, handler: &mut H, mut authorize: A) -> Result<(), SessionError>
+    where
+        H: crate::request::Handler,
+        A: FnMut(&AgentRequest<'_>) -> Result<(), String>,
+    {
+        while let Some(command) = self.next().await? {
+            let authorization = authorize(&command);
+            macro_rules! dispatch {
+                ($reply:ident, $call:expr) => {{
+                    let result = match authorization {
+                        Ok(()) => $call.await,
+                        Err(error) => Err(error),
+                    };
+                    $reply.respond(result).await?;
+                }};
+            }
+            match command {
+                AgentRequest::DnsStart { request: (), reply } => {
+                    dispatch!(reply, handler.dns_start())
+                }
+                AgentRequest::DnsStop { request: (), reply } => {
+                    dispatch!(reply, handler.dns_stop())
+                }
+                AgentRequest::Reboot { request: (), reply } => dispatch!(reply, async {
+                    handler
+                        .node_power(NodePowerRequest::Reboot)
+                        .await
+                        .map(|_| ())
+                }),
+                #[allow(deprecated)]
+                AgentRequest::ReloadConfig { request: (), reply } => {
+                    dispatch!(reply, handler.reload_config())
+                }
+                AgentRequest::ReloadTi { request, reply } => {
+                    dispatch!(reply, handler.reload_ti(&request))
+                }
+                AgentRequest::ResourceUsage { request: (), reply } => dispatch!(reply, async {
+                    handler
+                        .node_observation(NodeObservationRequest::ResourceUsage)
+                        .await
+                        .and_then(|response| match response {
+                            NodeObservationResponse::ResourceUsage {
+                                hostname,
+                                resource_usage,
+                            } => Ok((hostname, resource_usage)),
+                            other => {
+                                Err(format!("unexpected node_observation response: {other:?}"))
+                            }
+                        })
+                }),
+                AgentRequest::TorExitNodeList { request, reply } => dispatch!(
+                    reply,
+                    handler.tor_exit_node_list(
+                        &request.iter().map(String::as_str).collect::<Vec<_>>()
+                    )
+                ),
+                AgentRequest::TrustedDomainList { request, reply } => dispatch!(
+                    reply,
+                    handler.trusted_domain_list(
+                        &request.iter().map(String::as_str).collect::<Vec<_>>()
+                    )
+                ),
+                AgentRequest::TrustedUserAgentList { request, reply } => dispatch!(
+                    reply,
+                    handler.trusted_user_agent_list(
+                        &request.iter().map(String::as_str).collect::<Vec<_>>()
+                    )
+                ),
+                AgentRequest::TimeSeriesGenerationPolicyList { request, reply } => {
+                    dispatch!(reply, handler.time_series_generation_policy_list(&request))
+                }
+                AgentRequest::DeleteTimeSeriesGenerationPolicy { request, reply } => dispatch!(
+                    reply,
+                    handler.delete_time_series_generation_policy(&request)
+                ),
+                AgentRequest::ReloadFilterRule { request, reply } => {
+                    dispatch!(reply, handler.update_traffic_filter_rules(&request))
+                }
+                AgentRequest::InternalNetworkList { request, reply } => {
+                    dispatch!(reply, handler.internal_network_list(request))
+                }
+                AgentRequest::ExclusionList { request, reply } => {
+                    dispatch!(reply, handler.exclusion_list(request))
+                }
+                AgentRequest::Watchlist { request, reply } => {
+                    dispatch!(reply, handler.watchlist(request))
+                }
+                AgentRequest::EchoRequest { request: (), reply } => {
+                    dispatch!(reply, async { Ok(()) })
+                }
+                AgentRequest::DeleteCustomerData { request, reply } => {
+                    dispatch!(reply, handler.delete_customer_data(&request))
+                }
+                AgentRequest::ProcessList { request: (), reply } => dispatch!(reply, async {
+                    handler
+                        .node_observation(NodeObservationRequest::ProcessList)
+                        .await
+                        .and_then(|response| match response {
+                            NodeObservationResponse::ProcessList { processes } => Ok(processes),
+                            other => {
+                                Err(format!("unexpected node_observation response: {other:?}"))
+                            }
+                        })
+                }),
+                AgentRequest::Shutdown { request: (), reply } => dispatch!(reply, async {
+                    handler
+                        .node_power(NodePowerRequest::Shutdown)
+                        .await
+                        .map(|_| ())
+                }),
+                AgentRequest::SemiSupervisedModels { request, reply } => {
+                    dispatch!(reply, handler.update_semi_supervised_models(&request))
+                }
+                AgentRequest::SignatureRules { request, reply } => {
+                    dispatch!(reply, handler.signature_rules(request))
+                }
+                AgentRequest::UpdateConfig { reply, .. } => {
+                    dispatch!(reply, handler.update_config())
+                }
+                AgentRequest::TrainModel { request, reply } => {
+                    dispatch!(reply, handler.train_model(&request))
+                }
+                AgentRequest::CloneModel { request, reply } => {
+                    dispatch!(reply, handler.clone_model(&request))
+                }
+                AgentRequest::CancelRun { request, reply } => {
+                    dispatch!(reply, handler.cancel_run(request))
+                }
+                AgentRequest::RunDetectorOnce { request, reply } => {
+                    dispatch!(reply, handler.run_detector_once(request))
+                }
+                AgentRequest::Service { request, reply } => {
+                    dispatch!(reply, handler.node_service(request))
+                }
+                AgentRequest::NetworkInterface { request, reply } => {
+                    dispatch!(reply, handler.node_network_interface(request))
+                }
+                AgentRequest::Hostname { request, reply } => {
+                    dispatch!(reply, handler.node_hostname(request))
+                }
+                AgentRequest::TimeSync { request, reply } => {
+                    dispatch!(reply, handler.node_time_sync(request))
+                }
+                AgentRequest::Logging { request, reply } => {
+                    dispatch!(reply, handler.node_logging(request))
+                }
+                AgentRequest::RemoteAccess { request, reply } => {
+                    dispatch!(reply, handler.node_remote_access(request))
+                }
+                AgentRequest::Observation { request, reply } => {
+                    dispatch!(reply, handler.node_observation(request))
+                }
+                AgentRequest::Version { request, reply } => {
+                    dispatch!(reply, handler.node_version(request))
+                }
+                AgentRequest::Enroll { request, reply } => {
+                    dispatch!(reply, handler.node_enroll(request))
+                }
+                AgentRequest::Power { request, reply } => {
+                    let immediate = matches!(
+                        request,
+                        NodePowerRequest::Reboot | NodePowerRequest::Shutdown
+                    );
+                    let result = match authorization {
+                        Ok(()) => handler.node_power(request).await,
+                        Err(error) => Err(error),
+                    };
+                    if immediate {
+                        reply.complete_without_response();
+                    } else {
+                        reply.respond(result).await?;
+                    }
+                }
+                AgentRequest::Package { request, reply } => {
+                    if let Some(size) = reply.size() {
+                        let verdict = match authorization {
+                            Ok(()) => handler.node_package_install_preflight(&request).await,
+                            Err(error) => Err(error),
+                        };
+                        if let Some(mut reply) = reply.preflight(verdict).await? {
+                            let result = {
+                                let mut reader =
+                                    crate::request::PackageReader::from_session(&mut reply, size);
+                                let result =
+                                    handler.node_package_install(request, &mut reader).await;
+                                let mut buffer = Vec::new();
+                                while reader.remaining() > 0 {
+                                    reader.next_chunk(&mut buffer).await.map_err(|error| {
+                                        SessionError::transport(error, OutcomeCertainty::Unknown)
+                                    })?;
+                                }
+                                result
+                            };
+                            reply.respond(result).await?;
+                        }
+                    } else {
+                        let result = match authorization {
+                            Ok(()) => handler.node_package(request).await,
+                            Err(error) => Err(error),
+                        };
+                        reply.respond(result).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "client")]
+struct NodeHandlerAdapter<'a, H>(&'a mut H);
+
+#[cfg(feature = "client")]
+#[async_trait::async_trait]
+impl<H: crate::request::NodeHandler> crate::request::Handler for NodeHandlerAdapter<'_, H> {
+    async fn node_service(
+        &mut self,
+        request: NodeServiceRequest,
+    ) -> Result<NodeServiceResponse, String> {
+        self.0.node_service(request).await
+    }
+    async fn node_network_interface(
+        &mut self,
+        request: NodeNetworkInterfaceRequest,
+    ) -> Result<NodeNetworkInterfaceResponse, String> {
+        self.0.node_network_interface(request).await
+    }
+    async fn node_hostname(
+        &mut self,
+        request: NodeHostnameRequest,
+    ) -> Result<NodeHostnameResponse, String> {
+        self.0.node_hostname(request).await
+    }
+    async fn node_time_sync(
+        &mut self,
+        request: NodeTimeSyncRequest,
+    ) -> Result<NodeTimeSyncResponse, String> {
+        self.0.node_time_sync(request).await
+    }
+    async fn node_logging(
+        &mut self,
+        request: NodeLoggingRequest,
+    ) -> Result<NodeLoggingResponse, String> {
+        self.0.node_logging(request).await
+    }
+    async fn node_remote_access(
+        &mut self,
+        request: NodeRemoteAccessRequest,
+    ) -> Result<NodeRemoteAccessResponse, String> {
+        self.0.node_remote_access(request).await
+    }
+    async fn node_observation(
+        &mut self,
+        request: NodeObservationRequest,
+    ) -> Result<NodeObservationResponse, String> {
+        self.0.node_observation(request).await
+    }
+    async fn node_version(
+        &mut self,
+        request: NodeVersionRequest,
+    ) -> Result<NodeVersionResponse, String> {
+        self.0.node_version(request).await
+    }
+    async fn node_enroll(
+        &mut self,
+        request: NodeEnrollRequest,
+    ) -> Result<NodeEnrollResponse, String> {
+        self.0.node_enroll(request).await
+    }
+    async fn node_power(&mut self, request: NodePowerRequest) -> Result<NodePowerResponse, String> {
+        self.0.node_power(request).await
+    }
+    async fn node_package(
+        &mut self,
+        request: NodePackageRequest,
+    ) -> Result<NodePackageResponse, String> {
+        self.0.node_package(request).await
+    }
+    async fn node_package_install_preflight(
+        &mut self,
+        request: &NodePackageRequest,
+    ) -> Result<crate::types::node::InstallPreflight, String> {
+        self.0.node_package_install_preflight(request).await
+    }
+    async fn node_package_install(
+        &mut self,
+        request: NodePackageRequest,
+        reader: &mut crate::request::PackageReader<'_>,
+    ) -> Result<NodePackageResponse, String> {
+        self.0.node_package_install(request, reader).await
     }
 }
