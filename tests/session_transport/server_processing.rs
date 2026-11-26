@@ -1605,6 +1605,217 @@ async fn runner_answers_exclusion_count_report_unsupported_by_default() {
     );
 }
 
+/// The owned runner serves request 56 through the handler's
+/// `get_signature_rules` and request 57 through `report_signature_status`,
+/// passes each argument to them intact (a known revision `None` and `Some`,
+/// and status reports with every list non-empty and every list empty), returns
+/// the handler's `Some` and `None` answers and rejection, and authorizes each
+/// request as its service ID.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One handler, five requests and their answers.
+async fn runner_serves_signature_requests() {
+    use review_protocol::{
+        test::{signature_rules, signature_status_reports},
+        types::{SignatureRules, SignatureStatusReport},
+    };
+
+    #[derive(Debug, PartialEq)]
+    enum Received {
+        Pull(String, Option<u64>),
+        Report(String, SignatureStatusReport),
+    }
+
+    #[derive(Default)]
+    struct SignatureHandler(Mutex<Vec<Received>>);
+
+    #[async_trait::async_trait]
+    impl Handler for SignatureHandler {
+        async fn get_signature_rules(
+            &self,
+            peer: &str,
+            known_revision: Option<u64>,
+        ) -> Result<Option<SignatureRules>, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(Received::Pull(peer.to_string(), known_revision));
+            let current = signature_rules().remove(0);
+            match known_revision {
+                None => Ok(Some(current)),
+                Some(revision) if revision == current.revision => Ok(None),
+                Some(_) => Err("revision unknown".to_string()),
+            }
+        }
+
+        async fn report_signature_status(
+            &self,
+            peer: &str,
+            report: &SignatureStatusReport,
+        ) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(Received::Report(peer.to_string(), report.clone()));
+            if report.loaded.is_empty() {
+                Err("nothing loaded".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let current = signature_rules().remove(0);
+    let known_revisions = [None, Some(current.revision), Some(3)];
+    let reports = signature_status_reports();
+    let requests = known_revisions
+        .iter()
+        .map(|known_revision| request_frame(56, known_revision))
+        .chain(reports.iter().map(|report| request_frame(57, report)))
+        .collect::<Vec<_>>()
+        .concat();
+
+    let (incoming, _, _, node) = raw_sessions_at(
+        SessionOptions::legacy_compatible(),
+        review_protocol::PROTOCOL_VERSION,
+    )
+    .await;
+    let policy = Policy::default();
+    let trace = policy.trace.clone();
+    let mut incoming = incoming.with_authorization(context(), Arc::new(policy));
+    let handler = Arc::new(SignatureHandler::default());
+    let (mut send, mut recv) = open_requests(&node, &requests).await;
+    send.finish().unwrap();
+    assert!(matches!(
+        request_stream(&mut incoming)
+            .await
+            .run(Arc::clone(&handler))
+            .await,
+        Ok(ServerRequestOutcome::Finished)
+    ));
+    let mut responses = Vec::new();
+    recv.read_to_end(&mut responses).await.unwrap();
+
+    let frames = response_frames(&responses);
+    let [
+        pull_none,
+        pull_current,
+        pull_unknown,
+        report_full,
+        report_empty,
+    ] = frames.as_slice()
+    else {
+        panic!("expected five responses, got {}", frames.len());
+    };
+    assert_eq!(
+        decode_response::<Option<SignatureRules>>(pull_none),
+        Ok(Some(current))
+    );
+    assert_eq!(
+        decode_response::<Option<SignatureRules>>(pull_current),
+        Ok(None)
+    );
+    assert_eq!(
+        decode_response::<Option<SignatureRules>>(pull_unknown),
+        Err("revision unknown".to_string())
+    );
+    assert_eq!(decode_response::<()>(report_full), Ok(()));
+    assert_eq!(
+        decode_response::<()>(report_empty),
+        Err("nothing loaded".to_string())
+    );
+    let peer = || "verified-peer".to_string();
+    assert_eq!(
+        *handler.0.lock().unwrap(),
+        known_revisions
+            .iter()
+            .map(|known_revision| Received::Pull(peer(), *known_revision))
+            .chain(
+                reports
+                    .iter()
+                    .map(|report| Received::Report(peer(), report.clone()))
+            )
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            service_id::SERVER_SIGNATURE_RULES_GET,
+            service_id::SERVER_SIGNATURE_RULES_GET,
+            service_id::SERVER_SIGNATURE_RULES_GET,
+            service_id::SERVER_SIGNATURE_RULES_REPORT_STATUS,
+            service_id::SERVER_SIGNATURE_RULES_REPORT_STATUS,
+        ]
+        .map(Observation::Authorization)
+    );
+}
+
+/// The owned runner answers requests 56 and 57 with the default
+/// `not supported` error when the handler does not override them, after
+/// authorizing them, and continues with the next request.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn runner_answers_signature_requests_unsupported_by_default() {
+    use review_protocol::test::signature_status_reports;
+
+    let report = signature_status_reports().remove(0);
+    let requests = [
+        request_frame(56, &None::<u64>).as_slice(),
+        request_frame(56, &Some(7_u64)).as_slice(),
+        request_frame(57, &report).as_slice(),
+        GET_CONFIG,
+    ]
+    .concat();
+
+    let (incoming, _, _, node) = raw_sessions_at(
+        SessionOptions::legacy_compatible(),
+        review_protocol::PROTOCOL_VERSION,
+    )
+    .await;
+    let policy = Policy::default();
+    let trace = policy.trace.clone();
+    let mut incoming = incoming.with_authorization(context(), Arc::new(policy));
+    let (mut send, mut recv) = open_requests(&node, &requests).await;
+    send.finish().unwrap();
+    assert!(matches!(
+        request_stream(&mut incoming)
+            .await
+            .run(Arc::new(ConfigResponse(1)))
+            .await,
+        Ok(ServerRequestOutcome::Finished)
+    ));
+    let mut responses = Vec::new();
+    recv.read_to_end(&mut responses).await.unwrap();
+
+    let frames = response_frames(&responses);
+    let [pull_none, pull_some, report_answer, config_answer] = frames.as_slice() else {
+        panic!("expected four responses, got {}", frames.len());
+    };
+    for pull in [pull_none, pull_some] {
+        assert_eq!(
+            decode_response::<Option<review_protocol::types::SignatureRules>>(pull),
+            Err("not supported".to_string())
+        );
+    }
+    assert_eq!(
+        decode_response::<()>(report_answer),
+        Err("not supported".to_string())
+    );
+    assert_eq!(
+        decode_response::<String>(config_answer),
+        Ok("x".to_string())
+    );
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            Observation::Authorization(service_id::SERVER_SIGNATURE_RULES_GET),
+            Observation::Authorization(service_id::SERVER_SIGNATURE_RULES_GET),
+            Observation::Authorization(service_id::SERVER_SIGNATURE_RULES_REPORT_STATUS),
+            Observation::Authorization(service_id::SERVER_CONFIG_GET),
+        ]
+    );
+}
+
 /// The retired host report codes 37 and 38 are unknown to the owned runner:
 /// it answers `unknown request code` and stops dispatch.
 #[tokio::test]

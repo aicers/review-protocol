@@ -37,6 +37,33 @@ pub async fn dispatch<H: request::NodeHandler>(handler: &mut H, send: &mut quinn
     request::handle_node(handler, send, recv).await
 }
 
+pub async fn signature_rules(
+    client: &client::Connection,
+    server: &server::Connection,
+    report: &review_protocol::types::SignatureStatusReport,
+) -> anyhow::Result<()> {
+    client.report_signature_status(report).await?;
+    if let Some(rules) = client.get_signature_rules(Some(1)).await? {
+        server.send_signature_rules(&rules).await?;
+    }
+    Ok(())
+}
+
+pub async fn signature_rules_handler<H: request::Handler + Send>(
+    handler: &mut H,
+    rules: review_protocol::types::SignatureRules,
+) -> Result<(), String> {
+    handler.signature_rules(rules).await
+}
+
+pub async fn signature_rules_manager<H: server::Handler + Sync>(
+    handler: &H,
+    report: &review_protocol::types::SignatureStatusReport,
+) -> Result<Option<review_protocol::types::SignatureRules>, String> {
+    handler.report_signature_status("engine", report).await?;
+    handler.get_signature_rules("engine", Some(1)).await
+}
+
 pub async fn network_lists_and_exclusion_counts(
     client: &client::Connection,
     server: &server::Connection,

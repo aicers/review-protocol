@@ -145,6 +145,10 @@ pub(crate) enum RequestCode {
     /// Run one round of an Unsupervised Engine detector now
     RunDetectorOnce = 26,
 
+    // ── Semi-supervised Engine request codes ───────────────────
+    /// Push the compiled signature rule sets to a Semi-supervised Engine
+    SignatureRules = 27,
+
     /// Unknown request
     #[num_enum(default)]
     Unknown = u32::MAX,

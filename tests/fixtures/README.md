@@ -213,13 +213,40 @@ The bytes of a later patch release that changes only `CHANGELOG.md` and
   `Network` primary subjects, both target kinds and every detail, including
   the event that fails `validate`.
 - `raw-event-detection-events.bin`: one `Target::RawEvent` detection event for
-  each of the 22 network and Netflow bodies of the test `bodies()` list at
-  that tag (the 20 network bodies, `Netflow5` and `Netflow9`), in list order.
-  Each has time `1_773_586_804_120_000_000` ns for both the event and its raw
-  event, sensor `sensor-1`, model and detail `NonBrowser`, the body's kind,
-  category `CommandAndControl` and score `0.75`. The Sysmon bodies are left
-  out, since their bytes change.
+  each of 21 network and Netflow bodies of the test `bodies()` list at that
+  tag (19 of the 20 network bodies, `Netflow5` and `Netflow9`), in list
+  order. Each has time `1_773_586_804_120_000_000` ns for both the event and
+  its raw event, sensor `sensor-1`, model and detail `NonBrowser`, the body's
+  kind, category `CommandAndControl` and score `0.75`. The Sysmon bodies are
+  left out, since their bytes change. The `Http` body is left out too,
+  because protocol 0.53.0 changes its bytes.
+
+  As captured, the file held 22 events, the third of them for the `Http`
+  body. Protocol 0.53.0 cut exactly that event's 368 bytes out, which start
+  at offset 230, after the `Conn` and `Dns` events: the bytes before them are
+  the unchanged encoding of those two events, and the bytes after them the
+  unchanged encoding of the 19 events after `Http`. Every other byte is as
+  captured; the file was never regenerated from later code.
 
 The tests rebuild the same events from the current helpers: the events of
 `test::detection_events()` before the appended endpoint event, and the same
-22 bodies. The `current/server-*.bin` fixtures are unchanged by 0.52.0.
+21 bodies. The `current/server-*.bin` fixtures are unchanged by 0.52.0.
+
+## Http detection event in protocol 0.53.0
+
+Protocol 0.53.0 appends six request header fields to the `Http` raw event
+body after `state`: `request_header_names`, `accept`, `connection`,
+`accept_encoding`, `accept_language` and `pragma`, the fields giganto-client
+`0.32.0` appends to its `Http`. `current/http-detection-event.bin` pins the
+new layout. It is the `Http` event cut out of
+`0.32.0/raw-event-detection-events.bin`, with the bincode 2 standard serde
+encoding of the six fields of the test `bodies()` list's `Http` body inserted
+after `state` (before the score and detail): the names `Host`, `Accept`,
+`Cookie`, `Accept`, then `text/html,application/xhtml+xml`, `keep-alive`,
+`gzip, deflate`, `en-US,en;q=0.9` and `no-cache, x-synthetic`. The bytes were
+composed this way, not encoded by the crate.
+
+The signature requests 0.53.0 adds, agent request 27 and server requests 56
+and 57, are not part of the `current/server-*.bin` fixtures, which are
+unchanged; their own tests cover them. Server request codes 53 to 55 are
+reserved for another change and still decode as unknown.

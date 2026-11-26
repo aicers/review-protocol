@@ -327,6 +327,7 @@ pub const COMMON_TRUSTED_USER_AGENT_LIST: ServiceId =
 pub const COMMON_SEMI_SUPERVISED_MODELS: ServiceId =
     ServiceId::new("common", "semi_supervised_models");
 pub const COMMON_RENEW_CERTIFICATE: ServiceId = ServiceId::new("common", "renew_certificate");
+pub const COMMON_SIGNATURE_RULES: ServiceId = ServiceId::new("common", "signature_rules");
 
 // ── engine ─────────────────────────────────────────────────────
 //
@@ -428,6 +429,15 @@ pub const SERVER_DETECTOR_REPORT_STATUS: ServiceId =
 
 pub const SERVER_EXCLUSION_LIST_REPORT_COUNTS: ServiceId =
     ServiceId::new("server.exclusion_list", "report_counts");
+
+// ── server.signature_rules ────────────────────────────────────
+//
+// The signature rule sets a Semi-supervised Engine pulls, and the status of
+// its signature matching it reports.
+
+pub const SERVER_SIGNATURE_RULES_GET: ServiceId = ServiceId::new("server.signature_rules", "get");
+pub const SERVER_SIGNATURE_RULES_REPORT_STATUS: ServiceId =
+    ServiceId::new("server.signature_rules", "report_status");
 
 // ── server.dai ────────────────────────────────────────────────
 //
@@ -647,6 +657,7 @@ pub(crate) fn from_client_request_code(code: ClientRequestCode) -> Option<Servic
         ClientRequestCode::ProcessList => Some(NODE_OBSERVATION_PROCESS_LIST),
         ClientRequestCode::SemiSupervisedModels => Some(COMMON_SEMI_SUPERVISED_MODELS),
         ClientRequestCode::Shutdown => Some(NODE_POWER_SHUTDOWN),
+        ClientRequestCode::SignatureRules => Some(COMMON_SIGNATURE_RULES),
 
         // Node feature-family codes.  These map to the family
         // level; the specific method is determined by deserializing
@@ -727,6 +738,8 @@ pub(crate) fn from_server_request_code(code: ServerRequestCode) -> Option<Servic
         ServerRequestCode::SendDaiRangeDay => Some(SERVER_DAI_SEND_RANGE_DAY),
         ServerRequestCode::ReportDaiRangeLate => Some(SERVER_DAI_REPORT_RANGE_LATE),
         ServerRequestCode::ReportExclusionCounts => Some(SERVER_EXCLUSION_LIST_REPORT_COUNTS),
+        ServerRequestCode::GetSignatureRules => Some(SERVER_SIGNATURE_RULES_GET),
+        ServerRequestCode::ReportSignatureStatus => Some(SERVER_SIGNATURE_RULES_REPORT_STATUS),
         ServerRequestCode::Unknown => None,
     }
 }
@@ -832,6 +845,7 @@ pub fn all() -> &'static [ServiceId] {
         COMMON_TRUSTED_USER_AGENT_LIST,
         COMMON_SEMI_SUPERVISED_MODELS,
         COMMON_RENEW_CERTIFICATE,
+        COMMON_SIGNATURE_RULES,
         // engine
         ENGINE_TRAIN_MODEL,
         ENGINE_CLONE_MODEL,
@@ -847,6 +861,9 @@ pub fn all() -> &'static [ServiceId] {
         SERVER_DETECTOR_REPORT_STATUS,
         // server.exclusion_list
         SERVER_EXCLUSION_LIST_REPORT_COUNTS,
+        // server.signature_rules
+        SERVER_SIGNATURE_RULES_GET,
+        SERVER_SIGNATURE_RULES_REPORT_STATUS,
         // server.dai
         SERVER_DAI_GET_EXTRACTOR_CONFIG,
         SERVER_DAI_GET_CURSORS,
@@ -1092,6 +1109,7 @@ mod tests {
             ClientRequestCode::CloneModel,
             ClientRequestCode::CancelRun,
             ClientRequestCode::RunDetectorOnce,
+            ClientRequestCode::SignatureRules,
         ];
         for &code in codes {
             assert!(
@@ -1147,6 +1165,8 @@ mod tests {
             ServerRequestCode::SendDaiRangeDay,
             ServerRequestCode::ReportDaiRangeLate,
             ServerRequestCode::ReportExclusionCounts,
+            ServerRequestCode::GetSignatureRules,
+            ServerRequestCode::ReportSignatureStatus,
         ];
         for &code in codes {
             assert!(
@@ -1379,6 +1399,58 @@ mod tests {
             SERVER_EXCLUSION_LIST_REPORT_COUNTS.to_string(),
             "server.exclusion_list.report_counts"
         );
+    }
+
+    /// Requests 27, 56 and 57 map to their own service IDs, whose categories
+    /// and names are pinned, and `all()` lists them.
+    #[test]
+    fn signature_request_codes_map_to_their_ids() {
+        let client = ClientRequestCode::from(27_u32);
+        assert_eq!(client, ClientRequestCode::SignatureRules);
+        assert_eq!(
+            from_client_request_code(client),
+            Some(COMMON_SIGNATURE_RULES)
+        );
+        for (number, code, id, text) in [
+            (
+                56_u32,
+                ServerRequestCode::GetSignatureRules,
+                SERVER_SIGNATURE_RULES_GET,
+                "server.signature_rules.get",
+            ),
+            (
+                57,
+                ServerRequestCode::ReportSignatureStatus,
+                SERVER_SIGNATURE_RULES_REPORT_STATUS,
+                "server.signature_rules.report_status",
+            ),
+        ] {
+            assert_eq!(ServerRequestCode::from(number), code);
+            assert_eq!(from_server_request_code(code), Some(id));
+            assert_eq!(id.to_string(), text);
+        }
+        assert_eq!(COMMON_SIGNATURE_RULES.to_string(), "common.signature_rules");
+        assert_eq!(SERVER_SIGNATURE_RULES_GET.family, "server.signature_rules");
+        assert_eq!(SERVER_SIGNATURE_RULES_GET.method, "get");
+        assert_eq!(
+            SERVER_SIGNATURE_RULES_REPORT_STATUS.family,
+            "server.signature_rules"
+        );
+        assert_eq!(SERVER_SIGNATURE_RULES_REPORT_STATUS.method, "report_status");
+        for id in [
+            COMMON_SIGNATURE_RULES,
+            SERVER_SIGNATURE_RULES_GET,
+            SERVER_SIGNATURE_RULES_REPORT_STATUS,
+        ] {
+            assert!(all().contains(&id), "{id}");
+        }
+        // The codes reserved for another change map to no service ID.
+        for number in 53_u32..=55 {
+            assert_eq!(
+                from_server_request_code(ServerRequestCode::from(number)),
+                None
+            );
+        }
     }
 
     /// The retired host report requests decode as unknown codes, which map

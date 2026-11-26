@@ -1220,6 +1220,127 @@ async fn exclusion_count_reports_round_trip() {
     );
 }
 
+/// Every signature rule push, one with two rule sets and disabled rules and
+/// one with neither, reaches the agent as request 27 intact, and the agent's
+/// reply, a success or a rejection, reaches the manager.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn signature_rule_pushes_round_trip() {
+    use review_protocol::test::signature_rules;
+
+    let pushes = signature_rules();
+    assert!(
+        pushes
+            .iter()
+            .any(|rules| rules.sets.len() == 2 && !rules.disabled_rules.is_empty())
+    );
+    let (manager, _, _, mut incoming) = sessions(SessionOptions::legacy_compatible()).await;
+    let ((), ()) = tokio::join!(
+        async {
+            for rules in &pushes {
+                let result = manager.send_signature_rules(rules).await;
+                if rules.sets.is_empty() {
+                    assert!(
+                        matches!(result, Err(SessionError::RemoteRejection(message)) if message == "no rule sets")
+                    );
+                } else {
+                    result.unwrap();
+                }
+            }
+        },
+        async {
+            for rules in &pushes {
+                let mut stream = incoming.accept().await.unwrap();
+                let AgentRequest::SignatureRules { request, reply } =
+                    stream.next().await.unwrap().unwrap()
+                else {
+                    panic!("wrong request")
+                };
+                assert_eq!(&request, rules);
+                let answer = if request.sets.is_empty() {
+                    Err("no rule sets".into())
+                } else {
+                    Ok(())
+                };
+                reply.respond(answer).await.unwrap();
+                stream.finish().unwrap();
+            }
+        }
+    );
+}
+
+/// A Semi-supervised Engine's rule pull, request 56, reaches the manager's
+/// request stream with its known revision, `None` or `Some`, and the
+/// manager's `Some` and `None` answers and rejection reach the engine intact;
+/// every status report, request 57, reaches the manager as sent.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn signature_rule_pulls_and_status_reports_round_trip() {
+    use review_protocol::test::{signature_rules, signature_status_reports};
+
+    let rules = signature_rules();
+    let current = rules[0].clone();
+    let pulls = [
+        (None, Ok(Some(current.clone()))),
+        (Some(current.revision), Ok(None)),
+        (Some(3), Err("revision unknown".to_string())),
+    ];
+    let reports = signature_status_reports();
+    let (_, mut incoming, engine, _) = sessions(SessionOptions::legacy_compatible()).await;
+    let ((), ()) = tokio::join!(
+        async {
+            for (known_revision, answer) in &pulls {
+                let result = engine.get_signature_rules(*known_revision).await;
+                match answer {
+                    Ok(expected) => assert_eq!(&result.unwrap(), expected),
+                    Err(reason) => assert!(
+                        matches!(result, Err(SessionError::RemoteRejection(message)) if &message == reason)
+                    ),
+                }
+            }
+            for report in &reports {
+                let result = engine.report_signature_status(report).await;
+                if report.loaded.is_empty() {
+                    assert!(
+                        matches!(result, Err(SessionError::RemoteRejection(message)) if message == "nothing loaded")
+                    );
+                } else {
+                    result.unwrap();
+                }
+            }
+        },
+        async {
+            for (known_revision, answer) in &pulls {
+                let mut stream = request_stream(&mut incoming).await;
+                let ServerRequest::GetSignatureRules { request, reply } =
+                    stream.next().await.unwrap().unwrap()
+                else {
+                    panic!("wrong request")
+                };
+                assert_eq!(&request, known_revision);
+                reply.respond(answer.clone()).await.unwrap();
+                stream.finish().unwrap();
+            }
+            for report in &reports {
+                let mut stream = request_stream(&mut incoming).await;
+                let ServerRequest::ReportSignatureStatus { request, reply } =
+                    stream.next().await.unwrap().unwrap()
+                else {
+                    panic!("wrong request")
+                };
+                assert_eq!(&request, report);
+                let answer = if request.loaded.is_empty() {
+                    Err("nothing loaded".into())
+                } else {
+                    Ok(())
+                };
+                reply.respond(answer).await.unwrap();
+                stream.finish().unwrap();
+            }
+        }
+    );
+}
+
 /// Every detection event of the batch, with one that fails `validate` among
 /// valid ones, crosses the session-layer stream as sent and in order, both
 /// through `next` and through the owned runner.

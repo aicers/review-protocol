@@ -295,13 +295,26 @@
 //! compatibility. Request codes and representative responses have independently
 //! captured release/current fixtures in `tests/fixtures`.
 //!
-//! The protocol is `0.52.0`, and the library's `>=0.49.0` suggested floor is
-//! unchanged. `0.52.0` changes the detection event payload: the 14 Sysmon raw
-//! event bodies gain the endpoint host header as a trailing field (and
+//! The protocol is `0.53.0`, and the library's `>=0.49.0` suggested floor is
+//! unchanged. `0.53.0` changes the detection event payload again: the `Http`
+//! raw event body gains six trailing request header fields
+//! (`request_header_names`, `accept`, `connection`, `accept_encoding`,
+//! `accept_language` and `pragma`), so its bytes differ from `0.52.0`, and the
+//! three signature detection models (`EtSignature`, `EtPolicySignature` and
+//! `SigmaSignature`) are added with their detail. Detection events that use
+//! neither keep their `0.52.0` bytes, and an earlier peer cannot decode those
+//! that do. It also adds the signature rule
+//! requests: the manager's rule push, agent request 27, and a Semi-supervised
+//! Engine's rule pull and status report, server requests 56 and 57; a peer
+//! that predates `0.53.0` answers them with the unknown-code answer. Server
+//! request codes 53 through 55 are reserved for another change and still
+//! decode as unknown.
+//! `0.52.0` changed the detection event payload: the 14 Sysmon raw
+//! event bodies gained the endpoint host header as a trailing field (and
 //! `ProcessCreate` the full 64-bit logon ID after it), so their bytes differ
-//! from `0.51.0`; eight raw event kinds are added (five Sysmon kinds and the
+//! from `0.51.0`; eight raw event kinds were added (five Sysmon kinds and the
 //! Windows event log, journald and auditd kinds); and the endpoint primary
-//! subject is added. Detection events that use none of these shapes keep
+//! subject was added. Detection events that use none of these shapes keep
 //! their `0.51.0` bytes, and an earlier peer cannot decode those that do.
 //! `0.51.0` added the device identification (DAI) requests, codes 45
 //! through 51, and a Semi-supervised Engine's exclusion-count report, code 52,

@@ -51,7 +51,8 @@ use crate::{
     client::RequestCode,
     types::{
         CloneModelRequest, CustomerDataDeletionRequest, HostNetworkGroup, NetworkListItem, Process,
-        ResourceUsage, TimeSeriesGenerationPolicy, TrafficFilterRule, TrainModelRequest,
+        ResourceUsage, SignatureRules, TimeSeriesGenerationPolicy, TrafficFilterRule,
+        TrainModelRequest,
         node::{
             InstallPreflight, NodeEnrollRequest, NodeEnrollResponse, NodeHostnameRequest,
             NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
@@ -751,6 +752,19 @@ pub trait Handler: Send {
     /// Returns an error message if the request is not supported or
     /// the engine refuses it.
     async fn run_detector_once(&mut self, _detector_id: i32) -> Result<(), String> {
+        return Err("not supported".to_string());
+    }
+
+    // ── Semi-supervised Engine methods ─────────────────────────
+
+    /// Replaces the signature rule sets with those the Central Manager
+    /// pushed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or
+    /// the engine refuses the rule sets.
+    async fn signature_rules(&mut self, _rules: SignatureRules) -> Result<(), String> {
         return Err("not supported".to_string());
     }
 
@@ -1700,6 +1714,15 @@ pub async fn handle<H: Handler>(
                     .map_err(HandlerError::SendError)?;
             }
 
+            // ── Semi-supervised Engine dispatch ────────────────
+            RequestCode::SignatureRules => {
+                let rules = decode_args::<SignatureRules>(send, code, body, None).await?;
+                let result = handler.signature_rules(rules).await;
+                send_response(send, &mut buf, result)
+                    .await
+                    .map_err(HandlerError::SendError)?;
+            }
+
             // The fail-closed backstop for a code this build has not
             // assigned. An older binary, whose `RequestCode` has
             // neither a `NodePackage` nor a `NodeEnroll` variant,
@@ -1748,6 +1771,14 @@ mod tests {
         }
     }
 
+    /// The Semi-supervised Engine's rule push takes the code after the
+    /// Unsupervised Engine codes.
+    #[test]
+    fn signature_rules_request_code() {
+        assert_eq!(u32::from(RequestCode::SignatureRules), 27);
+        assert_eq!(RequestCode::from_primitive(27), RequestCode::SignatureRules);
+    }
+
     /// Verify that every node feature-family request code maps to a
     /// stable numeric value and round-trips through `FromPrimitive`.
     #[test]
@@ -1775,14 +1806,14 @@ mod tests {
     /// (non-node) codes and that unknown values still map to `Unknown`.
     #[test]
     fn node_request_codes_no_collision() {
-        // All existing non-node codes live in 0..=26; node codes
+        // All existing non-node codes live in 0..=27; node codes
         // start at 100. Verify that the gap maps to Unknown.
         assert_eq!(
-            RequestCode::from_primitive(26),
-            RequestCode::RunDetectorOnce,
-            "26 is the last non-node code"
+            RequestCode::from_primitive(27),
+            RequestCode::SignatureRules,
+            "27 is the last non-node code"
         );
-        assert_eq!(RequestCode::from_primitive(27), RequestCode::Unknown);
+        assert_eq!(RequestCode::from_primitive(28), RequestCode::Unknown);
         assert_eq!(RequestCode::from_primitive(50), RequestCode::Unknown);
         assert_eq!(RequestCode::from_primitive(99), RequestCode::Unknown);
         assert_eq!(
@@ -1866,6 +1897,22 @@ mod tests {
         node_dispatch_roundtrip::<_, ()>(RequestCode::CloneModel, clone).await;
         node_dispatch_roundtrip::<_, ()>(RequestCode::CancelRun, 7_u32).await;
         node_dispatch_roundtrip::<_, ()>(RequestCode::RunDetectorOnce, -1_i32).await;
+    }
+
+    /// An agent handler that does not override `signature_rules` answers
+    /// the rule push "not supported", both when called and through `handle`.
+    #[tokio::test]
+    #[cfg(feature = "server")]
+    async fn signature_rules_default_not_supported() {
+        for rules in crate::test::signature_rules() {
+            assert_eq!(
+                super::Handler::signature_rules(&mut NoopHandler, rules.clone())
+                    .await
+                    .unwrap_err(),
+                "not supported"
+            );
+            node_dispatch_roundtrip::<_, ()>(RequestCode::SignatureRules, rules).await;
+        }
     }
 
     /// Dispatch round-trip test helper: sends a typed node request

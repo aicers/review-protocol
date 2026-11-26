@@ -68,10 +68,10 @@ tokio = { version = "1", features = ["sync"], optional = true }
 uuid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
-# Checks `types::RawEventKind`, and the fields of the host header, Sysmon and
-# log copies in `types::raw_event`, against the tag those copies follow.
-# giganto-client is `publish = false`, so it is a git dependency.
-giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "0.31.0" }
+# Checks `types::RawEventKind`, and the fields of the host header, Sysmon, log
+# and network `Http` copies in `types::raw_event`, against the tag those copies
+# follow. giganto-client is `publish = false`, so it is a git dependency.
+giganto-client = { git = "https://github.com/aicers/giganto-client.git", tag = "0.32.0" }
 quinn = { version = "0.11", default-features = false, features = [
   "log",
   "platform-verifier",

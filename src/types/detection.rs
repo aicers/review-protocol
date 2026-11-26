@@ -118,6 +118,44 @@ pub enum DetectionModel {
     ///   to the window start + window size − 1 ns.
     /// - `score` is [`distance`](WindowOutlierDetail::distance).
     WindowOutlier = 20,
+    /// Emerging Threats Open rules ([`SignatureSource::EtOpen`]) matched
+    /// against raw events, other than the policy rules
+    /// [`EtPolicySignature`](Self::EtPolicySignature) reports.
+    ///
+    /// Every producer follows this contract:
+    ///
+    /// - One detection event per matched raw event and matched rule,
+    ///   carrying a [`Detail::EtSignature`], with a [`Target::RawEvent`] target.
+    /// - `category` is the [`EventCategory`] of the rule's first MITRE tactic
+    ///   (see [`EventCategory::from_mitre_tactic_id`]), or `None` when the
+    ///   rule has none.
+    /// - `score` is the matched rule's severity on a 0 to 1 scale.
+    EtSignature = 21,
+    /// Emerging Threats Open policy rules ([`SignatureSource::EtOpen`])
+    /// matched against raw events.
+    ///
+    /// Every producer follows this contract:
+    ///
+    /// - One detection event per matched raw event and matched rule,
+    ///   carrying a [`Detail::EtPolicySignature`], with a [`Target::RawEvent`] target.
+    /// - `category` is the [`EventCategory`] of the rule's first MITRE tactic
+    ///   (see [`EventCategory::from_mitre_tactic_id`]), or `None` when the
+    ///   rule has none.
+    /// - `score` is the matched rule's severity on a 0 to 1 scale.
+    EtPolicySignature = 22,
+    /// `SigmaHQ` rules, from its releases ([`SignatureSource::SigmaHq`]) or
+    /// its emerging threats rules ([`SignatureSource::SigmaHqEmerging`]),
+    /// matched against raw events.
+    ///
+    /// Every producer follows this contract:
+    ///
+    /// - One detection event per matched raw event and matched rule,
+    ///   carrying a [`Detail::SigmaSignature`], with a [`Target::RawEvent`] target.
+    /// - `category` is the [`EventCategory`] of the rule's first MITRE tactic
+    ///   (see [`EventCategory::from_mitre_tactic_id`]), or `None` when the
+    ///   rule has none.
+    /// - `score` is the matched rule's severity on a 0 to 1 scale.
+    SigmaSignature = 23,
 }
 
 /// A detection: what a detection model found, about which target, and why.
@@ -305,6 +343,9 @@ pub enum Detail {
     LabelDbMatch(LabelDbMatchDetail),
     FarOutlier(FarOutlierDetail),
     WindowOutlier(WindowOutlierDetail),
+    EtSignature(SignatureMatchDetail),
+    EtPolicySignature(SignatureMatchDetail),
+    SigmaSignature(SignatureMatchDetail),
 }
 
 impl Detail {
@@ -333,6 +374,9 @@ impl Detail {
             Self::LabelDbMatch(_) => DetectionModel::LabelDbMatch,
             Self::FarOutlier(_) => DetectionModel::FarOutlier,
             Self::WindowOutlier(_) => DetectionModel::WindowOutlier,
+            Self::EtSignature(_) => DetectionModel::EtSignature,
+            Self::EtPolicySignature(_) => DetectionModel::EtPolicySignature,
+            Self::SigmaSignature(_) => DetectionModel::SigmaSignature,
         }
     }
 
@@ -365,7 +409,10 @@ impl Detail {
             | Self::DnsCovertChannel
             | Self::UnusualDestinationPattern(_)
             | Self::LabelDbMatch(_)
-            | Self::FarOutlier(_) => None,
+            | Self::FarOutlier(_)
+            | Self::EtSignature(_)
+            | Self::EtPolicySignature(_)
+            | Self::SigmaSignature(_) => None,
         }
     }
 }
@@ -621,6 +668,76 @@ pub struct WindowOutlierDetail {
     /// requested as PCAP because of the PCAP request cap; `None` when the
     /// session lookup failed.
     pub pcap_truncated: Option<u64>,
+}
+
+/// The publisher of a signature rule set.
+///
+/// A source is serialized as its number in every format, never as its name or
+/// declaration index. The numbers are permanent once released; a later source
+/// is appended with the next unused number.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize_repr,
+    Eq,
+    Hash,
+    IntoPrimitive,
+    PartialEq,
+    Serialize_repr,
+    TryFromPrimitive,
+)]
+#[repr(u32)]
+pub enum SignatureSource {
+    /// Emerging Threats Open.
+    EtOpen = 0,
+    /// The `SigmaHQ` rule releases.
+    SigmaHq = 1,
+    /// The `SigmaHQ` emerging threats rules.
+    SigmaHqEmerging = 2,
+}
+
+/// The detail of a [`DetectionModel::EtSignature`],
+/// [`DetectionModel::EtPolicySignature`] or [`DetectionModel::SigmaSignature`]
+/// detection: the rule that matched and where it came from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureMatchDetail {
+    /// The source of the rule set that holds the matched rule.
+    pub source: SignatureSource,
+    /// The version of the source's rule set the rule was taken from.
+    pub source_version: String,
+    /// The version of the converter that compiled the rule set.
+    pub converter_version: String,
+    /// The matched rule's id: the ET `sid` or the Sigma `id`.
+    pub rule_id: String,
+    /// The matched rule's revision: the ET `rev`; `None` for Sigma.
+    pub rule_revision: Option<String>,
+    /// The matched rule's title.
+    pub rule_title: String,
+    /// The matched rule's classification, if it has one.
+    pub classification: Option<String>,
+    /// The MITRE ATT&CK technique ids the rule names, such as `T1059.001`.
+    pub techniques: Vec<String>,
+    /// The rule's own severity value, verbatim.
+    pub severity: String,
+    /// The rule's author, if it names one.
+    pub author: Option<String>,
+    /// The names of the fields whose conditions were true; never their
+    /// values.
+    ///
+    /// Producers send at most 16 names. The limit is not checked here.
+    pub matched_fields: Vec<String>,
+    /// Whether the rule's home network was replaced by the private address
+    /// ranges when the rule was matched.
+    pub home_net_fallback: bool,
+    /// The Windows event log channel of the matched record.
+    ///
+    /// Reserved for matches on Windows event log records; `None` otherwise.
+    pub event_channel: Option<String>,
+    /// The Windows event ID of the matched record.
+    ///
+    /// Reserved for matches on Windows event log records; `None` otherwise.
+    pub event_id: Option<u32>,
 }
 
 /// One slot of a [`WindowOutlierDetail`]'s window and how far it lies from
@@ -1150,7 +1267,7 @@ mod tests {
     use crate::types::raw_event;
 
     /// The models and numbers the schema commits to.
-    pub(super) const TABLE: [(DetectionModel, u32); 21] = [
+    pub(super) const TABLE: [(DetectionModel, u32); 24] = [
         (DetectionModel::WatchlistMatch, 0),
         (DetectionModel::CryptocurrencyMiningPool, 1),
         (DetectionModel::LockyRansomware, 2),
@@ -1172,6 +1289,16 @@ mod tests {
         (DetectionModel::LabelDbMatch, 18),
         (DetectionModel::FarOutlier, 19),
         (DetectionModel::WindowOutlier, 20),
+        (DetectionModel::EtSignature, 21),
+        (DetectionModel::EtPolicySignature, 22),
+        (DetectionModel::SigmaSignature, 23),
+    ];
+
+    /// The signature sources and numbers the schema commits to.
+    pub(super) const SOURCES: [(SignatureSource, u32); 3] = [
+        (SignatureSource::EtOpen, 0),
+        (SignatureSource::SigmaHq, 1),
+        (SignatureSource::SigmaHqEmerging, 2),
     ];
 
     /// 2026-03-15T15:00:04.12Z.
@@ -1214,6 +1341,46 @@ mod tests {
             cluster_id: 7,
             rule_confidence: Some(0.5),
             match_score: 1.0,
+        }
+    }
+
+    /// An ET Open signature match with every optional field set.
+    pub(super) fn et_signature() -> SignatureMatchDetail {
+        SignatureMatchDetail {
+            source: SignatureSource::EtOpen,
+            source_version: "10813".to_string(),
+            converter_version: "1.2.0".to_string(),
+            rule_id: "2013028".to_string(),
+            rule_revision: Some("7".to_string()),
+            rule_title: "ET POLICY curl User-Agent Outbound".to_string(),
+            classification: Some("attempted-recon".to_string()),
+            techniques: vec!["T1071.001".to_string(), "T1105".to_string()],
+            severity: "2".to_string(),
+            author: Some("Emerging Threats".to_string()),
+            matched_fields: vec!["user_agent".to_string(), "resp_port".to_string()],
+            home_net_fallback: true,
+            event_channel: Some("Security".to_string()),
+            event_id: Some(4625),
+        }
+    }
+
+    /// A Sigma signature match with every optional field `None`.
+    pub(super) fn sigma_signature() -> SignatureMatchDetail {
+        SignatureMatchDetail {
+            source: SignatureSource::SigmaHqEmerging,
+            source_version: "r2026-11-01".to_string(),
+            converter_version: "0.9.1".to_string(),
+            rule_id: "5f1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
+            rule_revision: None,
+            rule_title: "Suspicious PowerShell Download".to_string(),
+            classification: None,
+            techniques: Vec::new(),
+            severity: "high".to_string(),
+            author: None,
+            matched_fields: Vec::new(),
+            home_net_fallback: false,
+            event_channel: None,
+            event_id: None,
         }
     }
 
@@ -1362,6 +1529,9 @@ mod tests {
             Detail::LabelDbMatch(label_db_match()),
             Detail::FarOutlier(far_outlier()),
             Detail::WindowOutlier(window_outlier()),
+            Detail::EtSignature(et_signature()),
+            Detail::EtPolicySignature(et_signature()),
+            Detail::SigmaSignature(sigma_signature()),
         ]
     }
 
@@ -1533,14 +1703,29 @@ mod tests {
             assert_eq!(
                 usize::try_from(*number).expect("fits usize"),
                 index,
-                "numbers are 0-20 with no gap"
+                "numbers are 0-23 with no gap"
             );
             assert_eq!(DetectionModel::try_from(*number).ok(), Some(*model));
         }
         assert_eq!(u32::from(DetectionModel::LabelDbMatch), 18);
         assert_eq!(u32::from(DetectionModel::FarOutlier), 19);
         assert_eq!(u32::from(DetectionModel::WindowOutlier), 20);
-        assert!(DetectionModel::try_from(21_u32).is_err());
+        assert_eq!(u32::from(DetectionModel::EtSignature), 21);
+        assert_eq!(u32::from(DetectionModel::EtPolicySignature), 22);
+        assert_eq!(u32::from(DetectionModel::SigmaSignature), 23);
+        assert_eq!(
+            DetectionModel::try_from(21_u32).ok(),
+            Some(DetectionModel::EtSignature)
+        );
+        assert_eq!(
+            DetectionModel::try_from(22_u32).ok(),
+            Some(DetectionModel::EtPolicySignature)
+        );
+        assert_eq!(
+            DetectionModel::try_from(23_u32).ok(),
+            Some(DetectionModel::SigmaSignature)
+        );
+        assert!(DetectionModel::try_from(24_u32).is_err());
         assert!(DetectionModel::try_from(u32::MAX).is_err());
     }
 
@@ -1580,8 +1765,104 @@ mod tests {
             serde_json::from_str::<DetectionModel>("20").ok(),
             Some(DetectionModel::WindowOutlier)
         );
-        assert!(serde_json::from_str::<DetectionModel>("21").is_err());
+        for (model, json) in [
+            (DetectionModel::EtSignature, "21"),
+            (DetectionModel::EtPolicySignature, "22"),
+            (DetectionModel::SigmaSignature, "23"),
+        ] {
+            assert_eq!(serde_json::to_string(&model).expect("serializes"), json);
+            assert_eq!(
+                serde_json::from_str::<DetectionModel>(json).ok(),
+                Some(model)
+            );
+        }
+        assert!(serde_json::from_str::<DetectionModel>("24").is_err());
         assert!(serde_json::from_str::<DetectionModel>("\"PortScan\"").is_err());
+    }
+
+    #[test]
+    fn signature_source_numbers_match_table() {
+        for (source, number) in SOURCES {
+            assert_eq!(u32::from(source), number, "{source:?}");
+            assert_eq!(SignatureSource::try_from(number).ok(), Some(source));
+            let json = serde_json::to_string(&source).expect("serializes");
+            assert_eq!(json, number.to_string(), "{source:?}");
+            assert_eq!(
+                serde_json::from_str::<SignatureSource>(&json).ok(),
+                Some(source)
+            );
+        }
+        assert!(SignatureSource::try_from(3_u32).is_err());
+        assert!(serde_json::from_str::<SignatureSource>("3").is_err());
+        assert!(serde_json::from_str::<SignatureSource>("\"EtOpen\"").is_err());
+    }
+
+    #[test]
+    fn signature_details_name_their_models() {
+        for (detail, model) in [
+            (
+                Detail::EtSignature(et_signature()),
+                DetectionModel::EtSignature,
+            ),
+            (
+                Detail::EtPolicySignature(et_signature()),
+                DetectionModel::EtPolicySignature,
+            ),
+            (
+                Detail::SigmaSignature(sigma_signature()),
+                DetectionModel::SigmaSignature,
+            ),
+        ] {
+            assert_eq!(detail.detection_model(), model);
+            assert_eq!(detail.time_series_id(), None);
+        }
+    }
+
+    #[test]
+    fn signature_detail_round_trips_through_json() {
+        for detail in [et_signature(), sigma_signature()] {
+            let json = serde_json::to_string(&detail).expect("serializes");
+            assert_eq!(
+                serde_json::from_str::<SignatureMatchDetail>(&json).ok(),
+                Some(detail)
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&sigma_signature()).expect("serializes"),
+            r#"{"source":2,"source_version":"r2026-11-01","converter_version":"0.9.1","rule_id":"5f1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","rule_revision":null,"rule_title":"Suspicious PowerShell Download","classification":null,"techniques":[],"severity":"high","author":null,"matched_fields":[],"home_net_fallback":false,"event_channel":null,"event_id":null}"#
+        );
+    }
+
+    #[test]
+    fn validate_accepts_signature_events_on_raw_events() {
+        for detail in [
+            Detail::EtSignature(et_signature()),
+            Detail::EtPolicySignature(et_signature()),
+            Detail::SigmaSignature(sigma_signature()),
+        ] {
+            let mut event = raw_event_target();
+            event.detection_model = detail.detection_model();
+            event.category = EventCategory::from_mitre_tactic_id("TA0011");
+            event.score = 0.5;
+            event.detail = detail;
+            assert_eq!(event.validate(), Ok(()), "{event:?}");
+        }
+        // The 16-name producer limit is not checked here.
+        let mut detail = et_signature();
+        detail.matched_fields = (0..17).map(|i| format!("field-{i}")).collect();
+        let mut event = raw_event_target();
+        event.detection_model = DetectionModel::EtSignature;
+        event.detail = Detail::EtSignature(detail);
+        assert_eq!(event.validate(), Ok(()));
+        // A signature detail under another model breaks rule 1.
+        event.detection_model = DetectionModel::SigmaSignature;
+        assert_eq!(
+            assert_rule(&event, 1),
+            DetectionEventError::DetailMismatch {
+                detection_model: DetectionModel::SigmaSignature,
+                detail: DetectionModel::EtSignature,
+            }
+        );
     }
 
     #[test]
@@ -2625,9 +2906,9 @@ mod bincode_tests {
     use serde::{Serialize, de::DeserializeOwned};
 
     use super::tests::{
-        NANOS, TABLE, WIDE_NANOS, at, conn, details, endpoint, far_outlier,
-        far_outlier_without_prefix, label_db_match, window_outlier, window_outlier_event,
-        window_outlier_variants, window_outlier_without_slots,
+        NANOS, SOURCES, TABLE, WIDE_NANOS, at, conn, details, endpoint, et_signature, far_outlier,
+        far_outlier_without_prefix, label_db_match, sigma_signature, window_outlier,
+        window_outlier_event, window_outlier_variants, window_outlier_without_slots,
     };
     use super::*;
     use crate::types::raw_event;
@@ -2642,6 +2923,13 @@ mod bincode_tests {
     /// [`released_raw_event`], each encoded and the encodings concatenated.
     const RELEASED_RAW_EVENTS: &[u8] =
         include_bytes!("../../tests/fixtures/0.32.0/raw-event-detection-events.bin");
+
+    /// The raw event detection event [`released_raw_event`] builds for the
+    /// `Http` body of `raw_event::tests::bodies()`, in the layout protocol
+    /// `0.53.0` gives the body: the `0.32.0` capture of that event with the
+    /// six request header fields inserted after `state`.
+    const HTTP_EVENT: &[u8] =
+        include_bytes!("../../tests/fixtures/current/http-detection-event.bin");
 
     /// The crate's bincode 2 encoding of [`NANOS`] as an `i128`: the
     /// zigzagged value in a `u64` varint.
@@ -2686,13 +2974,13 @@ mod bincode_tests {
     }
 
     /// Returns whether a body's variant was released with its current
-    /// fields: every network and Netflow body. A Sysmon body gained its
-    /// header in protocol `0.52.0`, and the log bodies are new.
+    /// fields: every network and Netflow body except `Http`. A Sysmon body
+    /// gained its header in protocol `0.52.0`, the log bodies are new, and
+    /// `Http` gained six request header fields in protocol `0.53.0`.
     fn released_unchanged(body: &RawEventBody) -> bool {
         match body {
             RawEventBody::Conn(_)
             | RawEventBody::Dns(_)
-            | RawEventBody::Http(_)
             | RawEventBody::Rdp(_)
             | RawEventBody::Smtp(_)
             | RawEventBody::Ntlm(_)
@@ -2712,7 +3000,8 @@ mod bincode_tests {
             | RawEventBody::Icmp(_)
             | RawEventBody::Netflow5(_)
             | RawEventBody::Netflow9(_) => true,
-            RawEventBody::ProcessCreate(_)
+            RawEventBody::Http(_)
+            | RawEventBody::ProcessCreate(_)
             | RawEventBody::FileCreateTime(_)
             | RawEventBody::NetworkConnect(_)
             | RawEventBody::ProcessTerminate(_)
@@ -2776,11 +3065,43 @@ mod bincode_tests {
             .filter(released_unchanged)
             .map(released_raw_event)
             .collect();
-        assert_eq!(events.len(), 22);
+        assert_eq!(events.len(), 21);
         for event in &events {
             assert_eq!(event.validate(), Ok(()));
         }
         assert_encodes_to(&events, RELEASED_RAW_EVENTS);
+    }
+
+    #[test]
+    fn http_body_encodes_its_request_headers_after_state() {
+        let events: Vec<_> = raw_event::tests::bodies()
+            .into_iter()
+            .filter(|body| matches!(body, RawEventBody::Http(_)))
+            .map(released_raw_event)
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].validate(), Ok(()));
+        assert_encodes_to(&events, HTTP_EVENT);
+
+        // The six fields are the last bytes of the body, after `state`
+        // ("done"), and before the score and detail.
+        let RawEventBody::Http(http) = raw_event::tests::bodies()
+            .into_iter()
+            .find(|body| matches!(body, RawEventBody::Http(_)))
+            .expect("bodies() has an Http body")
+        else {
+            unreachable!("the Http body was found");
+        };
+        let mut tail = encode(&http.state);
+        tail.extend(encode(&http.request_header_names));
+        tail.extend(encode(&http.accept));
+        tail.extend(encode(&http.connection));
+        tail.extend(encode(&http.accept_encoding));
+        tail.extend(encode(&http.accept_language));
+        tail.extend(encode(&http.pragma));
+        tail.extend(0.75_f64.to_le_bytes());
+        tail.push(13);
+        assert!(HTTP_EVENT.ends_with(&tail));
     }
 
     #[test]
@@ -2849,13 +3170,100 @@ mod bincode_tests {
             decode::<DetectionModel>(&[20]),
             DetectionModel::WindowOutlier
         );
+        assert_eq!(encode(&DetectionModel::EtSignature), [21]);
+        assert_eq!(encode(&DetectionModel::EtPolicySignature), [22]);
+        assert_eq!(encode(&DetectionModel::SigmaSignature), [23]);
+        assert_eq!(decode::<DetectionModel>(&[21]), DetectionModel::EtSignature);
+        assert_eq!(
+            decode::<DetectionModel>(&[22]),
+            DetectionModel::EtPolicySignature
+        );
+        assert_eq!(
+            decode::<DetectionModel>(&[23]),
+            DetectionModel::SigmaSignature
+        );
         assert!(
             bincode::serde::decode_from_slice::<DetectionModel, _>(
-                &encode(&21_u32),
+                &encode(&24_u32),
                 bincode::config::standard(),
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn signature_source_serializes_as_number_in_bincode() {
+        for (source, number) in SOURCES {
+            assert_eq!(encode(&source), encode(&number), "{source:?}");
+            assert_eq!(decode::<SignatureSource>(&encode(&number)), source);
+        }
+        assert_eq!(encode(&SignatureSource::SigmaHqEmerging), [2]);
+        assert!(
+            bincode::serde::decode_from_slice::<SignatureSource, _>(
+                &encode(&3_u32),
+                bincode::config::standard(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn signature_details_encode_after_every_existing_variant() {
+        let mut sigma = vec![1, 2];
+        for text in [
+            "r2026-11-01",
+            "0.9.1",
+            "5f1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        ] {
+            sigma.extend(encode(text));
+        }
+        sigma.push(0);
+        sigma.extend(encode("Suspicious PowerShell Download"));
+        sigma.extend([0, 0]);
+        sigma.extend(encode("high"));
+        sigma.extend([0, 0, 0, 0, 0]);
+        let detail = sigma_signature();
+        assert_eq!(encode(&detail), sigma[1..]);
+        assert_eq!(decode::<SignatureMatchDetail>(&sigma[1..]), detail);
+        sigma[0] = 23;
+        let detail = Detail::SigmaSignature(sigma_signature());
+        assert_eq!(encode(&detail), sigma);
+        assert_eq!(decode::<Detail>(&sigma), detail);
+
+        let mut et = vec![0];
+        for text in ["10813", "1.2.0", "2013028"] {
+            et.extend(encode(text));
+        }
+        et.push(1);
+        et.extend(encode("7"));
+        et.extend(encode("ET POLICY curl User-Agent Outbound"));
+        et.push(1);
+        et.extend(encode("attempted-recon"));
+        et.push(2);
+        et.extend(encode("T1071.001"));
+        et.extend(encode("T1105"));
+        et.extend(encode("2"));
+        et.push(1);
+        et.extend(encode("Emerging Threats"));
+        et.push(2);
+        et.extend(encode("user_agent"));
+        et.extend(encode("resp_port"));
+        et.push(1);
+        et.push(1);
+        et.extend(encode("Security"));
+        et.extend([1, 0xfb, 0x11, 0x12]);
+        let detail = et_signature();
+        assert_eq!(encode(&detail), et);
+        assert_eq!(decode::<SignatureMatchDetail>(&et), detail);
+        for (tag, detail) in [
+            (21, Detail::EtSignature(et_signature())),
+            (22, Detail::EtPolicySignature(et_signature())),
+        ] {
+            let mut expected = vec![tag];
+            expected.extend(&et);
+            assert_eq!(encode(&detail), expected, "{detail:?}");
+            assert_eq!(decode::<Detail>(&expected), detail);
+        }
     }
 
     #[test]
@@ -3141,7 +3549,7 @@ mod bincode_tests {
         subjects.sort_unstable();
         assert_eq!(subjects, [Some(0), Some(1), Some(2), Some(3), Some(4)]);
         assert!(matches!(
-            events.last(),
+            events.get(crate::test::RELEASED_DETECTION_EVENTS),
             Some(DetectionEvent {
                 target: Target::Subject {
                     primary: PrimarySubject::Endpoint { .. },
@@ -3150,6 +3558,19 @@ mod bincode_tests {
                 ..
             })
         ));
+
+        // Every detail variant appears, by its encoded tag; the three
+        // signature events follow the endpoint event.
+        let mut tags: Vec<_> = events
+            .iter()
+            .map(|event| encode(&event.detail).first().copied())
+            .collect();
+        let signatures = tags.split_off(crate::test::RELEASED_DETECTION_EVENTS + 1);
+        assert_eq!(signatures, [Some(21), Some(22), Some(23)]);
+        tags.extend(signatures);
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(tags.len(), TABLE.len());
     }
 
     #[test]
