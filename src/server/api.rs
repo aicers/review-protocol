@@ -8,7 +8,7 @@ use crate::{
     client,
     types::{
         CloneModelRequest, CustomerDataDeletionRequest, HostNetworkGroup, NetworkListItem,
-        TimeSeriesGenerationPolicy, TrafficFilterRule, TrainModelRequest,
+        SignatureRules, TimeSeriesGenerationPolicy, TrafficFilterRule, TrainModelRequest,
         node::{
             InstallPreflight, NodeEnrollRequest, NodeEnrollResponse, NodeHostnameRequest,
             NodeHostnameResponse, NodeLoggingRequest, NodeLoggingResponse,
@@ -210,6 +210,20 @@ impl Connection {
     /// unchanged, and for every other failure it returns `None`.
     pub async fn send_run_detector_once(&self, detector_id: i32) -> anyhow::Result<()> {
         self.send_request(client::RequestCode::RunDetectorOnce, &detector_id)
+            .await
+    }
+
+    /// Pushes the signature rule sets to a Semi-supervised Engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine refuses the rule sets, or if encoding
+    /// the request, opening the stream, sending the request or receiving
+    /// the response fails. Only an engine's refusal downcasts to `String`:
+    /// for it, `err.downcast_ref::<String>()` returns the engine's reason
+    /// unchanged, and for every other failure it returns `None`.
+    pub async fn send_signature_rules(&self, rules: &SignatureRules) -> anyhow::Result<()> {
+        self.send_request(client::RequestCode::SignatureRules, rules)
             .await
     }
 
@@ -2087,6 +2101,7 @@ mod tests {
         CloneModel(super::CloneModelRequest),
         CancelRun(u32),
         RunDetectorOnce(i32),
+        SignatureRules(super::SignatureRules),
     }
 
     /// An agent handler that records each Unsupervised Engine request and
@@ -2122,6 +2137,11 @@ mod tests {
                 .push(EngineRequest::RunDetectorOnce(detector_id));
             self.answer.clone()
         }
+
+        async fn signature_rules(&mut self, rules: super::SignatureRules) -> Result<(), String> {
+            self.received.push(EngineRequest::SignatureRules(rules));
+            self.answer.clone()
+        }
     }
 
     #[cfg(all(feature = "client", feature = "server"))]
@@ -2154,9 +2174,10 @@ mod tests {
         }
     }
 
-    /// Sends each Unsupervised Engine request through `server::Connection`
-    /// to an agent served by `handler`, and returns the results the
-    /// manager saw with the handler afterwards.
+    /// Sends each Unsupervised Engine request, and each signature rule push
+    /// of `test::signature_rules()` to a Semi-supervised Engine, through
+    /// `server::Connection` to an agent served by `handler`, and returns the
+    /// results the manager saw with the handler afterwards.
     #[cfg(all(feature = "client", feature = "server"))]
     async fn engine_requests_roundtrip<H>(mut handler: H) -> (Vec<anyhow::Result<()>>, H)
     where
@@ -2168,7 +2189,7 @@ mod tests {
         let handler_conn = client_conn.clone();
         let client_handle = tokio::spawn(async move {
             // One stream per request.
-            for _ in 0..5 {
+            for _ in 0..7 {
                 let (mut send, mut recv) = handler_conn.accept_bi().await.unwrap();
                 crate::request::handle(&mut handler, &mut send, &mut recv)
                     .await
@@ -2177,13 +2198,16 @@ mod tests {
             handler
         });
 
-        let results = vec![
+        let mut results = vec![
             server_conn.send_train_model(&train_model_request()).await,
             server_conn.send_clone_model(&clone_model_request()).await,
             server_conn.send_cancel_run(7).await,
             server_conn.send_run_detector_once(-3).await,
             server_conn.send_run_detector_once(i32::MAX).await,
         ];
+        for rules in crate::test::signature_rules() {
+            results.push(server_conn.send_signature_rules(&rules).await);
+        }
         let handler = client_handle.await.unwrap();
 
         test_env.teardown(&server_conn);
@@ -2199,6 +2223,13 @@ mod tests {
             EngineRequest::RunDetectorOnce(-3),
             EngineRequest::RunDetectorOnce(i32::MAX),
         ]
+        .into_iter()
+        .chain(
+            crate::test::signature_rules()
+                .into_iter()
+                .map(EngineRequest::SignatureRules),
+        )
+        .collect()
     }
 
     #[cfg(all(feature = "client", feature = "server"))]
@@ -2268,6 +2299,9 @@ mod tests {
             server_conn.send_clone_model(&clone_model_request()).await,
             server_conn.send_cancel_run(7).await,
             server_conn.send_run_detector_once(-3).await,
+            server_conn
+                .send_signature_rules(&crate::test::signature_rules()[0])
+                .await,
         ];
         for result in results {
             let error = result.unwrap_err();

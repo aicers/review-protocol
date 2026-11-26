@@ -9,7 +9,7 @@ use crate::{
         DaiCursors, DaiExtractorConfig, DaiObservationBatch, DaiRangeDay, DaiRangeGrant,
         DaiRangeLate, DaiRangeMark, DaiRangeUnit, DaiStoreAck, DataSource, DataSourceKey,
         DetectorStatusReport, EngineExclusionReport, HostNetworkGroup, NetworkListItem,
-        ReportedRunState, TimeSeriesGenerationPolicy,
+        ReportedRunState, SignatureRules, SignatureStatusReport, TimeSeriesGenerationPolicy,
     },
     unary_request,
 };
@@ -104,6 +104,40 @@ impl Connection {
     pub async fn report_exclusion_counts(&self, report: &EngineExclusionReport) -> io::Result<()> {
         let res: Result<(), String> =
             request(self, server::RequestCode::ReportExclusionCounts, report).await?;
+        res.map_err(io::Error::other)
+    }
+
+    /// Fetches the signature rule sets a Semi-supervised Engine matches raw
+    /// events against.
+    ///
+    /// `known_revision` is the revision of the rule sets the engine has, if
+    /// any. The server answers `None` when it is the server's current
+    /// revision, and the current rule sets otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the response is invalid, or the
+    /// server rejects the request; a server that does not serve it answers
+    /// `not supported`.
+    pub async fn get_signature_rules(
+        &self,
+        known_revision: Option<u64>,
+    ) -> io::Result<Option<SignatureRules>> {
+        let res: Result<Option<SignatureRules>, String> =
+            request(self, server::RequestCode::GetSignatureRules, known_revision).await?;
+        res.map_err(io::Error::other)
+    }
+
+    /// Reports the status of a Semi-supervised Engine's signature matching.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the response is invalid, or the
+    /// server rejects the report; a server that does not serve it answers
+    /// `not supported`.
+    pub async fn report_signature_status(&self, report: &SignatureStatusReport) -> io::Result<()> {
+        let res: Result<(), String> =
+            request(self, server::RequestCode::ReportSignatureStatus, report).await?;
         res.map_err(io::Error::other)
     }
 
@@ -889,6 +923,92 @@ mod tests {
         run_test_with(DefaultHandler, |client_conn| async move {
             let report = crate::test::engine_exclusion_reports().remove(0);
             assert_not_supported(client_conn.report_exclusion_counts(&report).await);
+        })
+        .await;
+    }
+
+    /// Request 56 carries no known revision or a known one, and its `Some`
+    /// and `None` answers arrive intact.
+    #[tokio::test]
+    async fn get_signature_rules_returns_handler_reply() {
+        let rules = crate::test::signature_rules();
+        let current = rules[0].revision;
+        for (known_revision, expected) in [
+            (None, Some(rules[0].clone())),
+            (Some(current), None),
+            (Some(0), Some(rules[1].clone())),
+        ] {
+            run_test(|client_conn| async move {
+                assert_eq!(
+                    client_conn
+                        .get_signature_rules(known_revision)
+                        .await
+                        .unwrap(),
+                    expected
+                );
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn get_signature_rules_converts_handler_error() {
+        run_test(|client_conn| async move {
+            let error = client_conn
+                .get_signature_rules(Some(crate::test::REJECTED_SIGNATURE_REVISION))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "revision rejected");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn get_signature_rules_default_is_not_supported() {
+        for known_revision in [None, Some(1)] {
+            run_test_with(DefaultHandler, |client_conn| async move {
+                assert_not_supported(client_conn.get_signature_rules(known_revision).await);
+            })
+            .await;
+        }
+    }
+
+    /// Every signature status report, one with every list non-empty and one
+    /// with every list empty, reaches the handler as sent.
+    #[tokio::test]
+    async fn report_signature_status_returns_handler_ok() {
+        for report in crate::test::signature_status_reports() {
+            run_test(|client_conn| async move {
+                assert!(
+                    client_conn.report_signature_status(&report).await.is_ok(),
+                    "signature status report {report:?} should arrive intact"
+                );
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn report_signature_status_converts_handler_error() {
+        run_test(|client_conn| async move {
+            let mut report = crate::test::signature_status_reports().remove(0);
+            report.truncated.reverse();
+            let error = client_conn
+                .report_signature_status(&report)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "report rejected");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn report_signature_status_default_is_not_supported() {
+        run_test_with(DefaultHandler, |client_conn| async move {
+            let report = crate::test::signature_status_reports().remove(0);
+            assert_not_supported(client_conn.report_signature_status(&report).await);
         })
         .await;
     }

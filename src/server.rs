@@ -305,6 +305,15 @@ pub(crate) enum RequestCode {
     SendDaiRangeDay = 50,
     ReportDaiRangeLate = 51,
     ReportExclusionCounts = 52,
+    // 53 to 55 are reserved for the requests another change adds. Never use
+    // them for anything else: they decode as `Unknown` until that change
+    // assigns them.
+    /// Pulls the signature rule sets. The argument is the revision the engine
+    /// knows, if any; the manager answers `None` when it is the manager's
+    /// current revision and the current rule sets otherwise.
+    GetSignatureRules = 56,
+    /// Reports the status of a Semi-supervised Engine's signature matching.
+    ReportSignatureStatus = 57,
 
     /// Unknown request
     #[num_enum(default)]
@@ -348,6 +357,27 @@ mod request_code_tests {
             RequestCode::ReportExclusionCounts
         );
         assert_eq!(RequestCode::from_primitive(53), RequestCode::Unknown);
+    }
+
+    #[test]
+    fn signature_request_codes() {
+        let cases = [
+            (RequestCode::GetSignatureRules, 56),
+            (RequestCode::ReportSignatureStatus, 57),
+        ];
+        for (code, num) in cases {
+            assert_eq!(u32::from(code), num);
+            assert_eq!(RequestCode::from_primitive(num), code);
+        }
+        assert_eq!(RequestCode::from_primitive(58), RequestCode::Unknown);
+    }
+
+    /// 53 to 55 are reserved for another change and stay unknown here.
+    #[test]
+    fn reserved_codes_are_unknown() {
+        for num in 53..=55 {
+            assert_eq!(RequestCode::from_primitive(num), RequestCode::Unknown);
+        }
     }
 
     #[test]

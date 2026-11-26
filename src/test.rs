@@ -321,6 +321,11 @@ pub(crate) const ACTIVE_RUN_IDS: &[u32] = &[RUN_ID, 8, u32::MAX];
 #[allow(dead_code)] // used by tests only, like `TestServerHandler`
 pub(crate) const REJECTED_DETECTOR_ID: i32 = -1;
 
+/// The known signature rule revision `TestServerHandler` rejects.
+#[cfg(all(feature = "client", feature = "server"))]
+#[allow(dead_code)] // used by tests only, like `TestServerHandler`
+pub(crate) const REJECTED_SIGNATURE_REVISION: u64 = u64::MAX;
+
 /// Returns the detector status reports `TestServerHandler` accepts.
 ///
 /// Between them they carry every `DetectorState`, `RoundOutcome` and
@@ -456,7 +461,8 @@ pub const RELEASED_DETECTION_EVENTS: usize = 25;
 ///
 /// The first [`RELEASED_DETECTION_EVENTS`] events have shapes released before
 /// protocol `0.52.0`; the event after them, about an endpoint, was appended
-/// with the `Endpoint` primary subject.
+/// with the `Endpoint` primary subject, and the three after that, one per
+/// signature model, with protocol `0.53.0`.
 #[allow(clippy::too_many_lines)] // One synthetic event per detection model.
 #[must_use]
 pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
@@ -467,8 +473,9 @@ pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
         EventCategory, ExternalDdosDetail, FarOutlierDetail, FtpBruteForceDetail,
         LabelDbMatchDetail, LdapBruteForceDetail, MultiHostPortScanDetail, PortScanDetail,
         PrimarySubject, RawEventBody, RawEventKind, RdpBruteForceDetail, RelatedIp,
-        RepeatedHttpSessionsDetail, SlotDeviation, Target, ThreatRole, TimeWindow,
-        UnusualDestinationPatternDetail, WatchlistMatchDetail, WindowOutlierDetail, raw_event,
+        RepeatedHttpSessionsDetail, SignatureMatchDetail, SignatureSource, SlotDeviation, Target,
+        ThreatRole, TimeWindow, UnusualDestinationPatternDetail, WatchlistMatchDetail,
+        WindowOutlierDetail, raw_event,
     };
 
     const ENDPOINT_ID: &str = "3c9e5b2a-7d41-4f86-b0a3-e5d2c8f17a64";
@@ -840,7 +847,7 @@ pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
             22,
             DetectionModel::FarOutlier,
             None,
-            conn,
+            conn.clone(),
             1.0,
             Detail::FarOutlier(FarOutlierDetail::Prefix {
                 nearest_cluster_id: None,
@@ -935,6 +942,187 @@ pub fn detection_events() -> Vec<crate::types::DetectionEvent> {
                 proto: 6,
             }),
         ),
+        // Appended with protocol 0.53.0, one per signature model.
+        raw_event(
+            24,
+            DetectionModel::EtSignature,
+            Some(EventCategory::CommandAndControl),
+            conn.clone(),
+            0.75,
+            Detail::EtSignature(SignatureMatchDetail {
+                source: SignatureSource::EtOpen,
+                source_version: "10813".to_string(),
+                converter_version: "1.2.0".to_string(),
+                rule_id: "2027758".to_string(),
+                rule_revision: Some("3".to_string()),
+                rule_title: "ET MALWARE Synthetic Beacon".to_string(),
+                classification: Some("trojan-activity".to_string()),
+                techniques: vec!["T1071.001".to_string()],
+                severity: "1".to_string(),
+                author: Some("Emerging Threats".to_string()),
+                matched_fields: vec!["resp_port".to_string(), "service".to_string()],
+                home_net_fallback: false,
+                event_channel: None,
+                event_id: None,
+            }),
+        ),
+        raw_event(
+            25,
+            DetectionModel::EtPolicySignature,
+            None,
+            conn.clone(),
+            0.25,
+            Detail::EtPolicySignature(SignatureMatchDetail {
+                source: SignatureSource::EtOpen,
+                source_version: "10813".to_string(),
+                converter_version: "1.2.0".to_string(),
+                rule_id: "2013028".to_string(),
+                rule_revision: Some("7".to_string()),
+                rule_title: "ET POLICY Synthetic Outbound".to_string(),
+                classification: Some("policy-violation".to_string()),
+                techniques: Vec::new(),
+                severity: "3".to_string(),
+                author: None,
+                matched_fields: vec!["resp_port".to_string()],
+                home_net_fallback: true,
+                event_channel: None,
+                event_id: None,
+            }),
+        ),
+        raw_event(
+            26,
+            DetectionModel::SigmaSignature,
+            Some(EventCategory::Execution),
+            conn,
+            1.0,
+            Detail::SigmaSignature(SignatureMatchDetail {
+                source: SignatureSource::SigmaHqEmerging,
+                source_version: "r2026-11-01".to_string(),
+                converter_version: "0.9.1".to_string(),
+                rule_id: "5f1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
+                rule_revision: None,
+                rule_title: "Synthetic Sigma Rule".to_string(),
+                classification: None,
+                techniques: vec!["T1059.001".to_string(), "T1105".to_string()],
+                severity: "critical".to_string(),
+                author: Some("SigmaHQ".to_string()),
+                matched_fields: Vec::new(),
+                home_net_fallback: false,
+                event_channel: Some("Microsoft-Windows-PowerShell/Operational".to_string()),
+                event_id: Some(4104),
+            }),
+        ),
+    ]
+}
+
+/// Returns synthetic signature rule pushes, as the Central Manager sends them
+/// with agent request 27 and answers server request 56 with.
+///
+/// The first has two rule sets, one with an empty bundle, and disabled rules
+/// of two sources; the second has none of either.
+#[must_use]
+pub fn signature_rules() -> Vec<crate::types::SignatureRules> {
+    use crate::types::{SignatureRuleSet, SignatureRules, SignatureSource};
+
+    vec![
+        SignatureRules {
+            revision: (1 << 53) + 5,
+            sets: vec![
+                SignatureRuleSet {
+                    source: SignatureSource::EtOpen,
+                    source_version: "10813".to_string(),
+                    converter_version: "1.2.0".to_string(),
+                    rules: vec![0x00, 0x01, 0x7f, 0x80, 0xff],
+                },
+                SignatureRuleSet {
+                    source: SignatureSource::SigmaHqEmerging,
+                    source_version: "r2026-11-01".to_string(),
+                    converter_version: "0.9.1".to_string(),
+                    rules: Vec::new(),
+                },
+            ],
+            disabled_rules: vec![
+                (SignatureSource::EtOpen, "2013028".to_string()),
+                (
+                    SignatureSource::SigmaHq,
+                    "5f1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
+                ),
+            ],
+        },
+        SignatureRules {
+            revision: 0,
+            sets: Vec::new(),
+            disabled_rules: Vec::new(),
+        },
+    ]
+}
+
+/// Returns synthetic signature status reports, as a Semi-supervised Engine
+/// sends them with server request 57.
+///
+/// The first has every list non-empty, a set that failed to load with no
+/// earlier snapshot and an IPv6 originator; the second has every list empty.
+#[must_use]
+pub fn signature_status_reports() -> Vec<crate::types::SignatureStatusReport> {
+    use std::net::Ipv4Addr;
+
+    use crate::types::{
+        DetectionModel, LoadedSignatureSet, RawEventKind, SignatureSource, SignatureStatusReport,
+        TruncatedCount,
+    };
+
+    vec![
+        SignatureStatusReport {
+            loaded: vec![
+                LoadedSignatureSet {
+                    source: SignatureSource::EtOpen,
+                    source_version: "10813".to_string(),
+                    converter_version: "1.2.0".to_string(),
+                    rules: 48_213,
+                    failed_compile: 17,
+                    load_error: None,
+                },
+                LoadedSignatureSet {
+                    source: SignatureSource::SigmaHq,
+                    source_version: String::new(),
+                    converter_version: String::new(),
+                    rules: 0,
+                    failed_compile: 0,
+                    load_error: Some("cannot read the bundle of r2026-11-01".to_string()),
+                },
+            ],
+            truncated: vec![
+                TruncatedCount {
+                    detection_model: DetectionModel::EtSignature,
+                    source: SignatureSource::EtOpen,
+                    rule_id: "2027758".to_string(),
+                    orig_addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)),
+                    window_start: 1_773_586_800_000_000_000,
+                    count: 40,
+                },
+                TruncatedCount {
+                    detection_model: DetectionModel::SigmaSignature,
+                    source: SignatureSource::SigmaHqEmerging,
+                    rule_id: "5f1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
+                    orig_addr: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7)),
+                    window_start: -1,
+                    count: u64::MAX,
+                },
+            ],
+            truncated_overflow: 1_234,
+            os_gated_skipped: vec![
+                (RawEventKind::ProcessCreate, 9),
+                (RawEventKind::Journald, 2),
+            ],
+            home_net_fallback: true,
+        },
+        SignatureStatusReport {
+            loaded: Vec::new(),
+            truncated: Vec::new(),
+            truncated_overflow: 0,
+            os_gated_skipped: Vec::new(),
+            home_net_fallback: false,
+        },
     ]
 }
 
@@ -1913,6 +2101,43 @@ impl crate::server::Handler for TestServerHandler {
             return Err(format!("unexpected peer: {peer}"));
         }
         if engine_exclusion_reports().contains(report) {
+            Ok(())
+        } else {
+            Err("report rejected".to_string())
+        }
+    }
+
+    // Answers no known revision with the first of `signature_rules()`, that
+    // one's revision with `None`, `REJECTED_SIGNATURE_REVISION` with an error
+    // and any other revision with the second of `signature_rules()`.
+    async fn get_signature_rules(
+        &self,
+        peer: &str,
+        known_revision: Option<u64>,
+    ) -> Result<Option<crate::types::SignatureRules>, String> {
+        if peer != "test-peer" {
+            return Err(format!("unexpected peer: {peer}"));
+        }
+        let mut rules = signature_rules().into_iter();
+        let current = rules.next().expect("signature_rules() is not empty");
+        match known_revision {
+            None => Ok(Some(current)),
+            Some(revision) if revision == current.revision => Ok(None),
+            Some(REJECTED_SIGNATURE_REVISION) => Err("revision rejected".to_string()),
+            Some(_) => Ok(rules.next()),
+        }
+    }
+
+    // Accepts each of `signature_status_reports()` and rejects anything else.
+    async fn report_signature_status(
+        &self,
+        peer: &str,
+        report: &crate::types::SignatureStatusReport,
+    ) -> Result<(), String> {
+        if peer != "test-peer" {
+            return Err(format!("unexpected peer: {peer}"));
+        }
+        if signature_status_reports().contains(report) {
             Ok(())
         } else {
             Err("report rejected".to_string())

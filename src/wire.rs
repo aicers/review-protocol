@@ -76,6 +76,7 @@ mod tests {
             (crate::client::RequestCode::CloneModel, 24_u32),
             (crate::client::RequestCode::CancelRun, 25_u32),
             (crate::client::RequestCode::RunDetectorOnce, 26_u32),
+            (crate::client::RequestCode::SignatureRules, 27_u32),
             (crate::client::RequestCode::Unknown, u32::MAX),
         ] {
             assert_eq!(u32::from(code), expected);
@@ -138,6 +139,8 @@ mod tests {
             (crate::server::RequestCode::SendDaiRangeDay, 50_u32),
             (crate::server::RequestCode::ReportDaiRangeLate, 51_u32),
             (crate::server::RequestCode::ReportExclusionCounts, 52_u32),
+            (crate::server::RequestCode::GetSignatureRules, 56_u32),
+            (crate::server::RequestCode::ReportSignatureStatus, 57_u32),
             (crate::server::RequestCode::Unknown, u32::MAX),
         ] {
             assert_eq!(u32::from(code), expected);

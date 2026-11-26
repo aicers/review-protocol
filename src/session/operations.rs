@@ -30,7 +30,7 @@ use crate::types::node::{
 };
 use crate::types::{
     CloneModelRequest, CustomerDataDeletionReport, DetectorStatusReport, EngineExclusionReport,
-    NetworkListItem, ReportedRunState, TrainModelRequest,
+    NetworkListItem, ReportedRunState, SignatureRules, SignatureStatusReport, TrainModelRequest,
 };
 #[cfg(feature = "server")]
 use crate::{
@@ -287,6 +287,7 @@ fn agent_serves(code: u32) -> bool {
             | C::CloneModel
             | C::CancelRun
             | C::RunDetectorOnce
+            | C::SignatureRules
     )
 }
 
@@ -853,6 +854,10 @@ server_operations! {
             => |h, peer, report| h.report_detector_status(peer, &report).await,
         ReportExclusionCounts(EngineExclusionReport) -> ()
             => |h, peer, report| h.report_exclusion_counts(peer, &report).await,
+        GetSignatureRules(Option<u64>) -> Option<SignatureRules>
+            => |h, peer, known_revision| h.get_signature_rules(peer, known_revision).await,
+        ReportSignatureStatus(SignatureStatusReport) -> ()
+            => |h, peer, report| h.report_signature_status(peer, &report).await,
         GetConfig(()) -> String
             => |h, peer, ()| h.get_config(peer).await,
         GetModel(String) -> Vec<u8>
@@ -1138,6 +1143,16 @@ impl AgentRequestStream {
                     },
                 }
             }
+            code if code == u32::from(crate::client::RequestCode::SignatureRules) => {
+                let request: SignatureRules = exchange.arguments(code, frame, limit).await?;
+                AgentRequest::SignatureRules {
+                    request,
+                    reply: Reply {
+                        exchange,
+                        response: PhantomData::<()>,
+                    },
+                }
+            }
             // `*_serves` admits only the codes matched above.
             _ => return Err(malformed("unknown request code")),
         };
@@ -1176,6 +1191,15 @@ pub enum AgentRequest<'a> {
     RunDetectorOnce {
         /// The peer-supplied arguments.
         request: i32,
+        /// The response capability borrowing this request stream.
+        reply: Reply<'a, ()>,
+    },
+
+    /// The `SignatureRules` push: the signature rule sets a Semi-supervised
+    /// Engine replaces its own with.
+    SignatureRules {
+        /// The peer-supplied arguments.
+        request: SignatureRules,
         /// The response capability borrowing this request stream.
         reply: Reply<'a, ()>,
     },
@@ -1352,6 +1376,45 @@ impl super::AgentHandle {
             &self.0.connection,
             &self.0.options,
             u32::from(crate::server::RequestCode::ReportExclusionCounts),
+            report,
+        )
+        .await
+    }
+
+    /// Sends the `get_signature_rules` engine operation, pulling the
+    /// signature rule sets.
+    ///
+    /// `known_revision` is the revision of the rule sets the engine has, if
+    /// any. The manager answers `None` when it is the manager's current
+    /// revision, and the current rule sets otherwise.
+    ///
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn get_signature_rules(
+        &self,
+        known_revision: Option<u64>,
+    ) -> Result<Option<SignatureRules>, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::GetSignatureRules),
+            known_revision,
+        )
+        .await
+    }
+
+    /// Sends the `report_signature_status` engine operation, the status of a
+    /// Semi-supervised Engine's signature matching.
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn report_signature_status(
+        &self,
+        report: &SignatureStatusReport,
+    ) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::ReportSignatureStatus),
             report,
         )
         .await
@@ -1556,6 +1619,17 @@ impl super::ServerHandle {
             detector_id,
         )
         .await
+    }
+
+    /// Pushes the signature rule sets to a Semi-supervised Engine.
+    ///
+    /// `Ok(())` means the engine accepted the rule sets.
+    ///
+    /// # Errors
+    /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
+    pub async fn send_signature_rules(&self, rules: &SignatureRules) -> Result<(), SessionError> {
+        self.push(crate::client::RequestCode::SignatureRules, rules)
+            .await
     }
 
     /// Pushes the exclusion list to the agent.
@@ -2135,7 +2209,8 @@ mod tests {
     /// compile until it is classified here. Each code maps to exactly one of:
     ///
     /// - the `ServerHandle` method that sends it: the ten configuration and list
-    ///   pushes, the four engine commands, and the eleven `node_*` families
+    ///   pushes, the four engine commands, the signature rule push, and the
+    ///   eleven `node_*` families
     ///   (`NodePackage` also covers `node_package_install`);
     /// - no legacy `server::Connection` sender, so nothing to carry over;
     /// - `EchoRequest`, the one documented exception: legacy `send_ping` is
@@ -2177,6 +2252,7 @@ mod tests {
             RequestCode::CloneModel => handle!(send_clone_model),
             RequestCode::CancelRun => handle!(send_cancel_run),
             RequestCode::RunDetectorOnce => handle!(send_run_detector_once),
+            RequestCode::SignatureRules => handle!(send_signature_rules),
             RequestCode::NodeService => handle!(node_service),
             RequestCode::NodeNetworkInterface => handle!(node_network_interface),
             RequestCode::NodeHostname => handle!(node_hostname),
@@ -2225,7 +2301,7 @@ mod tests {
                 Coverage::PingNotProvided => exceptions.push(number),
             }
         }
-        assert_eq!(methods.len(), 25, "{methods:?}");
+        assert_eq!(methods.len(), 26, "{methods:?}");
         assert_eq!(
             unsent,
             BTreeSet::from([1, 2, 4, 5, 6, 7, 13, 19, 20, 21, u32::MAX])

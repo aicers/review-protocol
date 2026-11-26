@@ -35,7 +35,8 @@ use crate::types::{
     DaiObservationBatch, DaiRangeDay, DaiRangeGrant, DaiRangeLate, DaiRangeMark, DaiRangeUnit,
     DaiStoreAck, DataSource, DataSourceKey, DetectionEvent, DetectorStatusReport,
     EngineExclusionReport, HostNetworkGroup, LabelDb, NetworkListItem, OutlierInfo,
-    ReportedRunState, TimeSeriesGenerationPolicy, TimeSeriesUpdate, UpdateClusterRequest,
+    ReportedRunState, SignatureRules, SignatureStatusReport, TimeSeriesGenerationPolicy,
+    TimeSeriesUpdate, UpdateClusterRequest,
 };
 
 /// A request handler that can handle a request to the server.
@@ -407,6 +408,40 @@ pub trait Handler {
     ) -> Result<(), String> {
         Err("not supported".to_string())
     }
+
+    /// Answers request 56, the signature rule sets the Semi-supervised Engine
+    /// `peer` pulls.
+    ///
+    /// `known_revision` is the revision of the rule sets the engine has, if
+    /// any. The manager answers `None` when `known_revision` is its current
+    /// revision, and the current rule sets otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or the
+    /// Central Manager refuses it.
+    async fn get_signature_rules(
+        &self,
+        _peer: &str,
+        _known_revision: Option<u64>,
+    ) -> Result<Option<SignatureRules>, String> {
+        Err("not supported".to_string())
+    }
+
+    /// Records the status of the signature matching the Semi-supervised
+    /// Engine `peer` reports with request 57.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the request is not supported or the
+    /// Central Manager refuses it.
+    async fn report_signature_status(
+        &self,
+        _peer: &str,
+        _report: &SignatureStatusReport,
+    ) -> Result<(), String> {
+        Err("not supported".to_string())
+    }
 }
 
 /// Handles requests to the server.
@@ -711,6 +746,16 @@ where
                 let result = handler.report_exclusion_counts(peer_name, &report).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
+            RequestCode::GetSignatureRules => {
+                let known_revision = parse_args::<Option<u64>>(body)?;
+                let result = handler.get_signature_rules(peer_name, known_revision).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportSignatureStatus => {
+                let report = parse_args::<SignatureStatusReport>(body)?;
+                let result = handler.report_signature_status(peer_name, &report).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
             RequestCode::Unknown => {
                 oinq::frame::send(
                     send,
@@ -1006,6 +1051,16 @@ where
                 let result = handler.report_exclusion_counts(peer_name, &report).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
+            RequestCode::GetSignatureRules => {
+                let known_revision = parse_args::<Option<u64>>(body)?;
+                let result = handler.get_signature_rules(peer_name, known_revision).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportSignatureStatus => {
+                let report = parse_args::<SignatureStatusReport>(body)?;
+                let result = handler.report_signature_status(peer_name, &report).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
             RequestCode::Unknown => {
                 oinq::frame::send(
                     send,
@@ -1210,6 +1265,8 @@ mod tests {
         ReportActiveRuns(String, Vec<u32>),
         ReportDetectorStatus(String, DetectorStatusReport),
         ReportExclusionCounts(String, EngineExclusionReport),
+        GetSignatureRules(String, Option<u64>),
+        ReportSignatureStatus(String, SignatureStatusReport),
     }
 
     struct EngineReportHandler {
@@ -1292,12 +1349,57 @@ mod tests {
                 ));
             self.response.clone()
         }
+
+        /// Answers with the first of `test::signature_rules()` when the
+        /// engine knows no revision, and `None` when it knows one.
+        async fn get_signature_rules(
+            &self,
+            peer: &str,
+            known_revision: Option<u64>,
+        ) -> Result<Option<SignatureRules>, String> {
+            self.received
+                .lock()
+                .unwrap()
+                .push(EngineReport::GetSignatureRules(
+                    peer.to_string(),
+                    known_revision,
+                ));
+            self.response
+                .clone()
+                .map(|()| signature_rules_answer(known_revision))
+        }
+
+        async fn report_signature_status(
+            &self,
+            peer: &str,
+            report: &SignatureStatusReport,
+        ) -> Result<(), String> {
+            self.received
+                .lock()
+                .unwrap()
+                .push(EngineReport::ReportSignatureStatus(
+                    peer.to_string(),
+                    report.clone(),
+                ));
+            self.response.clone()
+        }
+    }
+
+    /// What [`EngineReportHandler`] answers a rule pull with when it accepts
+    /// it.
+    fn signature_rules_answer(known_revision: Option<u64>) -> Option<SignatureRules> {
+        match known_revision {
+            None => crate::test::signature_rules().into_iter().next(),
+            Some(_) => None,
+        }
     }
 
     /// Sends each engine report request once over `client_send`, the
     /// Unsupervised Engine's requests 41 through 44 and the Semi-supervised
-    /// Engine's request 52, asserting every answer equals `expected`, and
-    /// returns what the handler should have received from `peer`.
+    /// Engine's requests 52, 56 and 57, asserting every answer equals
+    /// `expected` (for request 56, `expected` carrying
+    /// [`signature_rules_answer`]), and returns what the handler should have
+    /// received from `peer`.
     async fn send_engine_reports(
         client_send: &mut quinn::SendStream,
         client_recv: &mut quinn::RecvStream,
@@ -1382,7 +1484,59 @@ mod tests {
                 .into_iter()
                 .map(|report| EngineReport::ReportExclusionCounts(peer.to_string(), report)),
         );
+        sent.extend(send_signature_requests(client_send, client_recv, peer, expected).await);
         sent
+    }
+
+    /// Sends the Semi-supervised Engine's signature requests for
+    /// [`send_engine_reports`]: request 56 with no known revision and with one,
+    /// and request 57 with each of `test::signature_status_reports()`.
+    async fn send_signature_requests(
+        client_send: &mut quinn::SendStream,
+        client_recv: &mut quinn::RecvStream,
+        peer: &str,
+        expected: &Result<(), String>,
+    ) -> Vec<EngineReport> {
+        let known_revisions = [None, Some(crate::test::signature_rules()[0].revision)];
+        for known_revision in known_revisions {
+            let response: Result<Option<SignatureRules>, String> = crate::unary_request(
+                client_send,
+                client_recv,
+                u32::from(RequestCode::GetSignatureRules),
+                known_revision,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                response,
+                expected
+                    .clone()
+                    .map(|()| signature_rules_answer(known_revision))
+            );
+        }
+
+        let status_reports = crate::test::signature_status_reports();
+        for report in &status_reports {
+            let response: Result<(), String> = crate::unary_request(
+                client_send,
+                client_recv,
+                u32::from(RequestCode::ReportSignatureStatus),
+                report,
+            )
+            .await
+            .unwrap();
+            assert_eq!(&response, expected);
+        }
+
+        known_revisions
+            .into_iter()
+            .map(|known_revision| EngineReport::GetSignatureRules(peer.to_string(), known_revision))
+            .chain(
+                status_reports
+                    .into_iter()
+                    .map(|report| EngineReport::ReportSignatureStatus(peer.to_string(), report)),
+            )
+            .collect()
     }
 
     #[tokio::test]
@@ -1415,6 +1569,21 @@ mod tests {
         assert_eq!(
             DefaultHandler
                 .report_exclusion_counts("peer", &exclusion_report)
+                .await,
+            not_supported
+        );
+        assert_eq!(
+            DefaultHandler.get_signature_rules("peer", None).await,
+            Err("not supported".to_string())
+        );
+        assert_eq!(
+            DefaultHandler.get_signature_rules("peer", Some(7)).await,
+            Err("not supported".to_string())
+        );
+        let status_report = crate::test::signature_status_reports().remove(0);
+        assert_eq!(
+            DefaultHandler
+                .report_signature_status("peer", &status_report)
                 .await,
             not_supported
         );

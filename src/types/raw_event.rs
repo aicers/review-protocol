@@ -15,6 +15,8 @@
 //!   [`ProcessAccess`], [`RegistryObjectAddDel`], and [`WindowsEventLog`],
 //!   [`Journald`] and [`Auditd`] from `ingest::log`, with their inner types)
 //!   follow tag `0.31.0`.
+//! - [`Http`] follows tag `0.32.0`, which appends six request header fields
+//!   after `state`.
 //! - [`Kerberos`] and [`Dhcp`] follow tag `0.29.2` by deliberate exception:
 //!   the fields giganto-client `0.30.0` appended to them are not copied.
 //! - Every other copy follows tag `0.29.2`.
@@ -147,6 +149,19 @@ pub struct Http {
     pub mime_types: Vec<String>,
     pub body: Vec<u8>,
     pub state: String,
+    /// The request header names in the order they were received, in their
+    /// original case, with duplicates kept.
+    pub request_header_names: Vec<String>,
+    /// The value of the request's `Accept` header.
+    pub accept: String,
+    /// The value of the request's `Connection` header.
+    pub connection: String,
+    /// The value of the request's `Accept-Encoding` header.
+    pub accept_encoding: String,
+    /// The value of the request's `Accept-Language` header.
+    pub accept_language: String,
+    /// The value of the request's `Pragma` header.
+    pub pragma: String,
 }
 
 /// `password` and `cookie` carry credentials captured from the
@@ -191,6 +206,12 @@ impl fmt::Debug for Http {
             mime_types,
             body: _,
             state,
+            request_header_names,
+            accept,
+            connection,
+            accept_encoding,
+            accept_language,
+            pragma,
         } = self;
         f.debug_struct("Http")
             .field("orig_addr", orig_addr)
@@ -224,6 +245,12 @@ impl fmt::Debug for Http {
             .field("mime_types", mime_types)
             .field("body", &REDACTED)
             .field("state", state)
+            .field("request_header_names", request_header_names)
+            .field("accept", accept)
+            .field("connection", connection)
+            .field("accept_encoding", accept_encoding)
+            .field("accept_language", accept_language)
+            .field("pragma", pragma)
             .finish()
     }
 }
@@ -2011,6 +2038,12 @@ pub(super) mod tests {
                 mime_types: strings("mime"),
                 body: HTTP_BODY.to_vec(),
                 state: s("done"),
+                request_header_names: vec![s("Host"), s("Accept"), s("Cookie"), s("Accept")],
+                accept: s("text/html,application/xhtml+xml"),
+                connection: s("keep-alive"),
+                accept_encoding: s("gzip, deflate"),
+                accept_language: s("en-US,en;q=0.9"),
+                pragma: s("no-cache, x-synthetic"),
             }),
             RawEventBody::Rdp(Rdp {
                 orig_addr: v4(7),
@@ -2927,10 +2960,43 @@ pub(super) mod tests {
             "{rendered}"
         );
     }
+
+    #[test]
+    fn http_debug_prints_request_headers_as_derived() {
+        let RawEventBody::Http(http) = bodies()
+            .into_iter()
+            .find(|body| matches!(body, RawEventBody::Http(_)))
+            .expect("bodies() has an Http body")
+        else {
+            unreachable!("the Http body was found");
+        };
+        let rendered = format!("{http:?}");
+        let expected = format!(
+            "body: {REDACTED:?}, state: \"done\", \
+             request_header_names: {:?}, accept: {:?}, connection: {:?}, \
+             accept_encoding: {:?}, accept_language: {:?}, pragma: {:?} }}",
+            http.request_header_names,
+            http.accept,
+            http.connection,
+            http.accept_encoding,
+            http.accept_language,
+            http.pragma,
+        );
+        assert!(rendered.ends_with(&expected), "{rendered}");
+        let pretty = format!("{http:#?}");
+        for secret in [HTTP_URI, HTTP_REFERER, HTTP_PASSWORD, HTTP_COOKIE] {
+            assert!(!rendered.contains(secret), "{rendered}");
+            assert!(!pretty.contains(secret), "{pretty}");
+        }
+        let body = format!("{:?}", HTTP_BODY.to_vec());
+        assert!(!rendered.contains(&body), "{rendered}");
+        assert_eq!(rendered.matches(REDACTED).count(), 5, "{rendered}");
+    }
 }
 
-/// Maps giganto-client 0.31.0's host header, Sysmon and log structs to
-/// their copies here. Every conversion destructures without `..` and every
+/// Maps giganto-client 0.32.0's host header, Sysmon, log and network `Http`
+/// structs to their copies here; the first three are unchanged from 0.31.0,
+/// which the copies follow. Every conversion destructures without `..` and every
 /// enum match has no wildcard, so a field or variant giganto-client adds or
 /// renames fails to compile here. Kerberos and Dhcp are not mapped: their
 /// copies deliberately stay at giganto-client 0.29.2.
@@ -2938,7 +3004,9 @@ pub(super) mod tests {
 mod giganto_field_mapping {
     use std::fmt::Debug;
 
-    use giganto_client::ingest::{endpoint as g_endpoint, log as g_log, sysmon as g_sysmon};
+    use giganto_client::ingest::{
+        endpoint as g_endpoint, log as g_log, network as g_network, sysmon as g_sysmon,
+    };
     use serde::{Serialize, de::DeserializeOwned};
 
     use super::super::RawEventBody;
@@ -3125,6 +3193,87 @@ mod giganto_field_mapping {
     sysmon!(registry_object_add_del: g_sysmon::RegistryObjectAddDel => RegistryObjectAddDel {
         agent_name, agent_id, event_type, process_guid, process_id, image, target_object, user,
     });
+
+    fn http(value: g_network::Http) -> Http {
+        let g_network::Http {
+            orig_addr,
+            orig_port,
+            resp_addr,
+            resp_port,
+            proto,
+            start_time,
+            duration,
+            orig_pkts,
+            resp_pkts,
+            orig_l2_bytes,
+            resp_l2_bytes,
+            method,
+            host,
+            uri,
+            referer,
+            version,
+            user_agent,
+            request_len,
+            response_len,
+            status_code,
+            status_msg,
+            username,
+            password,
+            cookie,
+            content_encoding,
+            content_type,
+            cache_control,
+            filenames,
+            mime_types,
+            body,
+            state,
+            request_header_names,
+            accept,
+            connection,
+            accept_encoding,
+            accept_language,
+            pragma,
+        } = value;
+        Http {
+            orig_addr,
+            orig_port,
+            resp_addr,
+            resp_port,
+            proto,
+            start_time,
+            duration,
+            orig_pkts,
+            resp_pkts,
+            orig_l2_bytes,
+            resp_l2_bytes,
+            method,
+            host,
+            uri,
+            referer,
+            version,
+            user_agent,
+            request_len,
+            response_len,
+            status_code,
+            status_msg,
+            username,
+            password,
+            cookie,
+            content_encoding,
+            content_type,
+            cache_control,
+            filenames,
+            mime_types,
+            body,
+            state,
+            request_header_names,
+            accept,
+            connection,
+            accept_encoding,
+            accept_language,
+            pragma,
+        }
+    }
 
     fn windows_event_log(value: g_log::WindowsEventLog) -> WindowsEventLog {
         let g_log::WindowsEventLog {
@@ -3341,6 +3490,43 @@ mod giganto_field_mapping {
         }
         // 19 Sysmon bodies with a header and without, and 3 log bodies.
         assert_eq!(mapped, 19 * 2 + 3);
+    }
+
+    #[test]
+    fn http_body_maps_every_field() {
+        let mut mapped = 0;
+        for body in bodies() {
+            if let RawEventBody::Http(copy) = &body {
+                let Http {
+                    request_header_names,
+                    accept,
+                    connection,
+                    accept_encoding,
+                    accept_language,
+                    pragma,
+                    ..
+                } = copy;
+                // Every new field is set, the six to distinct values, and a
+                // repeated header name is kept.
+                let values = [accept, connection, accept_encoding, accept_language, pragma];
+                assert!(values.iter().all(|value| !value.is_empty()), "{copy:?}");
+                for (index, value) in values.iter().enumerate() {
+                    assert!(!values[index + 1..].contains(value), "{copy:?}");
+                    assert!(!request_header_names.contains(value), "{copy:?}");
+                }
+                assert!(request_header_names.len() >= 2, "{copy:?}");
+                assert!(
+                    request_header_names
+                        .iter()
+                        .enumerate()
+                        .any(|(index, name)| request_header_names[index + 1..].contains(name)),
+                    "{copy:?}"
+                );
+                assert_maps(copy, http);
+                mapped += 1;
+            }
+        }
+        assert_eq!(mapped, 1);
     }
 
     #[test]

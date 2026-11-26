@@ -63,7 +63,9 @@ pub async fn server(
             | ServerRequest::ReportRun { .. }
             | ServerRequest::ReportActiveRuns { .. }
             | ServerRequest::ReportDetectorStatus { .. }
-            | ServerRequest::ReportExclusionCounts { .. } => {}
+            | ServerRequest::ReportExclusionCounts { .. }
+            | ServerRequest::GetSignatureRules { .. }
+            | ServerRequest::ReportSignatureStatus { .. } => {}
         }
     }
     stream.finish()?;
@@ -102,6 +104,51 @@ pub async fn semi_supervised_engine(
         handle.get_exclusion_list().await?;
     let _watchlist: Vec<review_protocol::types::NetworkListItem> = handle.get_watchlist().await?;
     handle.report_exclusion_counts(report).await
+}
+
+#[cfg(feature = "client")]
+pub async fn signature_engine(
+    handle: &review_protocol::session::AgentHandle,
+    report: &review_protocol::types::SignatureStatusReport,
+) -> Result<Option<review_protocol::types::SignatureRules>, review_protocol::session::SessionError>
+{
+    handle.report_signature_status(report).await?;
+    handle.get_signature_rules(None).await
+}
+
+#[cfg(feature = "client")]
+pub async fn signature_rules_push(
+    stream: &mut review_protocol::session::AgentRequestStream,
+) -> Result<(), review_protocol::session::SessionError> {
+    use review_protocol::session::AgentRequest;
+    if let Some(AgentRequest::SignatureRules { request, reply }) = stream.next().await? {
+        let _revision: u64 = request.revision;
+        reply.respond(Ok(())).await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "server")]
+pub async fn signature_rules_command(
+    handle: &review_protocol::session::ServerHandle,
+    rules: &review_protocol::types::SignatureRules,
+) -> Result<(), review_protocol::session::SessionError> {
+    handle.send_signature_rules(rules).await
+}
+
+/// The signature schema types and the MITRE tactic mapping need no transport.
+pub fn signature_schema(
+    detail: &review_protocol::types::SignatureMatchDetail,
+) -> (
+    Option<review_protocol::types::EventCategory>,
+    u32,
+    review_protocol::types::DetectionModel,
+) {
+    use review_protocol::types::{DetectionModel, EventCategory, LoadedSignatureSet, TruncatedCount};
+    let _: fn(&LoadedSignatureSet) -> &Option<String> = |set| &set.load_error;
+    let _: fn(&TruncatedCount) -> i64 = |count| count.window_start;
+    let category = EventCategory::from_mitre_tactic_id(EventCategory::Impact.mitre_tactic_id());
+    (category, u32::from(detail.source), DetectionModel::SigmaSignature)
 }
 
 /// The exclusion-count report is a schema type, usable without any transport.

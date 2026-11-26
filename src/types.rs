@@ -28,8 +28,9 @@ pub use self::detection::{
     CryptocurrencyMiningPoolDetail, Detail, DetectionEvent, DetectionEventError, DetectionModel,
     EndpointRole, ExternalDdosDetail, FarOutlierDetail, FtpBruteForceDetail, LabelDbMatchDetail,
     LdapBruteForceDetail, MAX_RELATED_IPS, MultiHostPortScanDetail, PortScanDetail, PrimarySubject,
-    RdpBruteForceDetail, RelatedIp, RepeatedHttpSessionsDetail, SlotDeviation, Target, ThreatRole,
-    TimeWindow, UnusualDestinationPatternDetail, WatchlistMatchDetail, WindowOutlierDetail,
+    RdpBruteForceDetail, RelatedIp, RepeatedHttpSessionsDetail, SignatureMatchDetail,
+    SignatureSource, SlotDeviation, Target, ThreatRole, TimeWindow,
+    UnusualDestinationPatternDetail, WatchlistMatchDetail, WindowOutlierDetail,
     WindowOutlierViolation,
 };
 
@@ -357,6 +358,100 @@ pub struct EngineExclusionReport {
     pub counts: Vec<ExcludedCount>,
 }
 
+/// The signature rule sets a Semi-supervised Engine matches raw events
+/// against.
+///
+/// The Central Manager pushes it to an engine with agent request 27, and an
+/// engine pulls it with server request 56.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureRules {
+    /// The Central Manager's revision of the rule sets, which an engine
+    /// passes back to request 56 as its known revision.
+    pub revision: u64,
+    /// The compiled rule sets.
+    pub sets: Vec<SignatureRuleSet>,
+    /// The rules not to match, each named by its source and rule id.
+    pub disabled_rules: Vec<(SignatureSource, String)>,
+}
+
+/// One compiled signature rule set of a [`SignatureRules`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureRuleSet {
+    /// The source the rules come from.
+    pub source: SignatureSource,
+    /// The version of the source's rule set.
+    pub source_version: String,
+    /// The version of the converter that compiled the rule set.
+    pub converter_version: String,
+    /// The rule compiler's serialized bundle, opaque to this crate.
+    pub rules: Vec<u8>,
+}
+
+/// The status of a Semi-supervised Engine's signature matching.
+///
+/// The engine sends it with server request 57.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureStatusReport {
+    /// The rule sets the engine has loaded.
+    pub loaded: Vec<LoadedSignatureSet>,
+    /// The detection events the engine cut, counted per model, rule,
+    /// originator address and window.
+    ///
+    /// Producers send at most 1,000 entries. The limit is not checked here.
+    pub truncated: Vec<TruncatedCount>,
+    /// The sum of the counts beyond the entries in
+    /// [`truncated`](Self::truncated).
+    pub truncated_overflow: u64,
+    /// The records that OS-specific rules skipped for lack of a host header,
+    /// counted per raw event kind.
+    pub os_gated_skipped: Vec<(RawEventKind, u64)>,
+    /// Whether the home network was replaced by the private address ranges.
+    pub home_net_fallback: bool,
+}
+
+/// One signature rule set a Semi-supervised Engine has loaded, in a
+/// [`SignatureStatusReport`].
+///
+/// When [`load_error`](Self::load_error) is set, the entry's other fields are
+/// those of the snapshot still in use: with no earlier snapshot, the version
+/// strings are empty and [`rules`](Self::rules) and
+/// [`failed_compile`](Self::failed_compile) are 0. The reason text names the
+/// source version of the bundle that could not be read. It returns to `None`
+/// when a bundle of that source is next published.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadedSignatureSet {
+    /// The source the rules come from.
+    pub source: SignatureSource,
+    /// The version of the source's rule set.
+    pub source_version: String,
+    /// The version of the converter that compiled the rule set.
+    pub converter_version: String,
+    /// The number of rules compiled and in use.
+    pub rules: u64,
+    /// The number of rules that failed to compile.
+    pub failed_compile: u64,
+    /// Why the bundle could not be read; `None` when it could.
+    pub load_error: Option<String>,
+}
+
+/// The number of detection events of one model and rule, about one
+/// originator address, that a Semi-supervised Engine cut in one window.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TruncatedCount {
+    /// The model whose detection events were cut.
+    pub detection_model: DetectionModel,
+    /// The source of the rule.
+    pub source: SignatureSource,
+    /// The rule's id within its source.
+    pub rule_id: String,
+    /// The originator address of the cut detection events.
+    pub orig_addr: IpAddr,
+    /// The start of the window, in nanoseconds since the Unix epoch, UTC.
+    pub window_start: i64,
+    /// The number of detection events cut.
+    pub count: u64,
+}
+
 /// Why a detector does or does not run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DetectorState {
@@ -643,6 +738,56 @@ pub enum EventCategory {
     Persistence = 12,
     PrivilegeEscalation = 13,
     ResourceDevelopment = 14,
+}
+
+impl EventCategory {
+    /// Returns the id of the MITRE ATT&CK tactic this category is, such as
+    /// `TA0011` for [`CommandAndControl`](Self::CommandAndControl).
+    #[must_use]
+    pub fn mitre_tactic_id(self) -> &'static str {
+        match self {
+            Self::Reconnaissance => "TA0043",
+            Self::ResourceDevelopment => "TA0042",
+            Self::InitialAccess => "TA0001",
+            Self::Execution => "TA0002",
+            Self::Persistence => "TA0003",
+            Self::PrivilegeEscalation => "TA0004",
+            Self::DefenseEvasion => "TA0005",
+            Self::CredentialAccess => "TA0006",
+            Self::Discovery => "TA0007",
+            Self::LateralMovement => "TA0008",
+            Self::Collection => "TA0009",
+            Self::Exfiltration => "TA0010",
+            Self::CommandAndControl => "TA0011",
+            Self::Impact => "TA0040",
+        }
+    }
+
+    /// Returns the category of the MITRE ATT&CK tactic `id`, the inverse of
+    /// [`mitre_tactic_id`](Self::mitre_tactic_id).
+    ///
+    /// `id` must be written exactly as `mitre_tactic_id` returns it: any other
+    /// string, including a lowercase form, returns `None`.
+    #[must_use]
+    pub fn from_mitre_tactic_id(id: &str) -> Option<Self> {
+        match id {
+            "TA0043" => Some(Self::Reconnaissance),
+            "TA0042" => Some(Self::ResourceDevelopment),
+            "TA0001" => Some(Self::InitialAccess),
+            "TA0002" => Some(Self::Execution),
+            "TA0003" => Some(Self::Persistence),
+            "TA0004" => Some(Self::PrivilegeEscalation),
+            "TA0005" => Some(Self::DefenseEvasion),
+            "TA0006" => Some(Self::CredentialAccess),
+            "TA0007" => Some(Self::Discovery),
+            "TA0008" => Some(Self::LateralMovement),
+            "TA0009" => Some(Self::Collection),
+            "TA0010" => Some(Self::Exfiltration),
+            "TA0011" => Some(Self::CommandAndControl),
+            "TA0040" => Some(Self::Impact),
+            _ => None,
+        }
+    }
 }
 
 /// The kind of a raw event, a subset of giganto-client's `RawEventKind` with
@@ -5064,6 +5209,61 @@ pub mod node {
 mod tests {
     #[cfg(any(feature = "client", feature = "server"))]
     use super::*;
+
+    /// Every category with its MITRE ATT&CK tactic id, one to one.
+    const MITRE_TACTIC_IDS: [(super::EventCategory, &str); 14] = [
+        (super::EventCategory::Reconnaissance, "TA0043"),
+        (super::EventCategory::ResourceDevelopment, "TA0042"),
+        (super::EventCategory::InitialAccess, "TA0001"),
+        (super::EventCategory::Execution, "TA0002"),
+        (super::EventCategory::Persistence, "TA0003"),
+        (super::EventCategory::PrivilegeEscalation, "TA0004"),
+        (super::EventCategory::DefenseEvasion, "TA0005"),
+        (super::EventCategory::CredentialAccess, "TA0006"),
+        (super::EventCategory::Discovery, "TA0007"),
+        (super::EventCategory::LateralMovement, "TA0008"),
+        (super::EventCategory::Collection, "TA0009"),
+        (super::EventCategory::Exfiltration, "TA0010"),
+        (super::EventCategory::CommandAndControl, "TA0011"),
+        (super::EventCategory::Impact, "TA0040"),
+    ];
+
+    #[test]
+    fn event_categories_map_to_mitre_tactic_ids_one_to_one() {
+        use super::EventCategory;
+
+        for (category, id) in MITRE_TACTIC_IDS {
+            assert_eq!(category.mitre_tactic_id(), id, "{category:?}");
+            assert_eq!(EventCategory::from_mitre_tactic_id(id), Some(category));
+            assert_eq!(
+                EventCategory::from_mitre_tactic_id(category.mitre_tactic_id()),
+                Some(category)
+            );
+        }
+        // The 14 entries name 14 distinct categories and ids, so every
+        // category of the 14 is in the table once.
+        for (index, (category, id)) in MITRE_TACTIC_IDS.iter().enumerate() {
+            for (other_category, other_id) in MITRE_TACTIC_IDS.iter().skip(index + 1) {
+                assert_ne!(category, other_category);
+                assert_ne!(id, other_id);
+            }
+        }
+        for id in [
+            "",
+            "ta0011",
+            "Ta0011",
+            "TA011",
+            "TA00110",
+            " TA0011",
+            "TA0011 ",
+            "TA0041",
+            "TA0000",
+            "T1059",
+            "CommandAndControl",
+        ] {
+            assert_eq!(EventCategory::from_mitre_tactic_id(id), None, "{id:?}");
+        }
+    }
 
     /// Encodes a `TimeCount` under the wire configuration, asserts the
     /// bytes equal `expected`, and decodes `expected` back.
