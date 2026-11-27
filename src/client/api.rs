@@ -8,8 +8,9 @@ use crate::{
     types::{
         DaiCursors, DaiExtractorConfig, DaiObservationBatch, DaiRangeDay, DaiRangeGrant,
         DaiRangeLate, DaiRangeMark, DaiRangeUnit, DaiStoreAck, DataSource, DataSourceKey,
-        DetectorStatusReport, EngineExclusionReport, HostNetworkGroup, NetworkListItem,
-        ReportedRunState, SignatureRules, SignatureStatusReport, TimeSeriesGenerationPolicy,
+        DetectorStatusReport, EndpointSources, EndpointSourcesRequest, EngineExclusionReport,
+        HostNetworkGroup, NetworkListItem, ReportedRunState, RoundFilterReport, SignatureRules,
+        SignatureStatusReport, TimeSeriesGenerationPolicy, TrainingFilterReport,
     },
     unary_request,
 };
@@ -138,6 +139,59 @@ impl Connection {
     pub async fn report_signature_status(&self, report: &SignatureStatusReport) -> io::Result<()> {
         let res: Result<(), String> =
             request(self, server::RequestCode::ReportSignatureStatus, report).await?;
+        res.map_err(io::Error::other)
+    }
+
+    /// Resolves endpoint sources at training start or before an analysis round.
+    ///
+    /// See [`EndpointSourcesRequest`] and the report types for producer obligations.
+    /// # Errors
+    /// Returns an error on transport failure, malformed response or remote refusal.
+    pub async fn get_endpoint_sources(
+        &self,
+        request: &EndpointSourcesRequest,
+    ) -> io::Result<EndpointSources> {
+        let res: Result<EndpointSources, String> =
+            self::request(self, server::RequestCode::GetEndpointSources, request).await?;
+        res.map_err(io::Error::other)
+    }
+
+    /// Reports training filter counts before model upload.
+    ///
+    /// See [`EndpointSourcesRequest`] and the report types for producer obligations.
+    /// # Errors
+    /// Returns an error on transport failure, malformed response or remote refusal.
+    pub async fn report_training_filter(
+        &self,
+        run_id: u32,
+        report: &TrainingFilterReport,
+    ) -> io::Result<()> {
+        let res: Result<(), String> = request(
+            self,
+            server::RequestCode::ReportTrainingFilter,
+            (run_id, report),
+        )
+        .await?;
+        res.map_err(io::Error::other)
+    }
+
+    /// Reports endpoint-scope round filter counts after its status report.
+    ///
+    /// See [`EndpointSourcesRequest`] and the report types for producer obligations.
+    /// # Errors
+    /// Returns an error on transport failure, malformed response or remote refusal.
+    pub async fn report_round_filter(
+        &self,
+        detector_id: i32,
+        model: &str,
+        report: &RoundFilterReport,
+    ) -> io::Result<()> {
+        let res: Result<(), String> = request(
+            self,
+            server::RequestCode::ReportRoundFilter,
+            (detector_id, model, report),
+        )
+        .await?;
         res.map_err(io::Error::other)
     }
 
@@ -1011,6 +1065,125 @@ mod tests {
             assert_not_supported(client_conn.report_signature_status(&report).await);
         })
         .await;
+    }
+
+    struct EndpointHandler(bool);
+    #[async_trait::async_trait]
+    impl crate::server::Handler for EndpointHandler {
+        async fn get_endpoint_sources(
+            &self,
+            peer: &str,
+            request: &crate::types::EndpointSourcesRequest,
+        ) -> Result<crate::types::EndpointSources, String> {
+            assert_eq!(peer, "test-peer");
+            if self.0 {
+                crate::test::endpoint_answer(request)
+            } else {
+                Err("refused".into())
+            }
+        }
+        async fn report_training_filter(
+            &self,
+            peer: &str,
+            run_id: u32,
+            report: &crate::types::TrainingFilterReport,
+        ) -> Result<(), String> {
+            assert_eq!(peer, "test-peer");
+            assert_eq!(run_id, 7);
+            assert_eq!(report, &crate::test::training_filter_report());
+            if self.0 {
+                Ok(())
+            } else {
+                Err("refused".into())
+            }
+        }
+        async fn report_round_filter(
+            &self,
+            peer: &str,
+            detector_id: i32,
+            model: &str,
+            report: &crate::types::RoundFilterReport,
+        ) -> Result<(), String> {
+            assert_eq!(peer, "test-peer");
+            assert_eq!((detector_id, model), (-3, "host"));
+            assert_eq!(report, &crate::test::round_filter_report());
+            if self.0 {
+                Ok(())
+            } else {
+                Err("refused".into())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_api_success_refusal_and_defaults() {
+        for request in crate::test::endpoint_requests() {
+            let expected = crate::test::endpoint_answer(&request);
+            run_test_with(EndpointHandler(true), |conn| async move {
+                let actual = conn.get_endpoint_sources(&request).await;
+                match expected {
+                    Ok(answer) => assert_eq!(actual.unwrap(), answer),
+                    Err(reason) => {
+                        let error = actual.unwrap_err();
+                        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                        assert_eq!(error.to_string(), reason);
+                    }
+                }
+            })
+            .await;
+        }
+        for supported in [true, false] {
+            run_test_with(EndpointHandler(supported), |conn| async move {
+                let result = conn
+                    .report_training_filter(7, &crate::test::training_filter_report())
+                    .await;
+                assert_eq!(
+                    result.map_err(|e| e.to_string()),
+                    if supported {
+                        Ok(())
+                    } else {
+                        Err("refused".into())
+                    }
+                );
+            })
+            .await;
+            run_test_with(EndpointHandler(supported), |conn| async move {
+                let result = conn
+                    .report_round_filter(-3, "host", &crate::test::round_filter_report())
+                    .await;
+                assert_eq!(
+                    result.map_err(|e| e.to_string()),
+                    if supported {
+                        Ok(())
+                    } else {
+                        Err("refused".into())
+                    }
+                );
+            })
+            .await;
+        }
+        for operation in 53..=55 {
+            run_test_with(DefaultHandler, |conn| async move {
+                match operation {
+                    53 => assert_not_supported(
+                        conn.get_endpoint_sources(
+                            &crate::types::EndpointSourcesRequest::Training { run_id: 7 },
+                        )
+                        .await,
+                    ),
+                    54 => assert_not_supported(
+                        conn.report_training_filter(7, &crate::test::training_filter_report())
+                            .await,
+                    ),
+                    55 => assert_not_supported(
+                        conn.report_round_filter(-3, "host", &crate::test::round_filter_report())
+                            .await,
+                    ),
+                    _ => unreachable!(),
+                }
+            })
+            .await;
+        }
     }
 
     #[tokio::test]

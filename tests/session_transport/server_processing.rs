@@ -40,6 +40,11 @@ const GET_CONFIG: &[u8] = &[0, 0, 0, 4, 36, 0, 0, 0];
 const GET_EXCLUSION_LIST: &[u8] = &[0, 0, 0, 4, 32, 0, 0, 0];
 const GET_WATCHLIST: &[u8] = &[0, 0, 0, 4, 33, 0, 0, 0];
 const GET_LABEL_DB_PATTERNS: u32 = 15;
+const ENDPOINT_SERVICES: [(u32, ServiceId); 3] = [
+    (53, service_id::SERVER_ENDPOINT_SOURCES_GET),
+    (54, service_id::SERVER_RECORD_FILTER_REPORT_TRAINING),
+    (55, service_id::SERVER_RECORD_FILTER_REPORT_ROUND),
+];
 
 /// Returns the detection event a fixture frame carries: a `LockyRansomware`
 /// detection about cluster `cluster_id` of clustering model 0, at time 0.
@@ -458,6 +463,40 @@ mod legacy {
         assert_eq!(responses, Vec::<u8>::new());
     }
 
+    /// Denied endpoint requests must not parse arguments or call the handler.
+    #[tokio::test]
+    async fn legacy_denies_endpoint_operations_before_dispatch() {
+        let env = TEST_ENV.lock().await;
+        let (server, client) = env.setup().await;
+        for (code, service) in ENDPOINT_SERVICES {
+            let policy = Policy {
+                deny: Some(service),
+                ..Policy::default()
+            };
+            // An empty body is invalid for all three endpoint operations.
+            let requests = [request_frame(code, &()).as_slice(), GET_CONFIG].concat();
+            let (responses, result) = legacy_requests(&server, &client, &requests, &policy).await;
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                review_protocol::ProtocolErrorKind::of_io_error(&error),
+                review_protocol::ProtocolErrorKind::Forbidden
+            );
+            let frames = response_frames(&responses);
+            let [answer] = frames.as_slice() else {
+                panic!("expected only the denial response");
+            };
+            assert_eq!(
+                decode_response::<()>(answer),
+                Err("authorization denied".into())
+            );
+            assert_eq!(
+                *policy.trace.lock().unwrap(),
+                [Observation::Authorization(service)]
+            );
+        }
+    }
+
     #[tokio::test]
     async fn legacy_event_callbacks_match_pinned_stream() {
         let env = TEST_ENV.lock().await;
@@ -637,6 +676,47 @@ async fn runner_denies_a_later_request_before_parsing_or_dispatch() {
             Observation::Authorization(service_id::SERVER_MODEL_GET),
         ]
     );
+}
+
+/// Each endpoint operation enforces its own policy before parsing or dispatch.
+#[tokio::test]
+async fn runner_denies_endpoint_operations_before_dispatch() {
+    for (code, service) in ENDPOINT_SERVICES {
+        let (incoming, _, _, node) = raw_sessions(SessionOptions::legacy_compatible()).await;
+        let policy = Policy {
+            deny: Some(service),
+            ..Policy::default()
+        };
+        let trace = policy.trace.clone();
+        let mut incoming = incoming.with_authorization(context(), Arc::new(policy));
+        // Invalid arguments must still receive a denial, and no later request runs.
+        let requests = [request_frame(code, &()).as_slice(), GET_CONFIG].concat();
+        let (mut send, mut recv) = open_requests(&node, &requests).await;
+        send.finish().unwrap();
+        let result = request_stream(&mut incoming)
+            .await
+            .run(Arc::new(FixtureHandler::default()))
+            .await;
+        assert!(matches!(
+            result,
+            Err(ServerRunError::AuthorizationDenied { service: actual, source })
+                if actual == service && source.reason() == "private policy reason"
+        ));
+        let mut responses = Vec::new();
+        recv.read_to_end(&mut responses).await.unwrap();
+        let frames = response_frames(&responses);
+        let [answer] = frames.as_slice() else {
+            panic!("expected only the denial response");
+        };
+        assert_eq!(
+            decode_response::<()>(answer),
+            Err("authorization denied".into())
+        );
+        assert_eq!(
+            *trace.lock().unwrap(),
+            [Observation::Authorization(service)]
+        );
+    }
 }
 
 #[tokio::test]
@@ -1850,5 +1930,152 @@ async fn runner_answers_retired_host_report_codes_as_unknown() {
             Err("unknown request code".to_string())
         );
         assert_eq!(*trace.lock().unwrap(), []);
+    }
+}
+
+/// The runner authorizes each endpoint operation, preserves peer and arguments,
+/// returns successes/refusals, and defaults all three operations to unsupported.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One runner exercises success, refusal and defaults.
+async fn runner_serves_endpoint_operations() {
+    use review_protocol::{
+        test::{endpoint_answer, endpoint_requests, round_filter_report, training_filter_report},
+        types::{EndpointSources, EndpointSourcesRequest, RoundFilterReport, TrainingFilterReport},
+    };
+
+    #[derive(Debug, PartialEq)]
+    enum Received {
+        Lookup(String, EndpointSourcesRequest),
+        Training(String, u32, TrainingFilterReport),
+        Round(String, i32, String, RoundFilterReport),
+    }
+    #[derive(Default)]
+    struct EndpointHandler(Mutex<Vec<Received>>, bool);
+    #[async_trait::async_trait]
+    impl Handler for EndpointHandler {
+        async fn get_endpoint_sources(
+            &self,
+            peer: &str,
+            request: &EndpointSourcesRequest,
+        ) -> Result<EndpointSources, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(Received::Lookup(peer.into(), request.clone()));
+            endpoint_answer(request)
+        }
+        async fn report_training_filter(
+            &self,
+            peer: &str,
+            run_id: u32,
+            report: &TrainingFilterReport,
+        ) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(Received::Training(peer.into(), run_id, report.clone()));
+            if self.1 {
+                Err("refused".into())
+            } else {
+                Ok(())
+            }
+        }
+        async fn report_round_filter(
+            &self,
+            peer: &str,
+            detector_id: i32,
+            model: &str,
+            report: &RoundFilterReport,
+        ) -> Result<(), String> {
+            self.0.lock().unwrap().push(Received::Round(
+                peer.into(),
+                detector_id,
+                model.into(),
+                report.clone(),
+            ));
+            if self.1 {
+                Err("refused".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    for mode in 0..3 {
+        let training = training_filter_report();
+        let round = round_filter_report();
+        let mut requests = endpoint_requests()
+            .iter()
+            .map(|request| request_frame(53, request))
+            .collect::<Vec<_>>();
+        requests.push(request_frame(54, &(7_u32, &training)));
+        requests.push(request_frame(55, &(-3_i32, "host", &round)));
+        let (incoming, _, _, node) = raw_sessions_at(
+            SessionOptions::legacy_compatible(),
+            review_protocol::PROTOCOL_VERSION,
+        )
+        .await;
+        let policy = Policy::default();
+        let trace = policy.trace.clone();
+        let mut incoming = incoming.with_authorization(context(), Arc::new(policy));
+        let handler = Arc::new(EndpointHandler(Mutex::new(Vec::new()), mode == 1));
+        let (mut send, mut recv) = open_requests(&node, &requests.concat()).await;
+        send.finish().unwrap();
+        let stream = request_stream(&mut incoming).await;
+        let result = if mode == 2 {
+            stream.run(Arc::new(ConfigResponse(1))).await
+        } else {
+            stream.run(handler.clone()).await
+        };
+        assert!(matches!(result, Ok(ServerRequestOutcome::Finished)));
+        let mut responses = Vec::new();
+        recv.read_to_end(&mut responses).await.unwrap();
+        let frames = response_frames(&responses);
+        assert_eq!(frames.len(), 5);
+        for (frame, request) in frames.iter().zip(endpoint_requests()) {
+            assert_eq!(
+                decode_response::<EndpointSources>(frame),
+                if mode == 2 {
+                    Err("not supported".into())
+                } else {
+                    endpoint_answer(&request)
+                }
+            );
+        }
+        for frame in frames.iter().skip(3) {
+            assert_eq!(
+                decode_response::<()>(frame),
+                match mode {
+                    0 => Ok(()),
+                    1 => Err("refused".into()),
+                    _ => Err("not supported".into()),
+                }
+            );
+        }
+        if mode != 2 {
+            let mut expected = endpoint_requests()
+                .into_iter()
+                .map(|r| Received::Lookup("verified-peer".into(), r))
+                .collect::<Vec<_>>();
+            expected.push(Received::Training("verified-peer".into(), 7, training));
+            expected.push(Received::Round(
+                "verified-peer".into(),
+                -3,
+                "host".into(),
+                round,
+            ));
+            assert_eq!(*handler.0.lock().unwrap(), expected);
+        }
+        assert_eq!(
+            *trace.lock().unwrap(),
+            [
+                service_id::SERVER_ENDPOINT_SOURCES_GET,
+                service_id::SERVER_ENDPOINT_SOURCES_GET,
+                service_id::SERVER_ENDPOINT_SOURCES_GET,
+                service_id::SERVER_RECORD_FILTER_REPORT_TRAINING,
+                service_id::SERVER_RECORD_FILTER_REPORT_ROUND
+            ]
+            .map(Observation::Authorization)
+        );
     }
 }

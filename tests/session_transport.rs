@@ -1921,3 +1921,92 @@ mod server_integration;
 mod server_processing;
 #[path = "session_transport/server_pushes.rs"]
 mod server_pushes;
+
+/// Endpoint lookup and both filter senders preserve arguments and classify refusals.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn endpoint_requests_round_trip() {
+    use review_protocol::{
+        test::{endpoint_answer, endpoint_requests, round_filter_report, training_filter_report},
+        types::EndpointSources,
+    };
+    let (_, mut incoming, engine, _) = sessions(SessionOptions::legacy_compatible()).await;
+    let ((), ()) = tokio::join!(
+        async {
+            for request in endpoint_requests() {
+                let answer = engine.get_endpoint_sources(&request).await;
+                match endpoint_answer(&request) {
+                    Ok(expected) => assert_eq!(answer.unwrap(), expected),
+                    Err(reason) => assert!(
+                        matches!(answer, Err(SessionError::RemoteRejection(message)) if message == reason)
+                    ),
+                }
+            }
+            for accept in [true, false] {
+                let training = engine
+                    .report_training_filter(7, &training_filter_report())
+                    .await;
+                let round = engine
+                    .report_round_filter(-3, "host", &round_filter_report())
+                    .await;
+                for result in [training, round] {
+                    if accept {
+                        result.unwrap();
+                    } else {
+                        assert!(
+                            matches!(result, Err(SessionError::RemoteRejection(message)) if message == "refused")
+                        );
+                    }
+                }
+            }
+        },
+        async {
+            for expected in endpoint_requests() {
+                let mut stream = request_stream(&mut incoming).await;
+                let ServerRequest::GetEndpointSources { request, reply } =
+                    stream.next().await.unwrap().unwrap()
+                else {
+                    panic!("wrong request")
+                };
+                assert_eq!(request, expected);
+                let answer: Result<EndpointSources, String> = endpoint_answer(&request);
+                reply.respond(answer).await.unwrap();
+                stream.finish().unwrap();
+            }
+            for accept in [true, false] {
+                let mut stream = request_stream(&mut incoming).await;
+                let ServerRequest::ReportTrainingFilter { request, reply } =
+                    stream.next().await.unwrap().unwrap()
+                else {
+                    panic!("wrong request")
+                };
+                assert_eq!(request, (7, training_filter_report()));
+                reply
+                    .respond(if accept {
+                        Ok(())
+                    } else {
+                        Err("refused".into())
+                    })
+                    .await
+                    .unwrap();
+                stream.finish().unwrap();
+                let mut stream = request_stream(&mut incoming).await;
+                let ServerRequest::ReportRoundFilter { request, reply } =
+                    stream.next().await.unwrap().unwrap()
+                else {
+                    panic!("wrong request")
+                };
+                assert_eq!(request, (-3, "host".into(), round_filter_report()));
+                reply
+                    .respond(if accept {
+                        Ok(())
+                    } else {
+                        Err("refused".into())
+                    })
+                    .await
+                    .unwrap();
+                stream.finish().unwrap();
+            }
+        }
+    );
+}

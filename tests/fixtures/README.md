@@ -248,5 +248,10 @@ composed this way, not encoded by the crate.
 
 The signature requests 0.53.0 adds, agent request 27 and server requests 56
 and 57, are not part of the `current/server-*.bin` fixtures, which are
-unchanged; their own tests cover them. Server request codes 53 to 55 are
-reserved for another change and still decode as unknown.
+unchanged; their own tests cover them.
+
+Protocol 0.54.0 adds endpoint source lookup and training/round record-filter
+reports as server requests 53 through 55. Their request bodies and shared
+types have fixed wire snapshots in `src/types/endpoint_tests.rs`, and their
+transport tests cover routing and authorization. The existing binary
+fixtures remain unchanged.

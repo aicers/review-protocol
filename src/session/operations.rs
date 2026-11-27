@@ -29,8 +29,10 @@ use crate::types::node::{
     NodeTimeSyncResponse, NodeVersionRequest, NodeVersionResponse,
 };
 use crate::types::{
-    CloneModelRequest, CustomerDataDeletionReport, DetectorStatusReport, EngineExclusionReport,
-    NetworkListItem, ReportedRunState, SignatureRules, SignatureStatusReport, TrainModelRequest,
+    CloneModelRequest, CustomerDataDeletionReport, DetectorStatusReport, EndpointSources,
+    EndpointSourcesRequest, EngineExclusionReport, NetworkListItem, ReportedRunState,
+    RoundFilterReport, SignatureRules, SignatureStatusReport, TrainModelRequest,
+    TrainingFilterReport,
 };
 #[cfg(feature = "server")]
 use crate::{
@@ -854,6 +856,12 @@ server_operations! {
             => |h, peer, report| h.report_detector_status(peer, &report).await,
         ReportExclusionCounts(EngineExclusionReport) -> ()
             => |h, peer, report| h.report_exclusion_counts(peer, &report).await,
+        GetEndpointSources(EndpointSourcesRequest) -> EndpointSources
+            => |h, peer, request| h.get_endpoint_sources(peer, &request).await,
+        ReportTrainingFilter((u32, TrainingFilterReport)) -> ()
+            => |h, peer, (run_id, report)| h.report_training_filter(peer, run_id, &report).await,
+        ReportRoundFilter((i32, String, RoundFilterReport)) -> ()
+            => |h, peer, (detector_id, model, report)| h.report_round_filter(peer, detector_id, &model, &report).await,
         GetSignatureRules(Option<u64>) -> Option<SignatureRules>
             => |h, peer, known_revision| h.get_signature_rules(peer, known_revision).await,
         ReportSignatureStatus(SignatureStatusReport) -> ()
@@ -1416,6 +1424,63 @@ impl super::AgentHandle {
             &self.0.options,
             u32::from(crate::server::RequestCode::ReportSignatureStatus),
             report,
+        )
+        .await
+    }
+
+    /// Resolves endpoint sources at training start or before an analysis round.
+    ///
+    /// See [`EndpointSourcesRequest`] and the report types for producer obligations.
+    /// # Errors
+    /// Returns an error on transport failure, malformed response or remote refusal.
+    pub async fn get_endpoint_sources(
+        &self,
+        request: &EndpointSourcesRequest,
+    ) -> Result<EndpointSources, SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::GetEndpointSources),
+            request,
+        )
+        .await
+    }
+
+    /// Reports training filter counts before model upload.
+    ///
+    /// See [`EndpointSourcesRequest`] and the report types for producer obligations.
+    /// # Errors
+    /// Returns an error on transport failure, malformed response or remote refusal.
+    pub async fn report_training_filter(
+        &self,
+        run_id: u32,
+        report: &TrainingFilterReport,
+    ) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::ReportTrainingFilter),
+            (run_id, report),
+        )
+        .await
+    }
+
+    /// Reports endpoint-scope round filter counts after its status report.
+    ///
+    /// See [`EndpointSourcesRequest`] and the report types for producer obligations.
+    /// # Errors
+    /// Returns an error on transport failure, malformed response or remote refusal.
+    pub async fn report_round_filter(
+        &self,
+        detector_id: i32,
+        model: &str,
+        report: &RoundFilterReport,
+    ) -> Result<(), SessionError> {
+        unary(
+            &self.0.connection,
+            &self.0.options,
+            u32::from(crate::server::RequestCode::ReportRoundFilter),
+            (detector_id, model, report),
         )
         .await
     }
