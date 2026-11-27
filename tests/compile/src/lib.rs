@@ -165,6 +165,9 @@ pub async fn server(
             | ServerRequest::ReportDetectorStatus { .. }
             | ServerRequest::ReportExclusionCounts { .. }
             | ServerRequest::GetSignatureRules { .. }
+            | ServerRequest::GetEndpointSources { .. }
+            | ServerRequest::ReportTrainingFilter { .. }
+            | ServerRequest::ReportRoundFilter { .. }
             | ServerRequest::ReportSignatureStatus { .. } => {}
         }
     }
@@ -361,4 +364,39 @@ pub async fn send_event(
     sender.start(event)?;
     sender.flush().await?;
     sender.finish().await
+}
+
+/// Endpoint schema and host classification need no transport feature.
+pub fn endpoint_schema(
+    scope: review_protocol::types::EndpointScope,
+    request: review_protocol::types::EndpointSourcesRequest,
+    sources: review_protocol::types::EndpointSources,
+    day: review_protocol::types::DayFilterCounts,
+    counts: review_protocol::types::RecordFilterCounts,
+    training: review_protocol::types::TrainingFilterReport,
+    round: review_protocol::types::RoundFilterReport,
+) {
+    const HOST: bool = review_protocol::types::RawEventKind::Auditd.is_host_kind();
+    let _ = (scope, request, sources, day, counts, training, round, HOST);
+}
+
+/// Sends endpoint lookup and both filter reports through both engine APIs.
+///
+/// # Errors
+/// Returns transport failures and manager refusals from either API.
+#[cfg(feature = "client")]
+pub async fn endpoint_senders(
+    handle: &review_protocol::session::AgentHandle,
+    legacy: &review_protocol::client::Connection,
+    request: &review_protocol::types::EndpointSourcesRequest,
+    training: &review_protocol::types::TrainingFilterReport,
+    round: &review_protocol::types::RoundFilterReport,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = handle.get_endpoint_sources(request).await?;
+    handle.report_training_filter(7, training).await?;
+    handle.report_round_filter(-3, "host", round).await?;
+    let _ = legacy.get_endpoint_sources(request).await?;
+    legacy.report_training_filter(7, training).await?;
+    legacy.report_round_filter(-3, "host", round).await?;
+    Ok(())
 }

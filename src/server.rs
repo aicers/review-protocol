@@ -305,9 +305,17 @@ pub(crate) enum RequestCode {
     SendDaiRangeDay = 50,
     ReportDaiRangeLate = 51,
     ReportExclusionCounts = 52,
-    // 53 to 55 are reserved for the requests another change adds. Never use
-    // them for anything else: they decode as `Unknown` until that change
-    // assigns them.
+    /// Resolves training/round endpoint sources for the authenticated instance
+    /// and current node customer, never a caller-supplied scope or OS.
+    /// See [`crate::types::EndpointSourcesRequest`] and [`crate::types::EndpointSources`].
+    GetEndpointSources = 53,
+    /// Reports collection-mode and OS filter counts before model upload.
+    /// See [`crate::types::TrainingFilterReport`] for caller and ordering obligations.
+    ReportTrainingFilter = 54,
+    /// Reports endpoint-scope filter counts after the corresponding detector
+    /// status, with its exact completion timestamp to reject stale reports.
+    /// See [`crate::types::RoundFilterReport`] for caller and count obligations.
+    ReportRoundFilter = 55,
     /// Pulls the signature rule sets. The argument is the revision the engine
     /// knows, if any; the manager answers `None` when it is the manager's
     /// current revision and the current rule sets otherwise.
@@ -356,7 +364,6 @@ mod request_code_tests {
             RequestCode::from_primitive(52),
             RequestCode::ReportExclusionCounts
         );
-        assert_eq!(RequestCode::from_primitive(53), RequestCode::Unknown);
     }
 
     #[test]
@@ -372,11 +379,15 @@ mod request_code_tests {
         assert_eq!(RequestCode::from_primitive(58), RequestCode::Unknown);
     }
 
-    /// 53 to 55 are reserved for another change and stay unknown here.
     #[test]
-    fn reserved_codes_are_unknown() {
-        for num in 53..=55 {
-            assert_eq!(RequestCode::from_primitive(num), RequestCode::Unknown);
+    fn endpoint_request_codes() {
+        for (code, num) in [
+            (RequestCode::GetEndpointSources, 53),
+            (RequestCode::ReportTrainingFilter, 54),
+            (RequestCode::ReportRoundFilter, 55),
+        ] {
+            assert_eq!(u32::from(code), num);
+            assert_eq!(RequestCode::from_primitive(num), code);
         }
     }
 

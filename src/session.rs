@@ -315,8 +315,11 @@
 //! compatibility. Request codes and representative responses have independently
 //! captured release/current fixtures in `tests/fixtures`.
 //!
-//! The protocol is `0.53.0`, and the library's `>=0.49.0` suggested floor is
-//! unchanged. `0.53.0` changes the detection event payload again: the `Http`
+//! The protocol is `0.54.0`, and the library's `>=0.49.0` suggested floor is
+//! unchanged. `0.54.0` adds endpoint source lookup and training/round record-filter
+//! reports, server requests 53 through 55, and their scope, request, source and
+//! count/report types. Existing payloads keep their bytes.
+//! `0.53.0` changed the detection event payload again: the `Http`
 //! raw event body gains six trailing request header fields
 //! (`request_header_names`, `accept`, `connection`, `accept_encoding`,
 //! `accept_language` and `pragma`), so its bytes differ from `0.52.0`, and the
@@ -326,9 +329,7 @@
 //! that do. It also adds the signature rule
 //! requests: the manager's rule push, agent request 27, and a Semi-supervised
 //! Engine's rule pull and status report, server requests 56 and 57; a peer
-//! that predates `0.53.0` answers them with the unknown-code answer. Server
-//! request codes 53 through 55 are reserved for another change and still
-//! decode as unknown.
+//! that predates `0.53.0` answers them with the unknown-code answer.
 //! `0.52.0` changed the detection event payload: the 14 Sysmon raw
 //! event bodies gained the endpoint host header as a trailing field (and
 //! `ProcessCreate` the full 64-bit logon ID after it), so their bytes differ

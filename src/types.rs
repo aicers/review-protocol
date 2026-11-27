@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 pub use structured::ColumnStatistics;
 
+#[cfg(all(test, any(feature = "client", feature = "server")))]
+mod endpoint_tests;
+
 mod dai;
 mod detection;
 pub mod raw_event;
@@ -72,6 +75,95 @@ pub enum CustomerDataDeletionOutcome {
     Failed(String),
 }
 
+/// The endpoint scope of a host model or detector.
+///
+/// `Groups` must be nonempty and duplicate-free; review-database and
+/// review-web enforce this. Serialization performs no validation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum EndpointScope {
+    /// Every endpoint belonging to the customer.
+    All,
+    /// The customer's endpoint group ids.
+    Groups(Vec<String>),
+}
+
+/// An endpoint lookup identifying a training run or detector/model only.
+///
+/// `REview` resolves training from the caller's active `Train` run, and round
+/// scope from the applied detector configuration, with OS from the model's
+/// `trained_definition`. The caller supplies no customer, scope or OS.
+/// Lookup and both filter reports are restricted to the caller's instance
+/// and current node customer. This crate does not enforce these obligations.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum EndpointSourcesRequest {
+    /// A lookup at training start.
+    Training { run_id: u32 },
+    /// A lookup before an analysis round.
+    Round { detector_id: i32, model: String },
+}
+
+/// The resolved endpoint sources and the model definition's OS family.
+///
+/// Successful names are sorted, unique, lowercase hyphenated UUID sensor
+/// names. An empty success differs from an error. Current collection mode
+/// does not exclude a source. These are producer obligations, not validated
+/// by serialization or dispatch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EndpointSources {
+    /// The resolved sensor names.
+    pub endpoints: Vec<String>,
+    /// The `os_family` of the definition the model was trained from;
+    /// `Windows` or `Linux` in this protocol version.
+    pub os_family: raw_event::OsFamily,
+}
+
+/// Counts of records filtered by collection mode or OS.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecordFilterCounts {
+    /// Records whose header mode is not `extended`, including missing headers.
+    pub not_extended: u64,
+    /// Records rejected for OS mismatch.
+    pub other_os: u64,
+}
+
+/// Filter counts for one training day.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DayFilterCounts {
+    /// The training day's start in Unix nanoseconds.
+    pub start: i64,
+    /// The day's filtered records.
+    pub counts: RecordFilterCounts,
+}
+
+/// A training filter report sent before model upload.
+///
+/// `REview` restricts it to the caller's instance and current node customer.
+/// This crate validates neither that boundary nor report ordering.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrainingFilterReport {
+    /// The number of endpoint sources resolved for training.
+    pub endpoint_sources: u32,
+    /// The per-day filtered counts.
+    pub days: Vec<DayFilterCounts>,
+}
+
+/// A filter report for an `endpoint_scope` detector's completed round.
+///
+/// The engine sends it after the corresponding [`DetectorStatusReport`].
+/// `REview` restricts it to the caller's instance and current node customer
+/// and uses the timestamp to reject stale reports. This crate enforces none
+/// of these obligations.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RoundFilterReport {
+    /// The non-optional Unix-nanosecond timestamp equal to the same round's
+    /// `DetectorStatusReport.finished_at`, which is `Some` once a round ran.
+    pub finished_at: i64,
+    /// The number of round sources with `Served` status.
+    pub served_sources: u32,
+    /// The round's filtered records.
+    pub counts: RecordFilterCounts,
+}
+
 /// A request to an Unsupervised Engine to start a training run.
 ///
 /// The run creates the model named [`model`](Self::model), or replaces it,
@@ -112,7 +204,9 @@ pub struct TrainModelRequest {
     /// | `raw_event_kind` | string | required: a Giganto raw event kind in snake case that has a clustering model type | required, always `"log"` | required: one of the 20 network raw event kinds in snake case, the source policies' kind (for example `"tls"`); the engine records it on the model and on detection events, and always reads Giganto's periodic time-series kind whatever this value is |
     /// | `log_kind` | string | refused | required: a Giganto log kind name, not one of Giganto's other raw event kind names | refused |
     /// | `method` | string: `"multidimension"`, `"prefix"` or `"timeseries"` | required | required | required |
-    /// | `sources` | non-empty array of strings, no repeats | required | required | required |
+    /// | `sources` | non-empty array of strings, no repeats | required for non-host kinds, refused for host kinds | required | required |
+    /// | `endpoint_scope` | `"all"` or `{ groups = ["<group_id>", …] }`, nonempty with no repeats | required for host kinds, refused otherwise | refused | refused |
+    /// | `os_family` | `"windows"` or `"linux"`; fixed by a typed model | required for host kinds, refused otherwise | refused | refused |
     /// | `window_start` | string: RFC 3339 with offset; inclusive | required | required | required |
     /// | `window_end` | string: RFC 3339 with offset; exclusive; after `window_start` | required | required | required |
     /// | `[data_store]` | table: `address`, a socket address `"ip:port"`, and `server_name`, a string; both required | required | required | required |
@@ -133,6 +227,12 @@ pub struct TrainModelRequest {
     /// | `min_cluster_size` | usize | refused | refused | required |
     /// | `transform` | string: `"none"` or `"log1p"` | refused | refused | required |
     /// | `[csv]` | table: the keys below | required | refused | refused |
+    ///
+    /// Host kinds are exactly those for which [`RawEventKind::is_host_kind`]
+    /// is true. Host multidimension definitions, including `"custom"`, require
+    /// `endpoint_scope` and `os_family` and refuse `sources`. Other kinds
+    /// require `sources` and refuse both host keys. Prefix remains log-only;
+    /// prefix and timeseries refuse both host keys.
     ///
     /// `[csv]`, which only the multidimension method takes, has these keys:
     ///
@@ -250,7 +350,10 @@ pub struct TrainModelRequest {
     ///   `type_version` with `type = "custom"` or lacks it with a type id,
     ///   has `log_kind` when `raw_event_kind` is not `"log"` or lacks it when
     ///   `raw_event_kind = "log"`, has empty `sources`, repeats a
-    ///   source in `sources`, has `window_end` not after `window_start`, has
+    ///   source in `sources`, has empty or repeated `groups`, has `os_family`
+    ///   outside `"windows"` and `"linux"`, violates the host/non-host key
+    ///   rules above (including either host key on prefix or timeseries),
+    ///   has `window_end` not after `window_start`, has
     ///   `method = "multidimension"` without `[csv]`, has `[csv]` with
     ///   another method, has `method = "timeseries"` and `type = "custom"`
     ///   with `threat_role`, or has `method = "timeseries"` and a type id
@@ -262,7 +365,8 @@ pub struct TrainModelRequest {
     ///   model type; a prefix `log_kind` is a log kind name; a timeseries
     ///   `raw_event_kind` is a network kind; for a timeseries `"custom"`
     ///   definition, `raw_event_kind`, `group_by` and `slot_size` equal the
-    ///   source policies' values.
+    ///   source policies' values; a type's `os_family` equals its fixed value;
+    ///   and the scope's groups belong to the customer.
     pub definition: String,
 }
 
@@ -862,6 +966,38 @@ pub enum RawEventKind {
     WindowsEventLog = 80,
     Journald = 81,
     Auditd = 82,
+}
+
+impl RawEventKind {
+    /// Returns whether this kind is host telemetry, regardless of record headers.
+    #[must_use]
+    pub const fn is_host_kind(self) -> bool {
+        matches!(
+            self,
+            Self::ProcessCreate
+                | Self::FileCreateTime
+                | Self::NetworkConnect
+                | Self::ProcessTerminate
+                | Self::DriverLoad
+                | Self::ImageLoad
+                | Self::CreateRemoteThread
+                | Self::RawAccessRead
+                | Self::ProcessAccess
+                | Self::FileCreate
+                | Self::RegistryObjectAddDel
+                | Self::RegistryValueSet
+                | Self::RegistryKeyRename
+                | Self::FileCreateStreamHash
+                | Self::PipeEvent
+                | Self::DnsQuery
+                | Self::FileDelete
+                | Self::ProcessTamper
+                | Self::FileDeleteDetected
+                | Self::WindowsEventLog
+                | Self::Journald
+                | Self::Auditd
+        )
+    }
 }
 
 /// The body of a raw event, one variant per [`RawEventKind`] holding the
@@ -5613,5 +5749,29 @@ mod tests {
         assert_eq!(decoded, health);
         assert_eq!(AuditHealth::default().intent_without_outcome, 0);
         assert!(!AuditHealth::default().below_low_water);
+    }
+}
+
+#[cfg(test)]
+mod host_kind_tests {
+    use super::RawEventKind;
+
+    #[test]
+    fn host_predicate_covers_every_kind() {
+        const HOST_NUMBERS: [u32; 22] = [
+            31, 32, 33, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 47, 52, 53, 55, 56, 80, 81, 82,
+        ];
+        let kinds = (0..=u32::from(u16::MAX))
+            .filter_map(|n| RawEventKind::try_from(n).ok())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds.len(), 44);
+        assert_eq!(kinds.iter().filter(|k| k.is_host_kind()).count(), 22);
+        for kind in kinds {
+            assert_eq!(
+                kind.is_host_kind(),
+                HOST_NUMBERS.contains(&u32::from(kind)),
+                "{kind:?}"
+            );
+        }
     }
 }
