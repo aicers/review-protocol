@@ -439,6 +439,15 @@ pub const SERVER_SIGNATURE_RULES_GET: ServiceId = ServiceId::new("server.signatu
 pub const SERVER_SIGNATURE_RULES_REPORT_STATUS: ServiceId =
     ServiceId::new("server.signature_rules", "report_status");
 
+/// The `server.endpoint_sources.get` operation.
+pub const SERVER_ENDPOINT_SOURCES_GET: ServiceId = ServiceId::new("server.endpoint_sources", "get");
+/// The `server.record_filter.report_training` operation.
+pub const SERVER_RECORD_FILTER_REPORT_TRAINING: ServiceId =
+    ServiceId::new("server.record_filter", "report_training");
+/// The `server.record_filter.report_round` operation.
+pub const SERVER_RECORD_FILTER_REPORT_ROUND: ServiceId =
+    ServiceId::new("server.record_filter", "report_round");
+
 // ── server.dai ────────────────────────────────────────────────
 //
 // Device identification: observations and range days an agent sends.
@@ -740,6 +749,9 @@ pub(crate) fn from_server_request_code(code: ServerRequestCode) -> Option<Servic
         ServerRequestCode::ReportExclusionCounts => Some(SERVER_EXCLUSION_LIST_REPORT_COUNTS),
         ServerRequestCode::GetSignatureRules => Some(SERVER_SIGNATURE_RULES_GET),
         ServerRequestCode::ReportSignatureStatus => Some(SERVER_SIGNATURE_RULES_REPORT_STATUS),
+        ServerRequestCode::GetEndpointSources => Some(SERVER_ENDPOINT_SOURCES_GET),
+        ServerRequestCode::ReportTrainingFilter => Some(SERVER_RECORD_FILTER_REPORT_TRAINING),
+        ServerRequestCode::ReportRoundFilter => Some(SERVER_RECORD_FILTER_REPORT_ROUND),
         ServerRequestCode::Unknown => None,
     }
 }
@@ -851,6 +863,9 @@ pub fn all() -> &'static [ServiceId] {
         ENGINE_CLONE_MODEL,
         ENGINE_CANCEL_RUN,
         ENGINE_RUN_DETECTOR_ONCE,
+        SERVER_ENDPOINT_SOURCES_GET,
+        SERVER_RECORD_FILTER_REPORT_TRAINING,
+        SERVER_RECORD_FILTER_REPORT_ROUND,
         // server.customer_data_deletion
         SERVER_CUSTOMER_DATA_DELETION_REPORT,
         // server.run
@@ -1165,6 +1180,9 @@ mod tests {
             ServerRequestCode::SendDaiRangeDay,
             ServerRequestCode::ReportDaiRangeLate,
             ServerRequestCode::ReportExclusionCounts,
+            ServerRequestCode::GetEndpointSources,
+            ServerRequestCode::ReportTrainingFilter,
+            ServerRequestCode::ReportRoundFilter,
             ServerRequestCode::GetSignatureRules,
             ServerRequestCode::ReportSignatureStatus,
         ];
@@ -1444,12 +1462,33 @@ mod tests {
         ] {
             assert!(all().contains(&id), "{id}");
         }
-        // The codes reserved for another change map to no service ID.
-        for number in 53_u32..=55 {
+    }
+
+    #[test]
+    fn endpoint_request_codes_map_to_their_ids() {
+        for (number, id, text) in [
+            (
+                53_u32,
+                SERVER_ENDPOINT_SOURCES_GET,
+                "server.endpoint_sources.get",
+            ),
+            (
+                54,
+                SERVER_RECORD_FILTER_REPORT_TRAINING,
+                "server.record_filter.report_training",
+            ),
+            (
+                55,
+                SERVER_RECORD_FILTER_REPORT_ROUND,
+                "server.record_filter.report_round",
+            ),
+        ] {
             assert_eq!(
                 from_server_request_code(ServerRequestCode::from(number)),
-                None
+                Some(id)
             );
+            assert_eq!(id.to_string(), text);
+            assert!(all().contains(&id));
         }
     }
 

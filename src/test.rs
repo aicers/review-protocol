@@ -2144,3 +2144,68 @@ impl crate::server::Handler for TestServerHandler {
         }
     }
 }
+
+/// A training filter report with a nanosecond timestamp and a zero count.
+#[must_use]
+pub fn training_filter_report() -> crate::types::TrainingFilterReport {
+    use crate::types::{DayFilterCounts, RecordFilterCounts, TrainingFilterReport};
+    TrainingFilterReport {
+        endpoint_sources: 2,
+        days: vec![DayFilterCounts {
+            start: 1_700_000_000_000_000_001,
+            counts: RecordFilterCounts {
+                not_extended: 0,
+                other_os: 300,
+            },
+        }],
+    }
+}
+
+/// A round filter report with a negative nanosecond timestamp.
+#[must_use]
+pub fn round_filter_report() -> crate::types::RoundFilterReport {
+    use crate::types::{RecordFilterCounts, RoundFilterReport};
+    RoundFilterReport {
+        finished_at: -1_700_000_000_000_000_001,
+        served_sources: 1,
+        counts: RecordFilterCounts {
+            not_extended: 300,
+            other_os: 0,
+        },
+    }
+}
+
+/// Training and round lookups, including an empty success and a lookup error.
+#[must_use]
+pub fn endpoint_requests() -> Vec<crate::types::EndpointSourcesRequest> {
+    use crate::types::EndpointSourcesRequest;
+    vec![
+        EndpointSourcesRequest::Training { run_id: 7 },
+        EndpointSourcesRequest::Round {
+            detector_id: -3,
+            model: "host".into(),
+        },
+        EndpointSourcesRequest::Training { run_id: 0 },
+    ]
+}
+
+/// The endpoint fixture answer; a round lookup is an empty success.
+///
+/// # Errors
+/// Returns `run unknown` for training run zero.
+pub fn endpoint_answer(
+    request: &crate::types::EndpointSourcesRequest,
+) -> Result<crate::types::EndpointSources, String> {
+    use crate::types::{EndpointSources, EndpointSourcesRequest, raw_event::OsFamily};
+    match request {
+        EndpointSourcesRequest::Training { run_id: 0 } => Err("run unknown".into()),
+        EndpointSourcesRequest::Training { .. } => Ok(EndpointSources {
+            endpoints: vec!["01234567-89ab-cdef-0123-456789abcdef".into()],
+            os_family: OsFamily::Windows,
+        }),
+        EndpointSourcesRequest::Round { .. } => Ok(EndpointSources {
+            endpoints: vec![],
+            os_family: OsFamily::Linux,
+        }),
+    }
+}

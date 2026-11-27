@@ -33,10 +33,10 @@ use crate::protocol_error::{DispatchError, ProtocolErrorKind};
 use crate::types::{
     ColumnStatisticsUpdate, CustomerDataDeletionReport, DaiCursors, DaiExtractorConfig,
     DaiObservationBatch, DaiRangeDay, DaiRangeGrant, DaiRangeLate, DaiRangeMark, DaiRangeUnit,
-    DaiStoreAck, DataSource, DataSourceKey, DetectionEvent, DetectorStatusReport,
-    EngineExclusionReport, HostNetworkGroup, LabelDb, NetworkListItem, OutlierInfo,
-    ReportedRunState, SignatureRules, SignatureStatusReport, TimeSeriesGenerationPolicy,
-    TimeSeriesUpdate, UpdateClusterRequest,
+    DaiStoreAck, DataSource, DataSourceKey, DetectionEvent, DetectorStatusReport, EndpointSources,
+    EndpointSourcesRequest, EngineExclusionReport, HostNetworkGroup, LabelDb, NetworkListItem,
+    OutlierInfo, ReportedRunState, RoundFilterReport, SignatureRules, SignatureStatusReport,
+    TimeSeriesGenerationPolicy, TimeSeriesUpdate, TrainingFilterReport, UpdateClusterRequest,
 };
 
 /// A request handler that can handle a request to the server.
@@ -409,6 +409,57 @@ pub trait Handler {
         Err("not supported".to_string())
     }
 
+    /// Resolves endpoint sources at training start or before an analysis round.
+    ///
+    /// `REview` must restrict the request to the authenticated `peer`'s instance
+    /// and current node customer. See [`EndpointSourcesRequest`],
+    /// [`EndpointSources`], [`TrainingFilterReport`] and [`RoundFilterReport`]
+    /// for scope, OS, ordering and timestamp obligations; dispatch validates none.
+    /// # Errors
+    /// Returns `not supported` by default, or a manager refusal.
+    async fn get_endpoint_sources(
+        &self,
+        _peer: &str,
+        _request: &EndpointSourcesRequest,
+    ) -> Result<EndpointSources, String> {
+        Err("not supported".to_string())
+    }
+
+    /// Reports training filter counts before model upload.
+    ///
+    /// `REview` must restrict the request to the authenticated `peer`'s instance
+    /// and current node customer. See [`EndpointSourcesRequest`],
+    /// [`EndpointSources`], [`TrainingFilterReport`] and [`RoundFilterReport`]
+    /// for scope, OS, ordering and timestamp obligations; dispatch validates none.
+    /// # Errors
+    /// Returns `not supported` by default, or a manager refusal.
+    async fn report_training_filter(
+        &self,
+        _peer: &str,
+        _run_id: u32,
+        _report: &TrainingFilterReport,
+    ) -> Result<(), String> {
+        Err("not supported".to_string())
+    }
+
+    /// Reports endpoint-scope round filter counts after its status report.
+    ///
+    /// `REview` must restrict the request to the authenticated `peer`'s instance
+    /// and current node customer. See [`EndpointSourcesRequest`],
+    /// [`EndpointSources`], [`TrainingFilterReport`] and [`RoundFilterReport`]
+    /// for scope, OS, ordering and timestamp obligations; dispatch validates none.
+    /// # Errors
+    /// Returns `not supported` by default, or a manager refusal.
+    async fn report_round_filter(
+        &self,
+        _peer: &str,
+        _detector_id: i32,
+        _model: &str,
+        _report: &RoundFilterReport,
+    ) -> Result<(), String> {
+        Err("not supported".to_string())
+    }
+
     /// Answers request 56, the signature rule sets the Semi-supervised Engine
     /// `peer` pulls.
     ///
@@ -746,6 +797,26 @@ where
                 let result = handler.report_exclusion_counts(peer_name, &report).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
+            RequestCode::GetEndpointSources => {
+                let request = parse_args::<EndpointSourcesRequest>(body)?;
+                let result = handler.get_endpoint_sources(peer_name, &request).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportTrainingFilter => {
+                let (run_id, report) = parse_args::<(u32, TrainingFilterReport)>(body)?;
+                let result = handler
+                    .report_training_filter(peer_name, run_id, &report)
+                    .await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportRoundFilter => {
+                let (detector_id, model, report) =
+                    parse_args::<(i32, &str, RoundFilterReport)>(body)?;
+                let result = handler
+                    .report_round_filter(peer_name, detector_id, model, &report)
+                    .await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
             RequestCode::GetSignatureRules => {
                 let known_revision = parse_args::<Option<u64>>(body)?;
                 let result = handler.get_signature_rules(peer_name, known_revision).await;
@@ -1051,6 +1122,26 @@ where
                 let result = handler.report_exclusion_counts(peer_name, &report).await;
                 oinq::request::send_response(send, &mut buf, result).await?;
             }
+            RequestCode::GetEndpointSources => {
+                let request = parse_args::<EndpointSourcesRequest>(body)?;
+                let result = handler.get_endpoint_sources(peer_name, &request).await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportTrainingFilter => {
+                let (run_id, report) = parse_args::<(u32, TrainingFilterReport)>(body)?;
+                let result = handler
+                    .report_training_filter(peer_name, run_id, &report)
+                    .await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
+            RequestCode::ReportRoundFilter => {
+                let (detector_id, model, report) =
+                    parse_args::<(i32, &str, RoundFilterReport)>(body)?;
+                let result = handler
+                    .report_round_filter(peer_name, detector_id, model, &report)
+                    .await;
+                oinq::request::send_response(send, &mut buf, result).await?;
+            }
             RequestCode::GetSignatureRules => {
                 let known_revision = parse_args::<Option<u64>>(body)?;
                 let result = handler.get_signature_rules(peer_name, known_revision).await;
@@ -1265,6 +1356,9 @@ mod tests {
         ReportActiveRuns(String, Vec<u32>),
         ReportDetectorStatus(String, DetectorStatusReport),
         ReportExclusionCounts(String, EngineExclusionReport),
+        GetEndpointSources(String, EndpointSourcesRequest),
+        ReportTrainingFilter(String, u32, TrainingFilterReport),
+        ReportRoundFilter(String, i32, String, RoundFilterReport),
         GetSignatureRules(String, Option<u64>),
         ReportSignatureStatus(String, SignatureStatusReport),
     }
@@ -1350,6 +1444,59 @@ mod tests {
             self.response.clone()
         }
 
+        async fn get_endpoint_sources(
+            &self,
+            peer: &str,
+            request: &EndpointSourcesRequest,
+        ) -> Result<EndpointSources, String> {
+            self.received
+                .lock()
+                .unwrap()
+                .push(EngineReport::GetEndpointSources(
+                    peer.into(),
+                    request.clone(),
+                ));
+            self.response
+                .clone()
+                .and_then(|()| crate::test::endpoint_answer(request))
+        }
+
+        async fn report_training_filter(
+            &self,
+            peer: &str,
+            run_id: u32,
+            report: &TrainingFilterReport,
+        ) -> Result<(), String> {
+            self.received
+                .lock()
+                .unwrap()
+                .push(EngineReport::ReportTrainingFilter(
+                    peer.into(),
+                    run_id,
+                    report.clone(),
+                ));
+            self.response.clone()
+        }
+
+        async fn report_round_filter(
+            &self,
+            peer: &str,
+            detector_id: i32,
+            model: &str,
+            report: &RoundFilterReport,
+        ) -> Result<(), String> {
+            self.received
+                .lock()
+                .unwrap()
+                .push(EngineReport::ReportRoundFilter(
+                    peer.into(),
+                    detector_id,
+                    model.into(),
+                    report.clone(),
+                ));
+            self.response.clone()
+        }
+
         /// Answers with the first of `test::signature_rules()` when the
         /// engine knows no revision, and `None` when it knows one.
         async fn get_signature_rules(
@@ -1396,7 +1543,7 @@ mod tests {
 
     /// Sends each engine report request once over `client_send`, the
     /// Unsupervised Engine's requests 41 through 44 and the Semi-supervised
-    /// Engine's requests 52, 56 and 57, asserting every answer equals
+    /// Engine's requests 52 through 57, asserting every answer equals
     /// `expected` (for request 56, `expected` carrying
     /// [`signature_rules_answer`]), and returns what the handler should have
     /// received from `peer`.
@@ -1484,8 +1631,50 @@ mod tests {
                 .into_iter()
                 .map(|report| EngineReport::ReportExclusionCounts(peer.to_string(), report)),
         );
+        sent.extend(send_endpoint_requests(client_send, client_recv, peer, expected).await);
         sent.extend(send_signature_requests(client_send, client_recv, peer, expected).await);
         sent
+    }
+
+    async fn send_endpoint_requests(
+        send: &mut quinn::SendStream,
+        recv: &mut quinn::RecvStream,
+        peer: &str,
+        expected: &Result<(), String>,
+    ) -> Vec<EngineReport> {
+        let mut expected_reports = Vec::new();
+        for request in crate::test::endpoint_requests() {
+            let response: Result<EndpointSources, String> =
+                crate::unary_request(send, recv, 53, &request)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                response,
+                expected
+                    .clone()
+                    .and_then(|()| crate::test::endpoint_answer(&request))
+            );
+            expected_reports.push(EngineReport::GetEndpointSources(peer.into(), request));
+        }
+        let report = crate::test::training_filter_report();
+        let response: Result<(), String> = crate::unary_request(send, recv, 54, (7_u32, &report))
+            .await
+            .unwrap();
+        assert_eq!(&response, expected);
+        expected_reports.push(EngineReport::ReportTrainingFilter(peer.into(), 7, report));
+        let report = crate::test::round_filter_report();
+        let response: Result<(), String> =
+            crate::unary_request(send, recv, 55, (-3_i32, "host", &report))
+                .await
+                .unwrap();
+        assert_eq!(&response, expected);
+        expected_reports.push(EngineReport::ReportRoundFilter(
+            peer.into(),
+            -3,
+            "host".into(),
+            report,
+        ));
+        expected_reports
     }
 
     /// Sends the Semi-supervised Engine's signature requests for
@@ -1627,6 +1816,8 @@ mod tests {
         let (mut server_send, mut server_recv) = (channel.server.send, channel.server.recv);
         let (mut client_send, mut client_recv) = (channel.client.send, channel.client.recv);
         let peer = crate::auth::PeerContext::new("engine.example.test");
+        let authorizer = RecordingAuthorizer::default();
+        let observations = authorizer.0.clone();
 
         let server_task = tokio::spawn(async move {
             super::handle_authorized(
@@ -1634,7 +1825,7 @@ mod tests {
                 &mut server_send,
                 &mut server_recv,
                 &peer,
-                &crate::auth::NoopAuthorizer,
+                &authorizer,
             )
             .await
         });
@@ -1650,6 +1841,14 @@ mod tests {
         drop(client_recv);
         assert!(server_task.await.unwrap().unwrap().is_none());
         assert_eq!(*received.lock().unwrap(), expected);
+        let observed = observations.lock().unwrap();
+        for id in [
+            crate::service_id::SERVER_ENDPOINT_SOURCES_GET,
+            crate::service_id::SERVER_RECORD_FILTER_REPORT_TRAINING,
+            crate::service_id::SERVER_RECORD_FILTER_REPORT_ROUND,
+        ] {
+            assert!(observed.contains(&id));
+        }
     }
 
     #[tokio::test]
