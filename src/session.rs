@@ -26,7 +26,10 @@
 //! protocol streams.
 //!
 //! With the client feature, `AgentConnector::bind` or `AgentConnector::from_socket`
-//! accepts caller-owned TLS policy, transport windows, and explicit session limits.
+//! accepts TLS policy, transport windows, and explicit session limits.
+//! `client_config_from_pem` builds client-authenticated rustls configuration from
+//! PEM chain, key, and roots using an explicit aws-lc-rs provider; `ClientPemError`
+//! distinguishes missing chain, key, roots, PEM parsing, and rustls rejection.
 //! `connect` takes the server name used for TLS verification and the complete agent
 //! handshake claims. Established sessions retain endpoint resources after the
 //! connector is dropped. Use `local_addr`, `close`, and `wait_idle` for endpoint
@@ -95,6 +98,10 @@
 //! dispatches to an existing `request::Handler`. `run_node_authorized` accepts a
 //! node-only handler. Handshake capabilities are peer claims and grant no access.
 //! The runner drains unread package payload before the terminal response.
+//! All three agent runners return `AgentRunError::ResponseWrite` for response
+//! preparation/write failures and `AgentRunError::Session` for failures outside
+//! response writing, including reading the next request. Authorization denial
+//! retains its separate variant.
 //! For immediate reboot/shutdown, invoke the handler and call
 //! `Reply::complete_without_response` because those operations expect no reply.
 //!
@@ -111,7 +118,11 @@
 //! terminal response. An incomplete install cannot send a terminal success. After
 //! completion, the owner can read the next request with its unary frame budget
 //! restored. Event senders and receivers own their streams privately; the existing
-//! two-byte event header is preserved.
+//! two-byte event header is preserved. `DetectionEventSender::finish` flushes and
+//! queues FIN; `finish_and_wait` additionally waits for peer receipt of all bytes
+//! and FIN. Receipt does not prove application processing. A peer stop at any
+//! stage returns `SessionError::StreamStopped` with its `ApplicationCode`;
+//! connection loss uses the existing transport classification.
 //!
 //! ## Supervised server processing
 //!
@@ -297,9 +308,11 @@
 //! I/O and time enabled, including socket-based constructors. They take
 //! caller-supplied rustls configurations and preserve the selected transport policy.
 //!
-//! Transport defaults are no keepalive, a 30-second idle timeout, 100 incoming
-//! streams per direction, a 1,250,000-byte stream receive window, and 10,000,000-byte
-//! connection receive and send windows. Idle timeouts are truncated to milliseconds;
+//! Agent transport defaults match the legacy client: 5-second keepalive and a
+//! connection receive window of 2^62 - 1 bytes. Server defaults remain no keepalive
+//! and a 10,000,000-byte connection receive window. Both default to a 30-second
+//! idle timeout, 100 incoming streams per direction, a 1,250,000-byte stream
+//! receive window, and a 10,000,000-byte send window. Idle timeouts are truncated to milliseconds;
 //! `None` or less than one millisecond disables the local timeout. Keepalive must be
 //! positive and shorter than an enabled truncated idle timeout. The peers negotiate
 //! the effective idle timeout. These settings are independent of frame budgets and
@@ -393,6 +406,8 @@
 #[cfg(feature = "client")]
 mod connector;
 mod events;
+#[cfg(feature = "client")]
+mod pem;
 
 mod exchange;
 #[cfg(feature = "server")]
@@ -432,6 +447,8 @@ pub use operations::{
     ServerIncoming, ServerRequest, ServerRequestOutcome, ServerRequestStream, ServerStream,
     UnhandledServerRequest,
 };
+#[cfg(feature = "client")]
+pub use pem::{ClientPemError, client_config_from_pem};
 use thiserror::Error;
 use transport::SessionConnection;
 pub use transport::{
@@ -459,6 +476,12 @@ pub enum SessionError {
         certainty: OutcomeCertainty,
         #[source]
         source: TransportFailure,
+    },
+    /// The peer stopped an outgoing stream before receipt was confirmed.
+    #[error("peer stopped stream with application code {code:?}")]
+    StreamStopped {
+        /// The peer's uninterpreted stop code.
+        code: ApplicationCode,
     },
     /// Invalid local or received protocol data.
     #[error("malformed protocol data: {source}")]
@@ -549,6 +572,7 @@ impl SessionError {
     #[must_use]
     pub fn certainty(&self) -> Option<OutcomeCertainty> {
         match self {
+            Self::StreamStopped { .. } => Some(OutcomeCertainty::Unknown),
             Self::Transport { certainty, .. } | Self::Deadline { certainty, .. } => {
                 Some(*certainty)
             }

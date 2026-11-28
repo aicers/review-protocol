@@ -43,6 +43,11 @@ impl ApplicationCode {
         self.0
     }
 
+    #[cfg(feature = "client")]
+    pub(super) fn from_wire(code: oinq::ApplicationCode) -> Self {
+        Self(code.get())
+    }
+
     pub(super) fn wire(self) -> oinq::ApplicationCode {
         oinq::ApplicationCode::new(self.0).expect("application code was checked at construction")
     }

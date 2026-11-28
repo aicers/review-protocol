@@ -317,7 +317,7 @@ where
 pub fn exhaustive_session_error(error: review_protocol::session::SessionError) {
     use review_protocol::session::SessionError;
     match error {
-        SessionError::Transport { .. } | SessionError::Malformed { .. }
+        SessionError::StreamStopped { .. } | SessionError::Transport { .. } | SessionError::Malformed { .. }
         | SessionError::IncompatibleProtocol { .. } | SessionError::RemoteRejection(_)
         | SessionError::LimitExceeded { .. } | SessionError::Deadline { .. } => {}
     }
@@ -373,7 +373,7 @@ pub async fn send_event(
     let mut sender = handle.open_detection_event_stream().await?;
     sender.start(event)?;
     sender.flush().await?;
-    sender.finish().await
+    sender.finish_and_wait().await
 }
 
 /// Endpoint schema and host classification need no transport feature.
@@ -441,5 +441,23 @@ pub fn classify(error: review_protocol::session::SessionError) {
             },
             TransportFailure::StreamFailed(_) | TransportFailure::Other(_) => {}
         }
+    }
+}
+
+#[cfg(feature = "client")]
+pub fn pem_tls(
+    chain: &[u8],
+    key: &[u8],
+    roots: &[&[u8]],
+) -> Result<std::sync::Arc<rustls::ClientConfig>, review_protocol::session::ClientPemError> {
+    review_protocol::session::client_config_from_pem(chain, key, roots)
+}
+
+#[cfg(feature = "client")]
+pub fn runner_phase(error: review_protocol::session::AgentRunError) -> bool {
+    use review_protocol::session::AgentRunError;
+    match error {
+        AgentRunError::ResponseWrite(_) => true,
+        AgentRunError::Session(_) | AgentRunError::AuthorizationDenied { .. } => false,
     }
 }
