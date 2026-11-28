@@ -5,11 +5,12 @@ use std::{
     task::{Context, Waker},
 };
 
-pub(super) type SessionConnection = oinq::Connection;
 use oinq::Connection;
 use thiserror::Error;
 
 use super::{OutcomeCertainty, SessionError};
+
+pub(super) type SessionConnection = oinq::Connection;
 
 /// A checked application close code in the range zero through 2^62 - 1.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -83,6 +84,8 @@ pub enum FramePart {
 }
 
 /// A framing, codec, or configured budget failure.
+///
+/// I/O failures are reported as [`SessionError::Transport`] instead.
 #[derive(Debug, Error)]
 pub enum FrameError {
     /// A budget cannot be represented by the wire length field.
@@ -101,9 +104,6 @@ pub enum FrameError {
         received: usize,
         expected: usize,
     },
-    /// Original I/O failure.
-    #[error("frame I/O: {0}")]
-    Io(#[source] std::io::Error),
     /// Serialization failed before transmission.
     #[error("frame encoding: {0}")]
     Encode(#[source] bincode::error::EncodeError),
@@ -119,6 +119,9 @@ pub enum FrameError {
 }
 
 /// The category of a transport-level connection close, without causal attribution.
+///
+/// This enum supports exhaustive matching. Unrecognized transport close kinds
+/// map to [`Self::Other`]; adding a variant requires a breaking release.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportCloseKind {
     /// A TLS failure, with its alert number when known.
@@ -136,6 +139,10 @@ pub enum TransportCloseKind {
 }
 
 /// The observed reason a session connection closed.
+///
+/// This enum supports exhaustive matching. Unrecognized transport close reasons
+/// map to [`Self::Transport`] with [`TransportCloseKind::Other`]; adding a variant
+/// requires a breaking release.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CloseReason {
     /// The peer's application close code and uninterpreted reason bytes.
@@ -153,6 +160,10 @@ pub enum CloseReason {
 }
 
 /// A transport failure classified without implementation-specific downcasts.
+///
+/// This enum supports exhaustive matching. Failures without a recognized close
+/// state or a live connection map to [`Self::Other`]; adding a variant requires
+/// a breaking release.
 #[derive(Debug, Error)]
 pub enum TransportFailure {
     /// The connection has closed; its close state takes precedence over stream errors.

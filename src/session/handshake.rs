@@ -10,39 +10,37 @@ use super::{
 };
 
 #[cfg(feature = "server")]
-impl super::ServerHandle {
-    pub(crate) async fn from_transport(
-        connection: &Connection,
-        options: &SessionOptions,
-        window: &super::ProtocolWindow,
-    ) -> Result<(crate::AgentInfo, Exchange), SessionError> {
-        let (send, recv) = connection.accept_bi().await.map_err(|e| {
-            SessionError::transport(e, OutcomeCertainty::NotSent).on_connection(connection)
-        })?;
-        let mut exchange = Exchange::new(send, recv, options.handshake, connection);
-        let frame = exchange.frame().await?;
-        let mut agent = decode_agent(frame.as_bytes(), options.handshake.get())?;
-        exchange.recycle(frame)?;
-        agent.addr = connection.remote_addr();
-        if window.accepts(&agent.protocol_version) {
-            exchange.start(Ok::<_, &str>(window.advertised_version()))?;
-            exchange.flush().await?;
-            Ok((agent, exchange))
-        } else {
-            let required = window.accepted_range();
-            exchange.start(Err::<&str, _>(&required))?;
-            exchange.flush().await?;
-            // Retain endpoint resources until the rejection bytes/FIN are
-            // acknowledged; this constructor returns no handle on failure.
-            // A rejected agent may close the connection as soon as it reads
-            // the rejection, so a failure here must not replace the version
-            // error, as the legacy handshake ignores it too.
-            let _ = exchange.finish_and_wait().await;
-            Err(SessionError::IncompatibleProtocol {
-                version: agent.protocol_version,
-                required,
-            })
-        }
+pub(super) async fn server_handshake(
+    connection: &Connection,
+    options: &SessionOptions,
+    window: &super::ProtocolWindow,
+) -> Result<(crate::AgentInfo, Exchange), SessionError> {
+    let (send, recv) = connection.accept_bi().await.map_err(|e| {
+        SessionError::transport(e, OutcomeCertainty::NotSent).on_connection(connection)
+    })?;
+    let mut exchange = Exchange::new(send, recv, options.handshake, connection);
+    let frame = exchange.frame().await?;
+    let mut agent = decode_agent(frame.as_bytes(), options.handshake.get())?;
+    exchange.recycle(frame)?;
+    agent.addr = connection.remote_addr();
+    if window.accepts(&agent.protocol_version) {
+        exchange.start(Ok::<_, &str>(window.advertised_version()))?;
+        exchange.flush().await?;
+        Ok((agent, exchange))
+    } else {
+        let required = window.accepted_range();
+        exchange.start(Err::<&str, _>(&required))?;
+        exchange.flush().await?;
+        // Retain endpoint resources until the rejection bytes/FIN are
+        // acknowledged; this handshake returns no handle on failure.
+        // A rejected agent may close the connection as soon as it reads
+        // the rejection, so a failure here must not replace the version
+        // error, as the legacy handshake ignores it too.
+        let _ = exchange.finish_and_wait().await;
+        Err(SessionError::IncompatibleProtocol {
+            version: agent.protocol_version,
+            required,
+        })
     }
 }
 

@@ -243,6 +243,10 @@
 //! observed close state takes precedence over the individual stream error.
 //! `AgentHandle::close_reason` and `ServerHandle::close_reason` inspect that state
 //! without waiting; `closed` awaits the same owned reason type.
+//! If TLS establishment fails before a connection is available, only structured
+//! transport-close details can be classified. A peer application close during
+//! that phase is reported as `TransportFailure::Other` because the transport
+//! does not expose its application code or reason on the connect error.
 //!
 //! `certainty()` supplies these outcomes where applicable:
 //!
@@ -401,6 +405,7 @@ mod handshake;
 mod listener;
 mod operations;
 mod transport;
+
 use std::{
     sync::{
         Arc,

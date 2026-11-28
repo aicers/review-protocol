@@ -11,9 +11,9 @@ use oinq::{Connection, Endpoint, TransportOptions};
 use review_protocol::{
     MIN_PROTOCOL_VERSION_REQ, PROTOCOL_VERSION,
     session::{
-        AgentConnector, AgentHandle, AgentTransportOptions, ProtocolWindow, ServerHandle,
-        ServerIncoming, ServerListener, ServerListenerOptions, ServerRequestOutcome,
-        ServerSessionControl, ServerTransportOptions, SessionOptions,
+        AgentConnector, AgentHandle, AgentIncoming, AgentRequest, AgentTransportOptions,
+        ProtocolWindow, ServerHandle, ServerIncoming, ServerListener, ServerListenerOptions,
+        ServerRequestOutcome, ServerSessionControl, ServerTransportOptions, SessionOptions,
     },
 };
 use rustls::{
@@ -89,8 +89,8 @@ fn agent_tls(server: &Certificate, client: &Certificate) -> Arc<rustls::ClientCo
     Arc::new(config)
 }
 
-/// Connects an agent advertising the current protocol and admits it with the
-/// fixture identity and `policy`.
+/// Admits a raw fixture sender with the current protocol and fixture identity.
+/// Raw stream access is required to inject the pinned bytes without re-encoding.
 async fn admitted(
     listener: &ServerListener,
     endpoint: &Endpoint,
@@ -123,20 +123,15 @@ async fn admitted(
 }
 
 /// Answers one `RunDetectorOnce` command on the agent's incoming owner.
-async fn answer_detector_command(peer: &Connection) -> i32 {
-    let (send, recv) = peer.accept_bi().await.unwrap();
-    let limit = oinq::frame::FrameLimit::new(4096).unwrap();
-    let mut reader = oinq::frame::FramedReader::new(recv, limit);
-    let frame = reader.read().await.unwrap().unwrap();
-    // The current command fixture is a fixed little-endian code and bincode i32.
-    let (_, payload) = frame.as_bytes().split_at(4);
-    let (detector, _) =
-        bincode::serde::decode_from_slice(payload, bincode::config::standard()).unwrap();
-    let mut writer = oinq::frame::FramedWriter::new(send, limit);
-    writer.start(Ok::<(), String>(())).unwrap();
-    writer.flush().await.unwrap();
-    writer.into_inner().finish().unwrap();
-    detector
+async fn answer_detector_command(incoming: &mut AgentIncoming) -> i32 {
+    let mut stream = incoming.accept().await.unwrap();
+    let AgentRequest::RunDetectorOnce { request, reply } = stream.next().await.unwrap().unwrap()
+    else {
+        panic!("expected RunDetectorOnce");
+    };
+    reply.respond(Ok(())).await.unwrap();
+    stream.finish().unwrap();
+    request
 }
 
 /// Binds a listener accepting the crate's protocol window.
@@ -151,7 +146,7 @@ fn listen(certificate: &Certificate, client: &Certificate) -> ServerListener {
 }
 
 /// Reloads the listener with a replacement certificate and admits an agent
-/// that trusts only the replacement.
+/// that trusts only the replacement, then exchanges a typed command.
 async fn reload_and_admit(
     listener: &ServerListener,
     client: &Certificate,
@@ -183,12 +178,18 @@ async fn reload_and_admit(
         connector.connect(listener.local_addr().unwrap(), "localhost", &claims),
     );
     let control = unadmitted.control();
-    let (_handle, _incoming) = unadmitted.admit(context(), Arc::new(Policy::default()));
-    let (agent, _incoming) = agent.unwrap();
+    let (handle, _incoming) = unadmitted.admit(context(), Arc::new(Policy::default()));
+    let (agent, mut incoming) = agent.unwrap();
     assert_eq!(
         agent.peer_certificates().unwrap().chain(),
         &[replacement.der.as_ref().to_vec()]
     );
+    let (command, detector) = tokio::join!(
+        handle.send_run_detector_once(DETECTOR_ID),
+        answer_detector_command(&mut incoming),
+    );
+    command.unwrap();
+    assert_eq!(detector, DETECTOR_ID);
     (control, agent)
 }
 
@@ -210,7 +211,7 @@ async fn integrated_server_path_reproduces_fixtures_and_shuts_down_cleanly() {
         trace: trace.clone(),
         deny: None,
     };
-    let ((manager, mut incoming, control), node) = admitted(&listener, &endpoint, policy).await;
+    let ((_manager, mut incoming, control), node) = admitted(&listener, &endpoint, policy).await;
 
     // Accept each stream before the agent opens the next one: `accept` selects
     // both stream directions without bias.
@@ -242,23 +243,18 @@ async fn integrated_server_path_reproduces_fixtures_and_shuts_down_cleanly() {
         .unwrap();
     assert_eq!(answered, RESPONSES);
 
-    // A typed outbound command completes while both runners are still running.
-    let (command, detector) = timeout(TEST_TIMEOUT, async {
-        tokio::join!(
-            manager.send_run_detector_once(DETECTOR_ID),
-            answer_detector_command(&node),
-        )
-    })
-    .await
-    .unwrap();
-    command.unwrap();
-    assert_eq!(detector, DETECTOR_ID);
     assert!(!request_runner.is_finished());
     assert!(!event_runner.is_finished());
 
     // A reload serves new connections with the replacement certificate while
-    // the admitted session keeps its streams.
-    let (reloaded_control, reloaded_agent) = reload_and_admit(&listener, &client_certificate).await;
+    // the admitted session keeps its streams. The new session exchanges a typed
+    // command through AgentIncoming and Reply while both runners remain active.
+    let (reloaded_control, reloaded_agent) = timeout(
+        TEST_TIMEOUT,
+        reload_and_admit(&listener, &client_certificate),
+    )
+    .await
+    .unwrap();
     assert!(!request_runner.is_finished());
     assert!(!event_runner.is_finished());
 

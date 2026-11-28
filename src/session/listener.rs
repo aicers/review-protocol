@@ -10,7 +10,8 @@ use tokio::{sync::watch, time::Instant};
 
 use super::{
     HandshakeMetadata, OutcomeCertainty, PeerCertificates, ServerHandle, ServerIncoming,
-    SessionError, SessionOptions, Shared, handshake::server_shared,
+    SessionError, SessionOptions, Shared,
+    handshake::{server_handshake, server_shared},
 };
 use crate::{
     AgentInfo,
@@ -414,12 +415,9 @@ impl PendingSession {
         tokio::time::timeout(remaining, async {
             let connection = self.incoming.await.map_err(unsent)?;
             let mut guard = AbortPending(Some(connection.clone()), self.listener.clone());
-            let (claims, mut exchange) = ServerHandle::from_transport(
-                &connection,
-                &self.options.session,
-                &self.options.protocol,
-            )
-            .await?;
+            let (claims, mut exchange) =
+                server_handshake(&connection, &self.options.session, &self.options.protocol)
+                    .await?;
             // A refusal can immediately close the connection. Let the reply
             // reach the peer's transport before exposing that control.
             exchange.finish_and_wait().await?;
@@ -578,9 +576,12 @@ impl ServerSessionControl {
             CloseInfo::Transport(error) => {
                 ServerSessionClose::Transport(unsent(error).on_connection(&self.connection))
             }
-            other => ServerSessionClose::Transport(unsent(std::io::Error::other(format!(
-                "connection closed: {other:?}"
-            )))),
+            other => ServerSessionClose::Transport(
+                unsent(std::io::Error::other(format!(
+                    "connection closed: {other:?}"
+                )))
+                .on_connection(&self.connection),
+            ),
         }
     }
 
