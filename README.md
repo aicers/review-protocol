@@ -22,6 +22,27 @@ facilitate efficient and secure communication within the REview ecosystem.
   management
 - **Error Handling**: Comprehensive error handling with custom recovery options
 
+## Agent session migration
+
+With the `client` feature, `session::AgentTransportOptions::default()` uses
+5-second keepalive, maximum connection receive credit (2^62 − 1 bytes), and a
+30-second idle timeout, matching the legacy client. Server defaults are unchanged.
+`session::client_config_from_pem(chain, key, roots)` accepts PEM bytes and returns
+an `Arc<rustls::ClientConfig>` for `AgentConnector`, using an explicit aws-lc-rs
+provider. Each root input may contain several certificates; `ClientPemError`
+distinguishes missing chain, key or roots, malformed PEM, and rustls rejection.
+Applications still select their rustls dependency and features.
+
+`DetectionEventSender::finish` flushes and queues FIN. Use `finish_and_wait` to
+also wait for transport receipt through FIN. A peer stop during flushing,
+finishing or waiting returns `SessionError::StreamStopped { code }`; connection
+loss uses `SessionError::Transport`. Receipt does not prove application processing.
+
+The `run`, `run_authorized` and `run_node_authorized` agent runners return
+`AgentRunError::ResponseWrite` when preparing or writing a response fails, and
+`AgentRunError::Session` for failures outside response writing, including reading
+the next request. Authorization denial keeps its separate variant.
+
 ## Server session guide
 
 The `session` module runs a protocol server through protocol-owned types: an

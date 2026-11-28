@@ -266,7 +266,56 @@ impl DetectionEventSender {
                     .on_connection(&self.session.connection)
             })
     }
-    /// Finishes the stream after all prepared bytes have been flushed.
+    /// Flushes prepared bytes, queues FIN, and waits for receipt of all data and FIN.
+    ///
+    /// Receipt confirms transport acknowledgment, not application processing.
+    /// Dropping this future aborts the stream. No operation deadline is applied;
+    /// the caller can impose one with `tokio::time::timeout`.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::StreamStopped`] with the peer's code for a stop
+    /// during flushing, finishing, or waiting. Connection loss is classified as
+    /// [`SessionError::Transport`].
+    pub async fn finish_and_wait(mut self) -> Result<(), SessionError> {
+        let flushed = self.flush_inner().await;
+        if let Some(writer) = self.writer.take() {
+            self.raw = Some(writer.into_inner());
+        }
+        let send = self.raw.as_mut().ok_or_else(|| {
+            SessionError::frame(oinq::frame::FrameError::Poisoned, OutcomeCertainty::Unknown)
+        })?;
+        let finished = flushed.and_then(|()| {
+            send.finish().map_err(|error| {
+                SessionError::transport(error, OutcomeCertainty::Unknown)
+                    .on_connection(&self.session.connection)
+            })
+        });
+        if let Err(error) = finished {
+            // A failed write/FIN can hide STOP_SENDING behind an I/O error.
+            // Query the retained stream before resetting it to preserve the code.
+            if matches!(error, SessionError::Transport { .. })
+                && let Ok(Some(code)) = send.stopped().await
+            {
+                return Err(SessionError::StreamStopped {
+                    code: super::ApplicationCode::from_wire(code),
+                });
+            }
+            return Err(error);
+        }
+        let receipt = send.stopped().await.map_err(|error| {
+            SessionError::transport(error, OutcomeCertainty::Unknown)
+                .on_connection(&self.session.connection)
+        })?;
+        if let Some(code) = receipt {
+            return Err(SessionError::StreamStopped {
+                code: super::ApplicationCode::from_wire(code),
+            });
+        }
+        self.raw.take();
+        Ok(())
+    }
+
+    /// Flushes prepared bytes and queues FIN without waiting for receipt.
     /// # Errors
     /// Returns errors from flushing or queuing FIN.
     pub async fn finish(mut self) -> Result<(), SessionError> {

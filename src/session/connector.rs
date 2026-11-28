@@ -8,12 +8,16 @@ use oinq::{Endpoint, TransportOptions};
 
 use super::{AgentHandle, AgentIncoming, OutcomeCertainty, SessionError, SessionOptions};
 
+const MAX_RECEIVE_WINDOW: u64 = (1 << 62) - 1;
+
 macro_rules! agent_transport_options {
     ($($(#[$doc:meta])* $field:ident: $ty:ty),+ $(,)?) => {
         /// QUIC configuration passed through to the session transport.
         ///
-        /// Defaults are inherited from the transport. Timeout milliseconds and
-        /// receive windows must fit 62 bits. Incoming stream counts can be at
+        /// Defaults match the legacy agent: 5-second keepalive and maximum
+        /// connection receive credit. Other defaults follow the transport.
+        /// Timeout milliseconds and receive windows must fit 62 bits.
+        /// Incoming stream counts can be at
         /// most 2^60. A keepalive must be positive and shorter than the enabled
         /// idle timeout.
         #[derive(Clone, Copy, Debug)]
@@ -23,7 +27,11 @@ macro_rules! agent_transport_options {
 
         impl Default for AgentTransportOptions {
             fn default() -> Self {
-                let defaults = TransportOptions::default();
+                let defaults = TransportOptions {
+                    keep_alive_interval: Some(Duration::from_secs(5)),
+                    receive_window: MAX_RECEIVE_WINDOW,
+                    ..TransportOptions::default()
+                };
                 Self { $($field: defaults.$field),+ }
             }
         }
@@ -37,7 +45,7 @@ macro_rules! agent_transport_options {
 }
 
 agent_transport_options! {
-    /// Periodic traffic to avoid idle expiry. Disabled by default.
+    /// Periodic traffic to avoid idle expiry. Defaults to 5 seconds.
     keep_alive_interval: Option<Duration>,
     /// Maximum idle time. `None` or a sub-millisecond duration disables the local limit.
     idle_timeout: Option<Duration>,
@@ -47,7 +55,7 @@ agent_transport_options! {
     max_concurrent_uni_streams: u64,
     /// Receive credit for each stream, in bytes.
     stream_receive_window: u64,
-    /// Receive credit for the connection, in bytes.
+    /// Receive credit for the connection, in bytes. Defaults to 2^62 - 1.
     receive_window: u64,
     /// Maximum buffered unacknowledged outgoing bytes.
     send_window: u64,
@@ -56,7 +64,7 @@ agent_transport_options! {
 /// An agent endpoint for establishing protocol sessions.
 ///
 /// Established sessions retain endpoint resources after this owner is dropped.
-/// TLS verification, provider and server-name policy remain caller supplied.
+/// TLS policy can be supplied directly or built with [`super::client_config_from_pem`].
 pub struct AgentConnector {
     endpoint: Endpoint,
     session: SessionOptions,
@@ -158,4 +166,21 @@ fn unsent(error: impl std::error::Error + Send + Sync + 'static) -> SessionError
 
 fn close_code(code: u64) -> oinq::ApplicationCode {
     oinq::ApplicationCode::new(code).expect("only zero or one is passed as an application code")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_agent_defaults() {
+        let options = AgentTransportOptions::default();
+        assert_eq!(options.keep_alive_interval, Some(Duration::from_secs(5)));
+        assert_eq!(options.idle_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(options.max_concurrent_bidi_streams, 100);
+        assert_eq!(options.max_concurrent_uni_streams, 100);
+        assert_eq!(options.stream_receive_window, 1_250_000);
+        assert_eq!(options.receive_window, (1 << 62) - 1);
+        assert_eq!(options.send_window, 10_000_000);
+    }
 }

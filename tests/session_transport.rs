@@ -248,13 +248,17 @@ async fn raw_manager(
     version: &str,
     info: &AgentInfo,
 ) -> (Connection, (AgentHandle, AgentIncoming)) {
+    raw_manager_with_transport(options, version, info, TransportOptions::default()).await
+}
+
+async fn raw_manager_with_transport(
+    options: SessionOptions,
+    version: &str,
+    info: &AgentInfo,
+    transport: TransportOptions,
+) -> (Connection, (AgentHandle, AgentIncoming)) {
     let (server_tls, client_tls) = tls();
-    let endpoint = Endpoint::server(
-        server_tls,
-        "127.0.0.1:0".parse().unwrap(),
-        TransportOptions::default(),
-    )
-    .unwrap();
+    let endpoint = Endpoint::server(server_tls, "127.0.0.1:0".parse().unwrap(), transport).unwrap();
     let connector = AgentConnector::bind(
         "127.0.0.1:0".parse().unwrap(),
         client_tls,
@@ -2842,7 +2846,7 @@ async fn agent_runner_oversized_response_after_handler_is_unknown() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(matches!(
         result,
-        Err(AgentRunError::Session(SessionError::LimitExceeded {
+        Err(AgentRunError::ResponseWrite(SessionError::LimitExceeded {
             certainty: Some(OutcomeCertainty::Unknown),
             ..
         }))
@@ -3359,3 +3363,6 @@ async fn endpoint_requests_round_trip() {
 
 #[path = "session_transport/classification.rs"]
 mod classification;
+
+#[path = "session_transport/agent_helpers.rs"]
+mod agent_helpers;

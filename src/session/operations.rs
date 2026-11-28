@@ -216,15 +216,19 @@ impl RequestOwner {
         &mut self,
         serves: fn(u32) -> bool,
         unserved: fn(u32) -> String,
+        response_write: &mut bool,
     ) -> Result<Option<(u32, oinq::frame::Frame)>, SessionError> {
         loop {
+            *response_write = self.answering;
             self.flush_unserved().await?;
+            *response_write = false;
             let Some((code, frame)) = self.read_request().await? else {
                 return Ok(None);
             };
             if serves(code) {
                 return Ok(Some((code, frame)));
             }
+            *response_write = true;
             self.refuse(frame, &unserved(code))?;
         }
     }
@@ -585,7 +589,11 @@ impl ServerRequestStream {
     /// Returns classified transport, malformed request, or limit errors and aborts the stream.
     pub async fn next(&mut self) -> Result<Option<ServerRequest<'_>>, SessionError> {
         loop {
-            let Some((code, frame)) = self.owner.next(server_serves, server_unserved).await? else {
+            let Some((code, frame)) = self
+                .owner
+                .next(server_serves, server_unserved, &mut false)
+                .await?
+            else {
                 return Ok(None);
             };
             self.owner.exchange.certainty = OutcomeCertainty::Unknown;
@@ -1175,12 +1183,21 @@ impl AgentRequestStream {
         self.next_with(command_serves).await
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn next_with(
         &mut self,
         serves: fn(u32) -> bool,
     ) -> Result<Option<AgentCommand<'_>>, SessionError> {
-        let Some((code, frame)) = self.0.next(serves, agent_unserved).await? else {
+        self.next_with_phase(serves, &mut false).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn next_with_phase(
+        &mut self,
+        serves: fn(u32) -> bool,
+        response_write: &mut bool,
+    ) -> Result<Option<AgentCommand<'_>>, SessionError> {
+        let next = self.0.next(serves, agent_unserved, response_write).await?;
+        let Some((code, frame)) = next else {
             return Ok(None);
         };
         self.0.exchange.certainty = OutcomeCertainty::Unknown;
@@ -1714,9 +1731,12 @@ pub enum AgentRequest<'a> {
 #[cfg(feature = "client")]
 #[derive(Debug, thiserror::Error)]
 pub enum AgentRunError {
-    /// A transport, framing, limit, or remote-response failure.
+    /// A session failure while no response was being written (for example, reading a request).
     #[error(transparent)]
     Session(#[from] SessionError),
+    /// A failure while preparing or writing a response, including package preflight.
+    #[error("writing agent response: {0}")]
+    ResponseWrite(#[source] SessionError),
     /// The application policy denied a command before handler execution.
     #[error("authorization denied for {service}")]
     AuthorizationDenied {
@@ -3638,7 +3658,8 @@ impl AgentRequestStream {
     /// Non-node commands receive the legacy unknown-code response without authorization or dispatch.
     ///
     /// # Errors
-    /// Returns an authorization failure before handler execution, or a session failure.
+    /// Returns an authorization failure before handler execution, [`AgentRunError::ResponseWrite`]
+    /// while preparing/writing a response, or [`AgentRunError::Session`] otherwise.
     pub async fn run_node_authorized<H: crate::request::NodeHandler>(
         self,
         handler: &mut H,
@@ -3657,7 +3678,8 @@ impl AgentRequestStream {
     /// typed policy error locally.
     ///
     /// # Errors
-    /// Returns an authorization failure before handler execution, or a session failure.
+    /// Returns an authorization failure before handler execution, [`AgentRunError::ResponseWrite`]
+    /// while preparing/writing a response, or [`AgentRunError::Session`] otherwise.
     pub async fn run_authorized<H: crate::request::Handler>(
         self,
         handler: &mut H,
@@ -3676,7 +3698,8 @@ impl AgentRequestStream {
     /// captured by the caller, rather than handshake capability claims.
     ///
     /// # Errors
-    /// Returns an authorization failure before handler execution, or a session failure.
+    /// Returns an authorization failure before handler execution, [`AgentRunError::ResponseWrite`]
+    /// while preparing/writing a response, or [`AgentRunError::Session`] otherwise.
     // The dispatch table mirrors the legacy handler contracts; each arm completes a response.
     #[allow(clippy::too_many_lines, clippy::semicolon_if_nothing_returned)]
     pub async fn run<H, A>(self, handler: &mut H, authorize: A) -> Result<(), AgentRunError>
@@ -3704,7 +3727,18 @@ impl AgentRequestStream {
             command_serves
         };
         let mut authorization_denied = None;
-        while let Some(command) = self.next_with(serves).await? {
+        let mut response_write = false;
+        while let Some(command) = self
+            .next_with_phase(serves, &mut response_write)
+            .await
+            .map_err(|error| {
+                if response_write {
+                    AgentRunError::ResponseWrite(error)
+                } else {
+                    AgentRunError::Session(error)
+                }
+            })?
+        {
             let service = command.service_id();
             let authorization = authorize(&command);
             macro_rules! record_denied {
@@ -3727,7 +3761,10 @@ impl AgentRequestStream {
                             break;
                         }
                     };
-                    $reply.respond(result).await?;
+                    $reply
+                        .respond(result)
+                        .await
+                        .map_err(AgentRunError::ResponseWrite)?;
                 }};
             }
             match command {
@@ -3894,7 +3931,10 @@ impl AgentRequestStream {
                     if immediate {
                         reply.complete_without_response();
                     } else {
-                        reply.respond(result).await?;
+                        reply
+                            .respond(result)
+                            .await
+                            .map_err(AgentRunError::ResponseWrite)?;
                     }
                 }
                 AgentCommand::Package { request, reply } => {
@@ -3909,7 +3949,11 @@ impl AgentRequestStream {
                                 break;
                             }
                         };
-                        if let Some(mut reply) = reply.preflight(verdict).await? {
+                        if let Some(mut reply) = reply
+                            .preflight(verdict)
+                            .await
+                            .map_err(AgentRunError::ResponseWrite)?
+                        {
                             let result = {
                                 let mut reader =
                                     crate::request::PackageReader::from_session(&mut reply, size);
@@ -3931,7 +3975,10 @@ impl AgentRequestStream {
                                     )),
                                 }
                             };
-                            reply.respond(result).await?;
+                            reply
+                                .respond(result)
+                                .await
+                                .map_err(AgentRunError::ResponseWrite)?;
                         }
                     } else {
                         let result = match authorization {
@@ -3944,7 +3991,10 @@ impl AgentRequestStream {
                                 break;
                             }
                         };
-                        reply.respond(result).await?;
+                        reply
+                            .respond(result)
+                            .await
+                            .map_err(AgentRunError::ResponseWrite)?;
                     }
                 }
             }

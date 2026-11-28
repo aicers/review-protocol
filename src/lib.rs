@@ -5,6 +5,14 @@
 //! abstractions that embedding applications should rely on when
 //! integrating with the review protocol.
 //!
+//! Sessions provide agent defaults matching the legacy client (5-second keepalive,
+//! maximum connection receive credit, and a 30-second idle timeout); server
+//! defaults are unchanged. With `client`, `session::client_config_from_pem` builds
+//! client TLS using an explicit aws-lc-rs provider. Detection event senders offer
+//! `finish_and_wait` for transport receipt through FIN, with a matchable peer stop
+//! code. Agent runners distinguish response write failures from failures outside
+//! response writing through `AgentRunError`. See [`session`] for lifecycle details.
+//!
 //! ## Public modules
 //!
 //! - [`client`] – Client-side utilities and typed clients for calling
