@@ -250,7 +250,7 @@ pub trait DetectionEventStreamHandler {
     }
 }
 
-#[cfg(feature = "server")]
+#[cfg(any(feature = "client", feature = "server"))]
 pub(crate) const AUTHORIZATION_DENIED: &str = "authorization denied";
 #[cfg(feature = "server")]
 pub(crate) const UNKNOWN_REQUEST_CODE: &str = "unknown request code";

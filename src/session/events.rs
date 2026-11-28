@@ -189,9 +189,21 @@ impl DetectionEventSender {
         }
     }
     /// Prepares a detection event after the stream header has been flushed.
+    ///
     /// # Errors
     /// Returns a pending-header error, encoding error, or payload-limit error.
     pub fn start(&mut self, event: &crate::types::DetectionEvent) -> Result<(), SessionError> {
+        self.start_serialized(event)
+    }
+
+    /// Prepares a value serialized with the peer's event schema.
+    ///
+    /// Hog's `EventMessage`, for example, contains a timestamp, kind, and byte
+    /// fields and is not the same schema as [`DetectionEvent`](crate::types::DetectionEvent).
+    ///
+    /// # Errors
+    /// Returns a pending-header error, encoding error, or payload-limit error.
+    pub fn start_serialized<T: serde::Serialize>(&mut self, event: &T) -> Result<(), SessionError> {
         self.writer
             .as_mut()
             .ok_or_else(|| {

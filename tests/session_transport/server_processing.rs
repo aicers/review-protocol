@@ -1184,6 +1184,27 @@ async fn processing_enforces_explicit_frame_limits() {
 }
 
 #[tokio::test]
+async fn low_level_first_response_limit_after_request_is_unknown() {
+    use review_protocol::session::{FrameError, ServerRequest};
+
+    let mut options = SessionOptions::legacy_compatible();
+    options.unary = FrameLimit::new(32).unwrap();
+    let (mut incoming, _, _, node) = raw_sessions(options).await;
+    let (_send, _recv) = open_requests(&node, GET_CONFIG).await;
+    let mut stream = request_stream(&mut incoming).await;
+    let Some(ServerRequest::GetConfig { reply, .. }) = stream.next().await.unwrap() else {
+        panic!("wrong request");
+    };
+    assert!(matches!(
+        reply.respond(Ok("x".repeat(33))).await,
+        Err(SessionError::LimitExceeded {
+            source: FrameError::TooLarge { .. },
+            certainty: Some(OutcomeCertainty::Unknown),
+        })
+    ));
+}
+
+#[tokio::test]
 async fn label_lookup_uses_the_borrowed_argument_budget() {
     use std::sync::atomic::{AtomicBool, Ordering};
 

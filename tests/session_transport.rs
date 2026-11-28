@@ -8,10 +8,10 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use review_protocol::{
     AgentInfo, PROTOCOL_VERSION,
     session::{
-        AgentHandle, AgentIncoming, AgentRequest, ApplicationCode, CloseReason, Connection,
-        DetectionEventReceiver, Endpoint, FrameLimit, OutcomeCertainty, ServerHandle,
-        ServerIncoming, ServerRequest, ServerRequestStream, ServerStream, SessionError,
-        SessionOptions, TransportOptions,
+        AgentCommand, AgentHandle, AgentIncoming, AgentRequest, AgentRunError, ApplicationCode,
+        CloseReason, Connection, DetectionEventReceiver, Endpoint, FrameLimit, OutcomeCertainty,
+        ServerHandle, ServerIncoming, ServerRequest, ServerRequestStream, ServerStream,
+        SessionError, SessionOptions, TransportOptions,
     },
     types::{
         ManifestFormatRange, Status,
@@ -155,6 +155,17 @@ async fn raw_agent(options: SessionOptions, version: &str) -> (ServerHandle, Con
         AgentHandle::from_transport(agent.clone(), options, &claims)
     );
     (server.unwrap().0, agent)
+}
+
+async fn agent_with_raw_manager(options: SessionOptions) -> (AgentHandle, Connection) {
+    let (manager, node) = connections().await;
+    let claims = claims();
+    let (server, agent) = tokio::join!(
+        ServerHandle::from_transport(manager.clone(), options.clone(), ">=0.48.0", "0.49.0"),
+        AgentHandle::from_transport(node, options, &claims)
+    );
+    let _server = server.unwrap().0;
+    (agent.unwrap().0, manager)
 }
 
 async fn request_stream(incoming: &mut ServerIncoming) -> ServerRequestStream {
@@ -420,6 +431,35 @@ async fn preserves_typed_power_and_terminal_install_outcomes() {
     assert_eq!(source.position(), 0);
 }
 
+#[tokio::test]
+async fn terminal_install_preflight_rejection_finishes_cleanly() {
+    use oinq::frame::{FramedReader, FramedWriter};
+
+    let (manager, agent) = raw_agent(SessionOptions::legacy_compatible(), "0.49.0").await;
+    let mut source = std::io::Cursor::new(vec![1, 2, 3]);
+    let (result, ()) = tokio::join!(
+        manager.node_package_install(install_request(3), &mut source),
+        async {
+            let (send, recv) = agent.accept_bi().await.unwrap();
+            let limit = FrameLimit::new(1024).unwrap();
+            let mut reader = FramedReader::new(recv, limit);
+            let mut writer = FramedWriter::new(send, limit);
+            reader.read().await.unwrap().unwrap();
+            writer
+                .start(Err::<InstallPreflight, String>("disk full".into()))
+                .unwrap();
+            writer.flush().await.unwrap();
+            writer.into_inner().finish().unwrap();
+            assert!(reader.read().await.unwrap().is_none());
+        }
+    );
+    assert!(matches!(
+        result,
+        Err(SessionError::RemoteRejection(message)) if message == "disk full"
+    ));
+    assert_eq!(source.position(), 0);
+}
+
 fn install_request(size: u64) -> NodePackageRequest {
     NodePackageRequest::Install {
         target: "test".into(),
@@ -451,6 +491,8 @@ async fn install_transfer_stops_at_size_and_truncation_aborts() {
             let AgentRequest::Package { reply, .. } = stream.next().await.unwrap().unwrap() else {
                 panic!("wrong request");
             };
+            assert_eq!(reply.size(), Some(3000));
+            assert_eq!(reply.remaining(), Some(3000));
             let mut transfer = reply
                 .preflight(Ok(InstallPreflight::Proceed))
                 .await
@@ -461,6 +503,11 @@ async fn install_transfer_stops_at_size_and_truncation_aborts() {
             while transfer.next_chunk(&mut buffer).await.unwrap() {
                 assert!(buffer.len() <= 1024);
                 received.extend_from_slice(&buffer);
+                assert_eq!(
+                    transfer.remaining(),
+                    Some(3000 - u64::try_from(received.len()).unwrap())
+                );
+                assert_eq!(transfer.size(), Some(3000));
             }
             transfer
                 .respond(Ok(NodePackageResponse::Done))
@@ -593,7 +640,10 @@ async fn event_stream_round_trip_and_resumption() {
     let ((), received) = tokio::join!(
         async {
             let mut sender = agent.open_detection_event_stream().await.unwrap();
-            sender.start(&event).unwrap();
+            let value = serde_json::to_value(&event).unwrap();
+            sender
+                .start(&serde_json::from_value(value).unwrap())
+                .unwrap();
             sender.flush().await.unwrap();
             sender.finish().await.unwrap();
         },
@@ -997,6 +1047,58 @@ async fn stalled_request_and_event_headers_do_not_block_other_streams() {
     drop(stalled);
     assert_eq!(stalled_send.stopped().await.unwrap().unwrap().get(), 1);
     assert!(stalled_recv.read(&mut [0]).await.is_err());
+}
+
+#[tokio::test]
+async fn cancelling_agent_accept_consumes_no_command_stream() {
+    use oinq::frame::{FramedReader, FramedWriter};
+    use review_protocol::types::node::{NodeHostnameRequest, NodeHostnameResponse};
+
+    let (_server_incoming, mut incoming, manager, _node) =
+        raw_sessions(SessionOptions::legacy_compatible()).await;
+    {
+        let mut accept = tokio_test::task::spawn(incoming.accept());
+        assert!(accept.poll().is_pending());
+    }
+    let (send, recv) = manager.open_bi().await.unwrap();
+    let limit = FrameLimit::new(1024).unwrap();
+    let mut writer = FramedWriter::new(send, limit);
+    let mut reader = FramedReader::new(recv, limit);
+    writer
+        .start((
+            102_u32.to_le_bytes(),
+            NodeHostnameRequest::Set {
+                hostname: "accepted".into(),
+            },
+        ))
+        .unwrap();
+    writer.flush().await.unwrap();
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), incoming.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let AgentRequest::Hostname { request, reply } = stream.next().await.unwrap().unwrap() else {
+        panic!("wrong request");
+    };
+    assert_eq!(
+        request,
+        NodeHostnameRequest::Set {
+            hostname: "accepted".into()
+        }
+    );
+    reply.respond(Ok(NodeHostnameResponse::Done)).await.unwrap();
+    writer.into_inner().finish().unwrap();
+    assert!(stream.next().await.unwrap().is_none());
+    assert_eq!(
+        reader
+            .read()
+            .await
+            .unwrap()
+            .unwrap()
+            .decode::<Result<NodeHostnameResponse, String>>()
+            .unwrap(),
+        Ok(NodeHostnameResponse::Done)
+    );
 }
 
 #[tokio::test]
@@ -1567,6 +1669,259 @@ async fn answer_raw_frame(manager: &Connection, reply: &[u8]) -> Vec<u8> {
     request
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn typed_agent_operations_preserve_legacy_request_codes_and_bodies() {
+    use review_protocol::types::{
+        ColumnStatisticsUpdate, DataSource, DataSourceKey, DataType, DetectionEvent,
+        HostNetworkGroup, OutlierInfo, TimeSeriesGenerationPolicy, TimeSeriesUpdate,
+        UpdateClusterRequest,
+    };
+
+    fn source(id: u32) -> DataSource {
+        DataSource {
+            id,
+            name: "source".into(),
+            server_name: "server".into(),
+            address: "127.0.0.1:8080".parse().unwrap(),
+            data_type: DataType::Csv,
+            source: "payload".into(),
+            kind: None,
+            description: "description".into(),
+        }
+    }
+
+    let (agent, manager) = agent_with_raw_manager(SessionOptions::legacy_compatible()).await;
+
+    macro_rules! check {
+        ($call:expr, $code:expr, $input:expr, $reply:expr) => {{
+            let expected = bincode::serde::encode_to_vec(
+                (($code as u32).to_le_bytes(), &$input),
+                bincode::config::standard(),
+            )
+            .unwrap();
+            let reply = bincode::serde::encode_to_vec($reply, bincode::config::standard()).unwrap();
+            let (result, request) = tokio::join!($call, answer_raw_frame(&manager, &reply));
+            assert_eq!(request, expected);
+            result.unwrap();
+        }};
+    }
+
+    let statistics: &[ColumnStatisticsUpdate] = &[];
+    let time_series: &[TimeSeriesUpdate] = &[];
+    let clusters: &[UpdateClusterRequest] = &[];
+    let outliers: &[OutlierInfo] = &[];
+    let events: &[DetectionEvent] = &[];
+    let inserted_source = source(2);
+
+    check!(
+        agent.get_data_source(&DataSourceKey::Name("source")),
+        0,
+        DataSourceKey::Name("source"),
+        Ok::<Option<DataSource>, String>(Some(source(1)))
+    );
+    check!(
+        agent.get_indicator("indicator"),
+        1,
+        "indicator",
+        Ok::<std::collections::HashSet<Vec<String>>, String>(std::collections::HashSet::default())
+    );
+    check!(
+        agent.get_internal_network_list(),
+        31,
+        (),
+        Ok::<HostNetworkGroup, String>(HostNetworkGroup::default())
+    );
+    check!(
+        agent.get_labeldb_patterns(&[("labeldb", "pattern")]),
+        15,
+        &[("labeldb", "pattern")][..],
+        Ok::<Vec<(String, Option<review_protocol::types::LabelDb>)>, String>(Vec::new())
+    );
+    check!(
+        agent.get_tor_exit_node_list(),
+        26,
+        (),
+        Ok::<Vec<String>, String>(Vec::new())
+    );
+    check!(
+        agent.get_trusted_domain_list(),
+        24,
+        (),
+        Ok::<Vec<String>, String>(Vec::new())
+    );
+    check!(
+        agent.get_trusted_user_agent_list(),
+        35,
+        (),
+        Ok::<Vec<String>, String>(Vec::new())
+    );
+    check!(
+        agent.get_time_series_generation_policy_list(),
+        39,
+        (),
+        Ok::<Vec<TimeSeriesGenerationPolicy>, String>(Vec::new())
+    );
+    check!(
+        agent.renew_certificate(),
+        23,
+        (),
+        Ok::<(String, String), String>(("certificate".into(), "key".into()))
+    );
+    check!(
+        agent.insert_column_statistics(statistics, 7, 8),
+        5,
+        (statistics, 7_u32, 8_i64),
+        Ok::<(), String>(())
+    );
+    check!(
+        agent.insert_time_series(time_series, 7, 8),
+        7,
+        (time_series, 7_u32, 8_i64),
+        Ok::<(), String>(())
+    );
+    check!(
+        agent.update_clusters(clusters, 7),
+        10,
+        (clusters, 7_u32),
+        Ok::<(), String>(())
+    );
+    check!(
+        agent.update_outliers(outliers, 7, 8),
+        12,
+        (outliers, 7_u32, 8_i64),
+        Ok::<(), String>(())
+    );
+    check!(
+        agent.insert_detection_events(7, 8, events),
+        13,
+        (7_u32, 8_u32, events),
+        Ok::<(), String>(())
+    );
+    check!(
+        agent.insert_data_source(&inserted_source),
+        20,
+        inserted_source,
+        Ok::<u32, String>(2)
+    );
+    check!(
+        agent.get_outliers(7, 8),
+        25,
+        (7_u32, 8_i64),
+        Ok::<Vec<(String, Vec<i64>)>, String>(Vec::new())
+    );
+
+    let reply = bincode::serde::encode_to_vec(
+        Ok::<Option<DataSource>, String>(None),
+        bincode::config::standard(),
+    )
+    .unwrap();
+    let (result, _) = tokio::join!(
+        agent.get_data_source(&DataSourceKey::Id(9)),
+        answer_raw_frame(&manager, &reply)
+    );
+    assert!(result.unwrap().is_none());
+
+    let reply = bincode::serde::encode_to_vec(
+        Err::<Vec<String>, String>("list unavailable".into()),
+        bincode::config::standard(),
+    )
+    .unwrap();
+    let (result, _) = tokio::join!(
+        agent.get_tor_exit_node_list(),
+        answer_raw_frame(&manager, &reply)
+    );
+    assert!(matches!(
+        result,
+        Err(SessionError::RemoteRejection(message)) if message == "list unavailable"
+    ));
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn typed_agent_dai_operations_preserve_legacy_request_codes_and_bodies() {
+    use review_protocol::test;
+
+    let (agent, manager) = agent_with_raw_manager(SessionOptions::legacy_compatible()).await;
+
+    macro_rules! check {
+        ($call:expr, $code:expr, $input:expr, $reply:expr) => {{
+            let expected = bincode::serde::encode_to_vec(
+                (($code as u32).to_le_bytes(), &$input),
+                bincode::config::standard(),
+            )
+            .unwrap();
+            let reply = bincode::serde::encode_to_vec($reply, bincode::config::standard()).unwrap();
+            let (result, request) = tokio::join!($call, answer_raw_frame(&manager, &reply));
+            assert_eq!(request, expected);
+            result.unwrap();
+        }};
+    }
+
+    let sensors = test::dai_sensors();
+    let batch = test::dai_observation_batches().remove(0);
+    let unit = test::dai_range_unit();
+    let day = test::dai_range_days().remove(0);
+    let late = test::dai_range_late();
+
+    check!(
+        agent.get_dai_extractor_config(&sensors),
+        45,
+        sensors,
+        Ok::<review_protocol::types::DaiExtractorConfig, String>(test::dai_extractor_config())
+    );
+    check!(
+        agent.get_dai_cursors(&sensors),
+        46,
+        sensors,
+        Ok::<review_protocol::types::DaiCursors, String>(test::dai_cursors())
+    );
+    check!(
+        agent.send_dai_observations(&batch),
+        47,
+        batch,
+        Ok::<review_protocol::types::DaiStoreAck, String>(test::dai_store_acks().remove(0))
+    );
+    check!(
+        agent.begin_dai_range_day(&unit, 7),
+        48,
+        (&unit, 7_u64),
+        Ok::<review_protocol::types::DaiRangeGrant, String>(test::dai_range_grants().remove(0))
+    );
+    check!(
+        agent.renew_dai_range_day(&unit, 7),
+        49,
+        (&unit, 7_u64),
+        Ok::<Option<i64>, String>(Some(test::DAI_RENEWED_LEASE_END))
+    );
+    check!(
+        agent.send_dai_range_day(&day),
+        50,
+        day,
+        Ok::<review_protocol::types::DaiStoreAck, String>(test::dai_store_acks().remove(0))
+    );
+    check!(
+        agent.report_dai_range_late(&late),
+        51,
+        late,
+        Ok::<Vec<review_protocol::types::DaiRangeMark>, String>(test::dai_range_marks())
+    );
+
+    let reply = bincode::serde::encode_to_vec(
+        Err::<review_protocol::types::DaiStoreAck, String>("store rejected".into()),
+        bincode::config::standard(),
+    )
+    .unwrap();
+    let (result, _) = tokio::join!(
+        agent.send_dai_observations(&batch),
+        answer_raw_frame(&manager, &reply)
+    );
+    assert!(matches!(
+        result,
+        Err(SessionError::RemoteRejection(message)) if message == "store rejected"
+    ));
+}
+
 /// Checks that `agent` refuses both list pulls for `version` without sending
 /// them: the first request `manager` then receives is `get_config`.
 async fn assert_list_pulls_refused_locally(
@@ -1686,13 +2041,13 @@ async fn agent_answers_unserved_and_undecodable_requests_like_the_legacy_dispatc
     let mut reader = FramedReader::new(recv, limit);
     let ((), ()) = tokio::join!(
         async {
-            // `ExclusionList` (15) is served by the legacy dispatcher, not by sessions.
-            writer.start((15_u32.to_le_bytes(), ())).unwrap();
+            // An unknown code is rejected without consuming the stream.
+            writer.start((999_u32.to_le_bytes(), ())).unwrap();
             writer.flush().await.unwrap();
             let answer = reader.read().await.unwrap().unwrap();
             assert_eq!(
                 answer.decode::<Result<(), String>>().unwrap(),
-                Err("unknown request code: 15".to_string())
+                Err("unknown request code: 999".to_string())
             );
             // The stream continues after the unserved code.
             writer
@@ -1742,6 +2097,62 @@ async fn agent_answers_unserved_and_undecodable_requests_like_the_legacy_dispatc
             ));
         }
     );
+}
+
+#[tokio::test]
+async fn agent_list_pushes_reject_trailing_bytes_like_the_legacy_dispatcher() {
+    use oinq::frame::{FramedReader, FramedWriter};
+    use review_protocol::types::{HostNetworkGroup, NetworkListItem};
+
+    let group = HostNetworkGroup {
+        hosts: Vec::new(),
+        networks: vec!["192.0.2.0/24".parse().unwrap()],
+        ip_ranges: Vec::new(),
+    };
+    let body = bincode::serde::encode_to_vec(&group, bincode::config::standard()).unwrap();
+    let (prefix, _) = bincode::serde::decode_from_slice::<Vec<NetworkListItem>, _>(
+        &body,
+        bincode::config::standard(),
+    )
+    .unwrap();
+    assert_eq!(prefix, Vec::<NetworkListItem>::new());
+    let (_, mut incoming, manager, _) = raw_sessions(SessionOptions::legacy_compatible()).await;
+    for code in [15_u32, 16] {
+        let (send, recv) = manager.open_bi().await.unwrap();
+        let limit = FrameLimit::new(1024).unwrap();
+        let mut writer = FramedWriter::new(send, limit);
+        let mut reader = FramedReader::new(recv, limit);
+        let ((), ()) = tokio::join!(
+            async {
+                // A legacy group with no hosts is an empty item-list prefix plus trailing data.
+                let mut frame = code.to_le_bytes().to_vec();
+                frame.extend(&body);
+                writer.start_raw(&frame).unwrap();
+                writer.flush().await.unwrap();
+                assert_eq!(
+                    reader
+                        .read()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .decode::<Result<(), String>>()
+                        .unwrap(),
+                    Err(format!(
+                        "request code {code}: the arguments could not be decoded; the manager and the agent may be built against different review-protocol releases"
+                    ))
+                );
+                assert!(reader.read().await.unwrap().is_none());
+            },
+            async {
+                let mut stream = incoming.accept().await.unwrap();
+                assert!(matches!(
+                    stream.next_command().await,
+                    Err(SessionError::Malformed { .. })
+                ));
+                assert!(stream.next_command().await.is_err());
+            }
+        );
+    }
 }
 
 #[tokio::test]
@@ -1921,6 +2332,905 @@ mod server_integration;
 mod server_processing;
 #[path = "session_transport/server_pushes.rs"]
 mod server_pushes;
+
+#[tokio::test]
+async fn split_report_run_resumes_a_partial_response_frame() {
+    use oinq::frame::{FramedReader, FramedWriter};
+    use review_protocol::types::ReportedRunState;
+    use tokio::io::AsyncWriteExt;
+
+    let (agent, manager) = agent_with_raw_manager(SessionOptions::legacy_compatible()).await;
+    let mut exchange = agent
+        .start_report_run(42, ReportedRunState::Failed, Some("reason"))
+        .await
+        .unwrap();
+    let (send, recv) = manager.accept_bi().await.unwrap();
+    let limit = FrameLimit::new(1024).unwrap();
+    let mut reader = FramedReader::new(recv, limit);
+    let send = FramedWriter::new(send, limit);
+    let request = reader.read().await.unwrap().unwrap();
+    let expected = bincode::serde::encode_to_vec(
+        (
+            42_u32.to_le_bytes(),
+            (42_u32, ReportedRunState::Failed, Some("reason")),
+        ),
+        bincode::config::standard(),
+    )
+    .unwrap();
+    assert_eq!(request.as_bytes(), expected);
+
+    let mut send = send.into_inner();
+    send.write_all(&[0, 0]).await.unwrap();
+    {
+        let response = exchange.response();
+        tokio::pin!(response);
+        assert!(
+            tokio_test::task::spawn(response.as_mut())
+                .poll()
+                .is_pending()
+        );
+    }
+    send.write_all(&[0, 1, 0]).await.unwrap();
+    send.finish().unwrap();
+    exchange.response().await.unwrap();
+    assert!(reader.read().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn split_report_run_response_deadline_is_unknown_and_resumable() {
+    use oinq::frame::{FramedReader, FramedWriter};
+    use review_protocol::types::ReportedRunState;
+
+    let mut options = SessionOptions::legacy_compatible();
+    options.operation_timeout = Some(Duration::from_millis(50));
+    let (agent, manager) = agent_with_raw_manager(options).await;
+    let mut exchange = agent
+        .start_report_run(42, ReportedRunState::Started, None)
+        .await
+        .unwrap();
+    let (send, recv) = manager.accept_bi().await.unwrap();
+    let limit = FrameLimit::new(1024).unwrap();
+    let mut reader = FramedReader::new(recv, limit);
+    let mut writer = FramedWriter::new(send, limit);
+    reader.read().await.unwrap().unwrap();
+    assert!(matches!(
+        exchange.response().await,
+        Err(SessionError::Deadline {
+            certainty: OutcomeCertainty::Unknown,
+            ..
+        })
+    ));
+    let rejection = bincode::serde::encode_to_vec(
+        Err::<(), String>("rejected".into()),
+        bincode::config::standard(),
+    )
+    .unwrap();
+    writer.start_raw(&rejection).unwrap();
+    writer.flush().await.unwrap();
+    writer.into_inner().finish().unwrap();
+    assert!(matches!(
+        exchange.response().await,
+        Err(SessionError::RemoteRejection(message)) if message == "rejected"
+    ));
+}
+
+#[tokio::test]
+async fn dropping_report_run_exchange_aborts_both_directions() {
+    use oinq::frame::FramedReader;
+    use review_protocol::types::ReportedRunState;
+
+    let (agent, manager) = agent_with_raw_manager(SessionOptions::legacy_compatible()).await;
+    let exchange = agent
+        .start_report_run(42, ReportedRunState::Started, None)
+        .await
+        .unwrap();
+    let (send, recv) = manager.accept_bi().await.unwrap();
+    let mut reader = FramedReader::new(recv, FrameLimit::new(1024).unwrap());
+    reader.read().await.unwrap().unwrap();
+    drop(exchange);
+    assert_eq!(send.stopped().await.unwrap().unwrap().get(), 1);
+    let mut recv = reader.into_inner();
+    assert!(recv.read(&mut [0]).await.is_err());
+}
+
+#[tokio::test]
+async fn update_config_command_reaches_agent_request_stream() {
+    let (server, _, _, mut incoming) = sessions(SessionOptions::legacy_compatible()).await;
+    let (result, ()) = tokio::join!(server.send_config_update_cmd(), async {
+        let mut stream = incoming.accept().await.unwrap();
+        let AgentCommand::UpdateConfig { reply, .. } =
+            stream.next_command().await.unwrap().unwrap()
+        else {
+            panic!("wrong request");
+        };
+        reply.respond(Ok(())).await.unwrap();
+        stream.finish().unwrap();
+    });
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn signature_rule_command_reaches_authorized_agent_runner() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use oinq::frame::{FramedReader, FramedWriter};
+    use review_protocol::{
+        auth::{AuthorizationContext, PeerContext},
+        request::Handler,
+        service_id,
+        types::SignatureRules,
+    };
+
+    struct Policy;
+    impl review_protocol::auth::AuthorizerV2 for Policy {
+        fn authorize_with_context(
+            &self,
+            _context: &AuthorizationContext,
+            service: &review_protocol::service_id::ServiceId,
+        ) -> Result<(), review_protocol::auth::AuthorizationError> {
+            assert_eq!(*service, service_id::COMMON_SIGNATURE_RULES);
+            Ok(())
+        }
+    }
+
+    struct CountingHandler(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Handler for CountingHandler {
+        async fn signature_rules(&mut self, rules: SignatureRules) -> Result<(), String> {
+            assert_eq!(rules.revision, 7);
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let rules = SignatureRules {
+        revision: 7,
+        sets: Vec::new(),
+        disabled_rules: Vec::new(),
+    };
+    let (_, mut incoming, manager, _) = raw_sessions(SessionOptions::legacy_compatible()).await;
+    let (send, recv) = manager.open_bi().await.unwrap();
+    let limit = FrameLimit::new(1024).unwrap();
+    let mut writer = FramedWriter::new(send, limit);
+    let mut reader = FramedReader::new(recv, limit);
+    let mut handler = CountingHandler(AtomicUsize::new(0));
+    let context = AuthorizationContext::from_peer_context(&PeerContext::new("manager"));
+    let policy = Policy;
+    let ((), ()) = tokio::join!(
+        async {
+            writer.start((27_u32.to_le_bytes(), &rules)).unwrap();
+            writer.flush().await.unwrap();
+            assert_eq!(
+                reader
+                    .read()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .decode::<Result<(), String>>()
+                    .unwrap(),
+                Ok(())
+            );
+            writer.into_inner().finish().unwrap();
+        },
+        async {
+            incoming
+                .accept()
+                .await
+                .unwrap()
+                .run_authorized(&mut handler, &context, &policy)
+                .await
+                .unwrap();
+        }
+    );
+    assert_eq!(handler.0.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn hog_event_message_wire_shape_is_preserved() {
+    #[derive(serde::Serialize)]
+    enum HogKind {
+        DnsCovertChannel,
+    }
+    #[derive(serde::Serialize)]
+    // Mirrors Hog output::EventMessage, including serde_bytes serialization.
+    struct HogEvent {
+        time: i64,
+        kind: HogKind,
+        #[serde(with = "serde_bytes")]
+        fields: Vec<u8>,
+    }
+    let (server, agent) = connections().await;
+    let info = claims();
+    let (_, agent) = tokio::join!(
+        ServerHandle::from_transport(
+            server.clone(),
+            SessionOptions::legacy_compatible(),
+            ">=0.48.0",
+            "0.49.0"
+        ),
+        AgentHandle::from_transport(agent, SessionOptions::legacy_compatible(), &info),
+    );
+    let (agent, _) = agent.unwrap();
+    let ((), ()) = tokio::join!(
+        async {
+            let mut sender = agent.open_detection_event_stream().await.unwrap();
+            sender
+                .start_serialized(&HogEvent {
+                    time: 1,
+                    kind: HogKind::DnsCovertChannel,
+                    fields: vec![1, 2],
+                })
+                .unwrap();
+            sender.finish().await.unwrap();
+        },
+        async {
+            let mut stream = server.accept_uni().await.unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, [0, 0, 0, 0, 0, 5, 2, 0, 2, 1, 2]);
+        }
+    );
+}
+
+#[tokio::test]
+async fn agent_runner_authorizes_each_command_on_one_stream() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use oinq::frame::{FramedReader, FramedWriter};
+    use review_protocol::{
+        auth::{AuthorizationContext, AuthorizationError, AuthorizerV2, PeerContext},
+        service_id::{self, ServiceId},
+    };
+    struct Policy(AtomicUsize);
+    impl AuthorizerV2 for Policy {
+        fn authorize_with_context(
+            &self,
+            _context: &AuthorizationContext,
+            service: &ServiceId,
+        ) -> Result<(), AuthorizationError> {
+            assert_eq!(*service, service_id::COMMON_UPDATE_CONFIG);
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err(AuthorizationError::new("denied"))
+            }
+        }
+    }
+    struct Handler(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl review_protocol::request::Handler for Handler {
+        async fn update_config(&mut self) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let (_, mut incoming, manager, _) = raw_sessions(SessionOptions::legacy_compatible()).await;
+    let (send, recv) = manager.open_bi().await.unwrap();
+    let limit = FrameLimit::new(1024).unwrap();
+    let mut writer = FramedWriter::new(send, limit);
+    let mut reader = FramedReader::new(recv, limit);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut handler = Handler(calls.clone());
+    let context = AuthorizationContext::from_peer_context(&PeerContext::new("manager"));
+    let policy = Policy(AtomicUsize::new(0));
+    let ((), ()) = tokio::join!(
+        async {
+            for expected in [Ok(()), Err("authorization denied".to_string())] {
+                writer.start((12_u32.to_le_bytes(), ())).unwrap();
+                writer.flush().await.unwrap();
+                assert_eq!(
+                    reader
+                        .read()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .decode::<Result<(), String>>()
+                        .unwrap(),
+                    expected
+                );
+            }
+            writer.into_inner().finish().unwrap();
+        },
+        async {
+            let stream = incoming.accept().await.unwrap();
+            let error = stream
+                .run_authorized(&mut handler, &context, &policy)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                AgentRunError::AuthorizationDenied { service, source }
+                    if service == service_id::COMMON_UPDATE_CONFIG
+                        && source.to_string() == "authorization denied: denied"
+            ));
+            assert_eq!(policy.0.load(Ordering::SeqCst), 2);
+        }
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn agent_runner_immediate_power_denial_is_typed_and_has_no_response() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use oinq::frame::{FramedReader, FramedWriter};
+    use review_protocol::{
+        auth::{AuthorizationContext, AuthorizationError, AuthorizerV2, PeerContext},
+        request::Handler,
+        service_id::{self, ServiceId},
+    };
+
+    struct Policy;
+    impl AuthorizerV2 for Policy {
+        fn authorize_with_context(
+            &self,
+            _context: &AuthorizationContext,
+            service: &ServiceId,
+        ) -> Result<(), AuthorizationError> {
+            assert_eq!(*service, service_id::NODE_POWER_REBOOT);
+            Err(AuthorizationError::new("private policy detail"))
+        }
+    }
+
+    struct CountingHandler(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Handler for CountingHandler {
+        async fn node_power(
+            &mut self,
+            _request: NodePowerRequest,
+        ) -> Result<review_protocol::types::node::NodePowerResponse, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(review_protocol::types::node::NodePowerResponse::Initiated)
+        }
+    }
+
+    let (_, mut incoming, manager, _) = raw_sessions(SessionOptions::legacy_compatible()).await;
+    let (send, recv) = manager.open_bi().await.unwrap();
+    let limit = FrameLimit::new(1024).unwrap();
+    let mut writer = FramedWriter::new(send, limit);
+    let mut reader = FramedReader::new(recv, limit);
+    let mut handler = CountingHandler(AtomicUsize::new(0));
+    let context = AuthorizationContext::from_peer_context(&PeerContext::new("manager"));
+    let policy = Policy;
+    let ((), ()) = tokio::join!(
+        async {
+            writer
+                .start((106_u32.to_le_bytes(), NodePowerRequest::Reboot))
+                .unwrap();
+            writer.flush().await.unwrap();
+            assert!(reader.read().await.unwrap().is_none());
+            writer.into_inner().finish().unwrap();
+        },
+        async {
+            let error = incoming
+                .accept()
+                .await
+                .unwrap()
+                .run_authorized(&mut handler, &context, &policy)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                AgentRunError::AuthorizationDenied { service, source }
+                    if service == service_id::NODE_POWER_REBOOT
+                        && source.to_string() == "authorization denied: private policy detail"
+            ));
+        }
+    );
+    assert_eq!(handler.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn agent_runner_oversized_response_after_handler_is_unknown() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use oinq::frame::{FramedReader, FramedWriter};
+    use review_protocol::{
+        auth::{AuthorizationContext, AuthorizerV2Adapter, NoopAuthorizer, PeerContext},
+        request::Handler,
+        types::node::{NodeHostnameRequest, NodeHostnameResponse},
+    };
+
+    struct HostnameHandler(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Handler for HostnameHandler {
+        async fn node_hostname(
+            &mut self,
+            request: NodeHostnameRequest,
+        ) -> Result<NodeHostnameResponse, String> {
+            assert_eq!(
+                request,
+                NodeHostnameRequest::Set {
+                    hostname: "a".into()
+                }
+            );
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(NodeHostnameResponse::Get {
+                hostname: "x".repeat(128),
+            })
+        }
+    }
+
+    let mut options = SessionOptions::legacy_compatible();
+    options.unary = FrameLimit::new(32).unwrap();
+    let (_, mut incoming, manager, _) = raw_sessions(options).await;
+    let (send, recv) = manager.open_bi().await.unwrap();
+    let limit = FrameLimit::new(1024).unwrap();
+    let mut writer = FramedWriter::new(send, limit);
+    let _reader = FramedReader::new(recv, limit);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut handler = HostnameHandler(calls.clone());
+    let context = AuthorizationContext::from_peer_context(&PeerContext::new("manager"));
+    let policy = AuthorizerV2Adapter::new(NoopAuthorizer);
+    let (result, ()) = tokio::join!(
+        async {
+            incoming
+                .accept()
+                .await
+                .unwrap()
+                .run_authorized(&mut handler, &context, &policy)
+                .await
+        },
+        async {
+            writer
+                .start((
+                    102_u32.to_le_bytes(),
+                    NodeHostnameRequest::Set {
+                        hostname: "a".into(),
+                    },
+                ))
+                .unwrap();
+            writer.flush().await.unwrap();
+            writer.into_inner().finish().unwrap();
+        }
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        result,
+        Err(AgentRunError::Session(SessionError::LimitExceeded {
+            certainty: Some(OutcomeCertainty::Unknown),
+            ..
+        }))
+    ));
+}
+
+#[tokio::test]
+async fn agent_runner_preserves_typed_denial_when_peer_disconnects() {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{Receiver, Sender},
+    };
+
+    use oinq::frame::{FramedReader, FramedWriter};
+    use review_protocol::{
+        auth::{AuthorizationContext, AuthorizationError, AuthorizerV2, PeerContext},
+        request::Handler,
+        service_id::{self, ServiceId},
+    };
+
+    struct Policy {
+        notify: Sender<()>,
+        dropped: Mutex<Receiver<()>>,
+    }
+    impl AuthorizerV2 for Policy {
+        fn authorize_with_context(
+            &self,
+            _context: &AuthorizationContext,
+            service: &ServiceId,
+        ) -> Result<(), AuthorizationError> {
+            assert_eq!(*service, service_id::COMMON_UPDATE_CONFIG);
+            self.notify.send(()).unwrap();
+            self.dropped.lock().unwrap().recv().unwrap();
+            Err(AuthorizationError::new("private policy detail"))
+        }
+    }
+
+    struct CountingHandler(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Handler for CountingHandler {
+        async fn update_config(&mut self) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let (_server_incoming, mut incoming, manager, _node) =
+        raw_sessions(SessionOptions::legacy_compatible()).await;
+    let (send, recv) = manager.open_bi().await.unwrap();
+    let limit = FrameLimit::new(1024).unwrap();
+    let mut writer = FramedWriter::new(send, limit);
+    let reader = FramedReader::new(recv, limit);
+    let (notify, authorized) = std::sync::mpsc::channel();
+    let (dropped, disconnected) = std::sync::mpsc::channel();
+    let connection = std::thread::spawn(move || {
+        authorized.recv().unwrap();
+        drop(manager);
+        dropped.send(()).unwrap();
+    });
+    let policy = Policy {
+        notify,
+        dropped: Mutex::new(disconnected),
+    };
+    let mut handler = CountingHandler(AtomicUsize::new(0));
+    let context = AuthorizationContext::from_peer_context(&PeerContext::new("manager"));
+    let ((), error) = tokio::join!(
+        async {
+            writer.start((12_u32.to_le_bytes(), ())).unwrap();
+            writer.flush().await.unwrap();
+        },
+        async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                incoming
+                    .accept()
+                    .await
+                    .unwrap()
+                    .run_authorized(&mut handler, &context, &policy)
+                    .await
+            })
+            .await
+            .unwrap()
+        }
+    );
+    connection.join().unwrap();
+    drop(writer);
+    drop(reader);
+    assert!(matches!(
+        error,
+        Err(AgentRunError::AuthorizationDenied { service, source })
+            if service == service_id::COMMON_UPDATE_CONFIG
+                && source.to_string() == "authorization denied: private policy detail"
+    ));
+    assert_eq!(handler.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn agent_node_runner_rejects_non_node_commands_drains_package_and_continues() {
+    use oinq::frame::{FramedReader, FramedWriter};
+    use review_protocol::{
+        auth::{AuthorizationContext, AuthorizerV2Adapter, NoopAuthorizer, PeerContext},
+        request::{NodeHandler, PackageReader},
+        types::node::NodePackageResponse,
+    };
+    struct Handler;
+    #[async_trait::async_trait]
+    impl NodeHandler for Handler {
+        async fn node_package_install_preflight(
+            &mut self,
+            _: &NodePackageRequest,
+        ) -> Result<InstallPreflight, String> {
+            Ok(InstallPreflight::Proceed)
+        }
+        async fn node_package_install(
+            &mut self,
+            _: NodePackageRequest,
+            reader: &mut PackageReader<'_>,
+        ) -> Result<NodePackageResponse, String> {
+            assert_eq!((reader.size(), reader.remaining()), (3, 3));
+            let mut chunk = Vec::new();
+            assert!(reader.next_chunk(&mut chunk).await.unwrap());
+            assert_eq!(chunk, b"a");
+            assert_eq!(reader.remaining(), 2);
+            Ok(NodePackageResponse::Done)
+        }
+    }
+    let (_, mut incoming, manager, _) = raw_sessions(SessionOptions::legacy_compatible()).await;
+    let (send, recv) = manager.open_bi().await.unwrap();
+    let limit = FrameLimit::new(4096).unwrap();
+    let mut writer = FramedWriter::new(send, limit);
+    let mut reader = FramedReader::new(recv, limit);
+    let context = AuthorizationContext::from_peer_context(&PeerContext::new("manager"));
+    let policy = AuthorizerV2Adapter::new(NoopAuthorizer);
+    let ((), ()) = tokio::join!(
+        async {
+            for code in [
+                0_u32, 1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 26, 27,
+            ] {
+                writer.start((code.to_le_bytes(), ())).unwrap();
+                writer.flush().await.unwrap();
+                assert_eq!(
+                    reader
+                        .read()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .decode::<Result<(), String>>()
+                        .unwrap(),
+                    Err(format!("unknown request code: {code}"))
+                );
+            }
+            writer
+                .start((109_u32.to_le_bytes(), install_request(3)))
+                .unwrap();
+            writer.flush().await.unwrap();
+            assert_eq!(
+                reader
+                    .read()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .decode::<Result<InstallPreflight, String>>()
+                    .unwrap(),
+                Ok(InstallPreflight::Proceed)
+            );
+            for chunk in [b"a".as_slice(), b"bc".as_slice()] {
+                writer.start_raw(chunk).unwrap();
+                writer.flush().await.unwrap();
+            }
+            assert_eq!(
+                reader
+                    .read()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .decode::<Result<NodePackageResponse, String>>()
+                    .unwrap(),
+                Ok(NodePackageResponse::Done)
+            );
+            writer.start((17_u32.to_le_bytes(), ())).unwrap();
+            writer.flush().await.unwrap();
+            assert_eq!(
+                reader
+                    .read()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .decode::<Result<(), String>>()
+                    .unwrap(),
+                Err("unknown request code: 17".into())
+            );
+            writer.into_inner().finish().unwrap();
+        },
+        async {
+            incoming
+                .accept()
+                .await
+                .unwrap()
+                .run_node_authorized(&mut Handler, &context, &policy)
+                .await
+                .unwrap();
+        }
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn agent_package_reader_preserves_legacy_io_error_kinds() {
+    use std::sync::Mutex;
+
+    use oinq::frame::{FramedReader, FramedWriter};
+    use review_protocol::{
+        auth::{AuthorizationContext, AuthorizerV2Adapter, NoopAuthorizer, PeerContext},
+        request::{NodeHandler, PackageReader},
+        types::node::NodePackageResponse,
+    };
+    use tokio::io::AsyncWriteExt;
+
+    struct Handler(Arc<Mutex<Vec<std::io::ErrorKind>>>);
+    #[async_trait::async_trait]
+    impl NodeHandler for Handler {
+        async fn node_package_install_preflight(
+            &mut self,
+            _: &NodePackageRequest,
+        ) -> Result<InstallPreflight, String> {
+            Ok(InstallPreflight::Proceed)
+        }
+
+        async fn node_package_install(
+            &mut self,
+            _: NodePackageRequest,
+            reader: &mut PackageReader<'_>,
+        ) -> Result<NodePackageResponse, String> {
+            let mut chunk = Vec::new();
+            loop {
+                match reader.next_chunk(&mut chunk).await {
+                    Ok(true) => {}
+                    Ok(false) => panic!("payload ended before the expected error"),
+                    Err(error) => {
+                        self.0.lock().unwrap().push(error.kind());
+                        break;
+                    }
+                }
+            }
+            Err("handler failure".into())
+        }
+    }
+
+    for (size, payload, expected) in [
+        (
+            3_u64,
+            vec![0, 0, 0, 1, b'a'],
+            std::io::ErrorKind::UnexpectedEof,
+        ),
+        (
+            1_u64,
+            vec![0, 0, 0, 2, b'a', b'b'],
+            std::io::ErrorKind::InvalidData,
+        ),
+        (
+            3_u64,
+            vec![0, 0, 0, 2, b'a'],
+            std::io::ErrorKind::UnexpectedEof,
+        ),
+    ] {
+        let (_, mut incoming, manager, _) = raw_sessions(SessionOptions::legacy_compatible()).await;
+        let (send, recv) = manager.open_bi().await.unwrap();
+        let limit = FrameLimit::new(4096).unwrap();
+        let mut writer = FramedWriter::new(send, limit);
+        let mut reader = FramedReader::new(recv, limit);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut handler = Handler(seen.clone());
+        let context = AuthorizationContext::from_peer_context(&PeerContext::new("manager"));
+        let policy = AuthorizerV2Adapter::new(NoopAuthorizer);
+        let (result, ()) = tokio::join!(
+            async {
+                incoming
+                    .accept()
+                    .await
+                    .unwrap()
+                    .run_node_authorized(&mut handler, &context, &policy)
+                    .await
+            },
+            async {
+                writer
+                    .start((109_u32.to_le_bytes(), install_request(size)))
+                    .unwrap();
+                writer.flush().await.unwrap();
+                assert_eq!(
+                    reader
+                        .read()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .decode::<Result<InstallPreflight, String>>()
+                        .unwrap(),
+                    Ok(InstallPreflight::Proceed)
+                );
+                let mut send = writer.into_inner();
+                send.write_all(&payload).await.unwrap();
+                send.finish().unwrap();
+                assert_eq!(
+                    reader
+                        .read()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .decode::<Result<NodePackageResponse, String>>()
+                        .unwrap(),
+                    Err("handler failure".into())
+                );
+            }
+        );
+        result.unwrap();
+        assert_eq!(*seen.lock().unwrap(), [expected]);
+    }
+}
+
+#[tokio::test]
+async fn commands_progress_while_agent_request_and_event_are_open() {
+    use review_protocol::types::node::{NodeHostnameRequest, NodeHostnameResponse};
+    let (server, mut server_incoming, agent, mut agent_incoming) =
+        sessions(SessionOptions::legacy_compatible()).await;
+    let event = detection_event(1.0);
+    let (config, hostname, (), ()) = tokio::join!(
+        agent.get_config(),
+        server.node_hostname(NodeHostnameRequest::Get),
+        async {
+            let mut command = agent_incoming.accept().await.unwrap();
+            let AgentRequest::Hostname { reply, .. } = command.next().await.unwrap().unwrap()
+            else {
+                panic!("expected hostname");
+            };
+            reply
+                .respond(Ok(NodeHostnameResponse::Get {
+                    hostname: "node".into(),
+                }))
+                .await
+                .unwrap();
+            command.finish().unwrap();
+        },
+        async {
+            let mut events = agent.open_detection_event_stream().await.unwrap();
+            events.start(&event).unwrap();
+            events.flush().await.unwrap();
+            let mut answered_config = false;
+            let mut answered_event = false;
+            while !answered_config || !answered_event {
+                match server_incoming.accept().await.unwrap() {
+                    ServerStream::Requests(mut stream) => {
+                        let Some(ServerRequest::GetConfig { reply, .. }) =
+                            stream.next().await.unwrap()
+                        else {
+                            panic!("expected config");
+                        };
+                        reply.respond(Ok("config".into())).await.unwrap();
+                        stream.finish().unwrap();
+                        answered_config = true;
+                    }
+                    ServerStream::DetectionEvents(mut stream) => {
+                        assert!(stream.next().await.unwrap().is_some());
+                        answered_event = true;
+                    }
+                }
+            }
+            events.finish().await.unwrap();
+        }
+    );
+    assert_eq!(config.unwrap(), "config");
+    assert_eq!(
+        hostname.unwrap(),
+        NodeHostnameResponse::Get {
+            hostname: "node".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn event_sender_resumes_after_backpressure() {
+    let (manager, node) = connections().await;
+    let mut options = SessionOptions::legacy_compatible();
+    options.detection_events = FrameLimit::new(32 * 1024 * 1024).unwrap();
+    let info = claims();
+    let (manager_session, agent_session) = tokio::join!(
+        ServerHandle::from_transport(manager.clone(), options.clone(), ">=0.48.0", "0.49.0"),
+        AgentHandle::from_transport(node, options, &info)
+    );
+    let _server = manager_session.unwrap();
+    let (agent, _) = agent_session.unwrap();
+    let mut sender = agent.open_detection_event_stream().await.unwrap();
+    let payload = vec![42_u8; 24 * 1024 * 1024];
+    sender.start_serialized(&payload).unwrap();
+    assert!(sender.start_serialized(&payload).is_err());
+    {
+        let flush = sender.flush();
+        tokio::pin!(flush);
+        assert!(tokio_test::task::spawn(flush.as_mut()).poll().is_pending());
+    }
+    let (result, received) = tokio::join!(
+        async {
+            sender.flush().await.unwrap();
+            sender.finish().await
+        },
+        async {
+            let mut recv = manager.accept_uni().await.unwrap();
+            let mut bytes = Vec::new();
+            recv.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        }
+    );
+    result.unwrap();
+    assert_eq!(&received[..2], &[0, 0]);
+    let decoded: (Vec<u8>, _) =
+        bincode::serde::decode_from_slice(&received[6..], bincode::config::standard()).unwrap();
+    assert_eq!(decoded.0, payload);
+}
+
+#[tokio::test]
+async fn dropping_event_sender_aborts_stream() {
+    let (manager, node) = connections().await;
+    let info = claims();
+    let (server, agent) = tokio::join!(
+        ServerHandle::from_transport(
+            manager.clone(),
+            SessionOptions::legacy_compatible(),
+            ">=0.48.0",
+            "0.49.0"
+        ),
+        AgentHandle::from_transport(node, SessionOptions::legacy_compatible(), &info)
+    );
+    let _server = server.unwrap();
+    let (agent, _) = agent.unwrap();
+    let sender = agent.open_detection_event_stream().await.unwrap();
+    let mut recv = manager.accept_uni().await.unwrap();
+    drop(sender);
+    let mut bytes = Vec::new();
+    assert!(recv.read_to_end(&mut bytes).await.is_err());
+}
 
 /// Endpoint lookup and both filter senders preserve arguments and classify refusals.
 #[cfg(feature = "test-support")]

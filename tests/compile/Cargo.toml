@@ -7,7 +7,7 @@ publish = false
 [workspace]
 
 [features]
-client = ["review-protocol/client"]
+client = ["review-protocol/client", "dep:rustls"]
 server = ["review-protocol/server", "dep:rustls"]
 test-support = ["client", "server", "review-protocol/test-support"]
 legacy = ["client", "server", "dep:quinn", "dep:anyhow"]

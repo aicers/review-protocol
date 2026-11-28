@@ -32,6 +32,106 @@ pub async fn agent(
     Ok(())
 }
 
+#[cfg(feature = "client")]
+pub async fn dial_agent(
+    tls: std::sync::Arc<rustls::ClientConfig>,
+    bind: std::net::SocketAddr,
+    remote: std::net::SocketAddr,
+    info: &AgentInfo,
+) -> Result<(), review_protocol::session::SessionError> {
+    use review_protocol::session::{AgentConnector, AgentTransportOptions, ApplicationCode};
+    let connector = AgentConnector::bind(bind, tls, AgentTransportOptions::default(), options())?;
+    let (handle, _incoming) = connector.connect(remote, "manager.example", info).await?;
+    let _: String = handle.get_config().await?;
+    handle.close(ApplicationCode::new(0).expect("zero fits"), b"done");
+    connector.wait_idle().await;
+    Ok(())
+}
+
+#[cfg(feature = "client")]
+pub async fn dial_agent_from_socket(
+    socket: std::net::UdpSocket,
+    tls: std::sync::Arc<rustls::ClientConfig>,
+    remote: std::net::SocketAddr,
+    info: &AgentInfo,
+) -> Result<(), review_protocol::session::SessionError> {
+    use review_protocol::session::{AgentConnector, AgentTransportOptions};
+    let connector =
+        AgentConnector::from_socket(socket, tls, AgentTransportOptions::default(), options())?;
+    let (handle, _incoming) = connector.connect(remote, "manager.example", info).await?;
+    let _local = handle.local_addr()?;
+    handle.close(
+        review_protocol::session::ApplicationCode::new(0).expect("zero fits"),
+        b"done",
+    );
+    connector.wait_idle().await;
+    Ok(())
+}
+
+#[cfg(feature = "client")]
+pub fn original_agent_request_name(
+    request: &review_protocol::session::AgentRequest,
+) -> &'static str {
+    use review_protocol::session::AgentRequest;
+    match request {
+        AgentRequest::TrainModel { .. } => "train",
+        AgentRequest::CloneModel { .. } => "clone",
+        AgentRequest::CancelRun { .. } => "cancel",
+        AgentRequest::RunDetectorOnce { .. } => "run",
+        AgentRequest::SignatureRules { .. } => "signature",
+        AgentRequest::Service { .. } => "service",
+        AgentRequest::NetworkInterface { .. } => "network",
+        AgentRequest::Hostname { .. } => "hostname",
+        AgentRequest::TimeSync { .. } => "time",
+        AgentRequest::Logging { .. } => "logging",
+        AgentRequest::RemoteAccess { .. } => "remote",
+        AgentRequest::Observation { .. } => "observation",
+        AgentRequest::Version { .. } => "version",
+        AgentRequest::Enroll { .. } => "enroll",
+        AgentRequest::Power { .. } => "power",
+        AgentRequest::Package { .. } => "package",
+    }
+}
+
+#[cfg(feature = "client")]
+pub async fn complete_agent_commands(
+    stream: &mut review_protocol::session::AgentRequestStream,
+) -> Result<(), review_protocol::session::SessionError> {
+    use review_protocol::session::AgentCommand;
+    if let Some(AgentCommand::UpdateConfig { reply, .. }) = stream.next_command().await? {
+        reply.respond(Ok(())).await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "client")]
+pub async fn typed_agent_operations(
+    handle: &review_protocol::session::AgentHandle,
+) -> Result<(), review_protocol::session::SessionError> {
+    use review_protocol::types::{DataSourceKey, ReportedRunState};
+    let _: Option<review_protocol::types::DataSource> =
+        handle.get_data_source(&DataSourceKey::Id(1)).await?;
+    let _: std::collections::HashSet<Vec<String>> = handle.get_indicator("indicator").await?;
+    handle.get_internal_network_list().await?;
+    handle.get_labeldb_patterns(&[]).await?;
+    handle.get_tor_exit_node_list().await?;
+    handle.get_trusted_domain_list().await?;
+    handle.get_trusted_user_agent_list().await?;
+    handle.get_time_series_generation_policy_list().await?;
+    handle.renew_certificate().await?;
+    handle.insert_column_statistics(&[], 1, 2).await?;
+    handle.insert_time_series(&[], 1, 2).await?;
+    handle.update_clusters(&[], 1).await?;
+    handle.update_outliers(&[], 1, 2).await?;
+    handle.insert_detection_events(1, 2, &[]).await?;
+    handle.get_outliers(1, 2).await?;
+    handle.get_dai_cursors(&[]).await?;
+    let mut report = handle
+        .start_report_run(1, ReportedRunState::Started, None)
+        .await?;
+    report.response().await
+}
+
 #[cfg(feature = "server")]
 pub async fn server(
     connection: review_protocol::session::Connection,
@@ -215,6 +315,56 @@ pub fn exhaustive_session_error(error: review_protocol::session::SessionError) {
 
 #[cfg(feature = "server")]
 pub mod listener;
+
+#[cfg(feature = "client")]
+pub async fn serve_agent_commands<H: review_protocol::request::Handler>(
+    incoming: &mut review_protocol::session::AgentIncoming,
+    handler: &mut H,
+    context: &review_protocol::auth::AuthorizationContext,
+    policy: &dyn review_protocol::auth::AuthorizerV2,
+) -> Result<(), review_protocol::session::AgentRunError> {
+    incoming
+        .accept()
+        .await?
+        .run_authorized(handler, context, policy)
+        .await
+}
+
+#[cfg(feature = "client")]
+pub fn package_reader_auto_traits(reader: &review_protocol::request::PackageReader<'_>) {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<review_protocol::request::PackageReader<'_>>();
+    let _ = (reader.size(), reader.remaining());
+}
+
+#[cfg(feature = "client")]
+pub async fn receive_package(
+    reply: review_protocol::session::PackageReply<'_>,
+) -> Result<Vec<u8>, review_protocol::session::SessionError> {
+    use review_protocol::types::node::{InstallPreflight, NodePackageResponse};
+    let _ = reply.size();
+    let _ = reply.remaining();
+    let mut payload = Vec::new();
+    if let Some(mut transfer) = reply.preflight(Ok(InstallPreflight::Proceed)).await? {
+        let mut chunk = Vec::new();
+        while transfer.next_chunk(&mut chunk).await? {
+            payload.extend_from_slice(&chunk);
+        }
+        transfer.respond(Ok(NodePackageResponse::Done)).await?;
+    }
+    Ok(payload)
+}
+
+#[cfg(feature = "client")]
+pub async fn send_event(
+    handle: &review_protocol::session::AgentHandle,
+    event: &review_protocol::types::DetectionEvent,
+) -> Result<(), review_protocol::session::SessionError> {
+    let mut sender = handle.open_detection_event_stream().await?;
+    sender.start(event)?;
+    sender.flush().await?;
+    sender.finish().await
+}
 
 /// Endpoint schema and host classification need no transport feature.
 pub fn endpoint_schema(

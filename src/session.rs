@@ -25,6 +25,19 @@
 //! identity, handshake metadata, certificates, and closure. They do not expose
 //! protocol streams.
 //!
+//! With the client feature, `AgentConnector::bind` or `AgentConnector::from_socket`
+//! accepts caller-owned TLS policy, transport windows, and explicit session limits.
+//! `connect` takes the server name used for TLS verification and the complete agent
+//! handshake claims. Established sessions retain endpoint resources after the
+//! connector is dropped. Use `local_addr`, `close`, and `wait_idle` for endpoint
+//! lifecycle management; applications own reconnect timing and retries.
+//!
+//! `AgentHandle::start_report_run` sends a report and returns an owned exchange;
+//! its response can be awaited later and a cancelled read can be resumed. A
+//! transmitted mutation may have an unknown outcome after transport failure.
+//! `PackageReply::size` and `remaining` expose the declared and unread payload
+//! byte counts for an install.
+//!
 //! With the server feature, use `ServerListener::bind` or
 //! `ServerListener::from_socket` with application-supplied rustls configuration,
 //! transport options, frame budgets, an explicit protocol window, and a handshake
@@ -73,10 +86,17 @@
 //! one cancel-safe accept call.
 //!
 //! Request streams provide `next`, returning a typed invocation or `None` at clean
-//! EOF. Each invocation borrows its stream through a single-use `Reply` or
+//! EOF. `AgentRequestStream::next_command` additionally exposes legacy flat commands
+//! through `AgentCommand`; `next` and `AgentRequest` retain their original surface.
+//! Each invocation borrows its stream through a single-use `Reply` or
 //! `PackageReply`; respond before reading another request on that stream. A reply
 //! does not close the stream. Match each domain request, apply authorization before
 //! every handler invocation, and respond with `Ok(typed_value)` or `Err(remote_text)`.
+//! `AgentRequestStream::run_authorized` binds an application-supplied authenticated
+//! context and `AuthorizerV2`, checks each invocation using its logical service, and
+//! dispatches to an existing `request::Handler`. `run_node_authorized` accepts a
+//! node-only handler. Handshake capabilities are peer claims and grant no access.
+//! The runner drains unread package payload before the terminal response.
 //! For immediate reboot/shutdown, invoke the handler and call
 //! `Reply::complete_without_response` because those operations expect no reply.
 //!
@@ -361,6 +381,8 @@
 //! Existing applications can continue using the legacy API. A migration selects
 //! limits based on real payload requirements and uses a released foundation.
 
+#[cfg(feature = "client")]
+mod connector;
 mod events;
 
 mod exchange;
@@ -382,6 +404,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "client")]
+pub use connector::{AgentConnector, AgentTransportOptions};
 #[cfg(feature = "server")]
 pub use listener::{
     PendingSession, ProtocolWindow, ServerListener, ServerListenerOptions, ServerSessionClose,
@@ -394,7 +418,10 @@ pub use oinq::{
 };
 pub use operations::Reply;
 #[cfg(feature = "client")]
-pub use operations::{AgentIncoming, AgentRequest, AgentRequestStream, PackageReply};
+pub use operations::{
+    AgentCommand, AgentIncoming, AgentRequest, AgentRequestStream, AgentRunError, PackageReply,
+    ReportRunExchange,
+};
 #[cfg(feature = "server")]
 pub use operations::{
     ServerIncoming, ServerRequest, ServerRequestOutcome, ServerRequestStream, ServerStream,
@@ -721,6 +748,16 @@ macro_rules! handle_metadata {
             #[must_use]
             pub fn remote_addr(&self) -> std::net::SocketAddr {
                 self.0.connection.remote_addr()
+            }
+            /// Returns this connection's bound local address.
+            ///
+            /// # Errors
+            /// Returns a classified socket inspection error.
+            pub fn local_addr(&self) -> Result<std::net::SocketAddr, SessionError> {
+                self.0
+                    .connection
+                    .local_addr()
+                    .map_err(|error| SessionError::transport(error, OutcomeCertainty::NotSent))
             }
             /// Waits for typed close information; cancelling this wait leaves the connection open.
             pub async fn closed(&self) -> CloseReason {

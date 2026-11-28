@@ -128,16 +128,43 @@ impl HandlerError {
 /// chunk sizes, only on having received exactly `size` bytes in total.
 #[derive(Debug)]
 pub struct PackageReader<'a> {
-    recv: &'a mut quinn::RecvStream,
+    recv: PackageSource<'a>,
     size: u64,
     remaining: u64,
     failed: bool,
 }
 
+enum PackageSource<'a> {
+    Legacy(&'a mut quinn::RecvStream),
+    Session(&'a mut dyn SessionPackageSource),
+}
+
+impl std::fmt::Debug for PackageSource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PackageSource")
+    }
+}
+
+pub(crate) trait SessionPackageSource: Send + Sync {
+    fn next_chunk<'a>(
+        &'a mut self,
+        buf: &'a mut Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<bool>> + Send + 'a>>;
+}
+
 impl<'a> PackageReader<'a> {
     fn new(recv: &'a mut quinn::RecvStream, size: u64) -> Self {
         Self {
-            recv,
+            recv: PackageSource::Legacy(recv),
+            size,
+            remaining: size,
+            failed: false,
+        }
+    }
+
+    pub(crate) fn from_session(source: &'a mut dyn SessionPackageSource, size: u64) -> Self {
+        Self {
+            recv: PackageSource::Session(source),
             size,
             remaining: size,
             failed: false,
@@ -199,9 +226,16 @@ impl PackageReader<'_> {
 
     /// Reads one chunk and accounts for it against `remaining`.
     async fn read_chunk(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
-        oinq::frame::recv_raw(self.recv, buf)
-            .await
-            .map_err(truncated_payload)?;
+        match &mut self.recv {
+            PackageSource::Legacy(recv) => oinq::frame::recv_raw(recv, buf)
+                .await
+                .map_err(truncated_payload)?,
+            PackageSource::Session(source) => {
+                if !source.next_chunk(buf).await? {
+                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                }
+            }
+        }
         let len =
             u64::try_from(buf.len()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         if len > self.remaining {
