@@ -1,8 +1,7 @@
 //! Owned detection event framing with retained header and frame progress.
-#[cfg(feature = "server")]
 use std::sync::Arc;
 
-use oinq::{ApplicationCode, frame::FrameLimit};
+use oinq::ApplicationCode;
 #[cfg(feature = "server")]
 use oinq::{RecvStream, frame::FramedReader};
 #[cfg(feature = "client")]
@@ -12,9 +11,11 @@ use tokio::io::AsyncReadExt;
 #[cfg(feature = "client")]
 use tokio::io::AsyncWriteExt;
 
-use super::{OutcomeCertainty, SessionError};
+use super::FrameLimit;
 #[cfg(feature = "server")]
-use super::{ServerRunError, Shared};
+use super::ServerRunError;
+use super::Shared;
+use super::{OutcomeCertainty, SessionError};
 
 fn abort_code() -> ApplicationCode {
     ApplicationCode::new(1).expect("exchange abort code fits 62 bits")
@@ -32,7 +33,7 @@ pub struct DetectionEventReceiver {
     /// The session this stream was accepted on. The stream can outlive every
     /// other session owner, so it keeps the session, which repeats a
     /// listener-wide close when it drops last.
-    _session: Arc<Shared>,
+    session: Arc<Shared>,
 }
 
 #[cfg(feature = "server")]
@@ -44,7 +45,7 @@ impl DetectionEventReceiver {
             header: [0; 2],
             header_pos: 0,
             limit,
-            _session: session,
+            session,
         }
     }
     /// Processes this detection event stream with a server detection event
@@ -121,25 +122,29 @@ impl DetectionEventReceiver {
             let count = recv
                 .read(&mut self.header[self.header_pos..])
                 .await
-                .map_err(|e| SessionError::transport(e, OutcomeCertainty::Unknown))?;
+                .map_err(|e| {
+                    SessionError::transport(e, OutcomeCertainty::Unknown)
+                        .on_connection(&self.session.connection)
+                })?;
             if count == 0 {
                 return Err(SessionError::transport(
                     std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
                     OutcomeCertainty::Unknown,
-                ));
+                )
+                .on_connection(&self.session.connection));
             }
             self.header_pos += count;
         }
         if let Some(recv) = self.raw.take() {
-            self.reader = Some(FramedReader::new(recv, self.limit));
+            self.reader = Some(FramedReader::new(recv, self.limit.wire()));
         }
         let reader = self.reader.as_mut().ok_or_else(|| {
             SessionError::frame(oinq::frame::FrameError::Poisoned, OutcomeCertainty::Unknown)
         })?;
-        let Some(frame) = reader
-            .read()
-            .await
-            .map_err(|e| SessionError::frame(e, OutcomeCertainty::Unknown))?
+        let Some(frame) = reader.read().await.map_err(|e| {
+            SessionError::frame(e, OutcomeCertainty::Unknown)
+                .on_connection(&self.session.connection)
+        })?
         else {
             return Ok(Ok(None));
         };
@@ -148,9 +153,10 @@ impl DetectionEventReceiver {
             &super::decode::Budget::new(self.limit.get()),
         )
         .map(|(event, _)| Some(event));
-        reader
-            .recycle(frame.into_bytes())
-            .map_err(|e| SessionError::frame(e, OutcomeCertainty::Unknown))?;
+        reader.recycle(frame.into_bytes()).map_err(|e| {
+            SessionError::frame(e, OutcomeCertainty::Unknown)
+                .on_connection(&self.session.connection)
+        })?;
         Ok(event)
     }
     fn abort(&mut self) {
@@ -173,6 +179,7 @@ impl Drop for DetectionEventReceiver {
 /// resumption.
 #[cfg(feature = "client")]
 pub struct DetectionEventSender {
+    session: Arc<Shared>,
     raw: Option<SendStream>,
     writer: Option<FramedWriter<SendStream>>,
     header_pos: usize,
@@ -180,8 +187,9 @@ pub struct DetectionEventSender {
 }
 #[cfg(feature = "client")]
 impl DetectionEventSender {
-    pub(super) fn new(send: SendStream, limit: FrameLimit) -> Self {
+    pub(super) fn new(send: SendStream, limit: FrameLimit, session: Arc<Shared>) -> Self {
         Self {
+            session,
             raw: Some(send),
             writer: None,
             header_pos: 0,
@@ -210,7 +218,10 @@ impl DetectionEventSender {
                 SessionError::frame(oinq::frame::FrameError::Pending, OutcomeCertainty::NotSent)
             })?
             .start(event)
-            .map_err(|e| SessionError::frame(e, OutcomeCertainty::NotSent))
+            .map_err(|e| {
+                SessionError::frame(e, OutcomeCertainty::NotSent)
+                    .on_connection(&self.session.connection)
+            })
     }
     /// Flushes the protocol header or pending event; cancelling retains all progress.
     /// # Errors
@@ -227,20 +238,21 @@ impl DetectionEventSender {
             let send = self.raw.as_mut().ok_or_else(|| {
                 SessionError::frame(oinq::frame::FrameError::Poisoned, OutcomeCertainty::Unknown)
             })?;
-            let count = send
-                .write(&[0, 0][self.header_pos..])
-                .await
-                .map_err(|e| SessionError::transport(e, OutcomeCertainty::Unknown))?;
+            let count = send.write(&[0, 0][self.header_pos..]).await.map_err(|e| {
+                SessionError::transport(e, OutcomeCertainty::Unknown)
+                    .on_connection(&self.session.connection)
+            })?;
             if count == 0 {
                 return Err(SessionError::transport(
                     std::io::Error::from(std::io::ErrorKind::WriteZero),
                     OutcomeCertainty::Unknown,
-                ));
+                )
+                .on_connection(&self.session.connection));
             }
             self.header_pos += count;
         }
         if let Some(send) = self.raw.take() {
-            self.writer = Some(FramedWriter::new(send, self.limit));
+            self.writer = Some(FramedWriter::new(send, self.limit.wire()));
         }
         self.writer
             .as_mut()
@@ -249,7 +261,10 @@ impl DetectionEventSender {
             })?
             .flush()
             .await
-            .map_err(|e| SessionError::frame(e, OutcomeCertainty::Unknown))
+            .map_err(|e| {
+                SessionError::frame(e, OutcomeCertainty::Unknown)
+                    .on_connection(&self.session.connection)
+            })
     }
     /// Finishes the stream after all prepared bytes have been flushed.
     /// # Errors
@@ -260,7 +275,8 @@ impl DetectionEventSender {
             let mut send = writer.into_inner();
             if let Err(error) = send.finish() {
                 let _ = send.reset(abort_code());
-                return Err(SessionError::transport(error, OutcomeCertainty::Unknown));
+                return Err(SessionError::transport(error, OutcomeCertainty::Unknown)
+                    .on_connection(&self.session.connection));
             }
         }
         Ok(())
@@ -289,13 +305,12 @@ impl super::AgentHandle {
     /// Returns classified transport or deadline errors. Cancelling aborts an opened stream.
     pub async fn open_detection_event_stream(&self) -> Result<DetectionEventSender, SessionError> {
         let operation = async {
-            let send = self
-                .0
-                .connection
-                .open_uni()
-                .await
-                .map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent))?;
-            let mut sender = DetectionEventSender::new(send, self.0.options.detection_events);
+            let send = self.0.connection.open_uni().await.map_err(|e| {
+                SessionError::transport(e, OutcomeCertainty::NotSent)
+                    .on_connection(&self.0.connection)
+            })?;
+            let mut sender =
+                DetectionEventSender::new(send, self.0.options.detection_events, self.0.clone());
             sender.flush().await?;
             Ok(sender)
         };

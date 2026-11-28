@@ -10,10 +10,12 @@ use std::{
     time::Duration,
 };
 
+use oinq::frame::FrameLimit;
 use review_protocol::{
     PROTOCOL_VERSION,
     session::{
-        ApplicationCode, FrameLimit, OutcomeCertainty, ServerHandle, SessionError, SessionOptions,
+        ApplicationCode, FrameLimit as SessionFrameLimit, OutcomeCertainty, ServerHandle,
+        SessionError, SessionOptions,
     },
     types::{
         CounterpartScope, CustomerDataDeletionRequest, EndpointRole, GroupByUnit, HostNetworkGroup,
@@ -299,7 +301,7 @@ async fn network_list_pushes_refuse_an_agent_advertising_0_49_0() {
 #[tokio::test]
 async fn oversized_push_is_not_sent() {
     let mut options = SessionOptions::legacy_compatible();
-    options.unary = FrameLimit::new(64).unwrap();
+    options.unary = SessionFrameLimit::new(64).unwrap();
     let (server, agent) = raw_agent(options, PROTOCOL_VERSION).await;
     let long = vec![item(1, &"x".repeat(64), Vec::new())];
     let error = server.send_exclusion_list(&long).await.unwrap_err();
@@ -361,7 +363,7 @@ async fn push_without_a_reply_is_unknown() {
         let (_send, recv) = agent.accept_bi().await.unwrap();
         let mut reader = FramedReader::new(recv, FrameLimit::new(1024).unwrap());
         reader.read().await.unwrap().unwrap();
-        agent.close(ApplicationCode::default(), b"read and left");
+        agent.close(oinq::ApplicationCode::default(), b"read and left");
     });
     let error = result.unwrap_err();
     assert_eq!(

@@ -1,4 +1,4 @@
-//! An external consumer fixture; the session surface imports no Quinn types.
+//! An external consumer fixture; sessions need neither oinq nor Quinn dependencies.
 use review_protocol::{AgentInfo, types::node::NodePowerRequest};
 
 pub fn schema(info: AgentInfo) -> (AgentInfo, NodePowerRequest) {
@@ -15,13 +15,15 @@ pub fn options() -> review_protocol::session::SessionOptions {
 
 #[cfg(feature = "client")]
 pub async fn agent(
-    connection: review_protocol::session::Connection,
+    connector: &review_protocol::session::AgentConnector,
+    remote: std::net::SocketAddr,
     info: &AgentInfo,
 ) -> Result<(), review_protocol::session::SessionError> {
     use review_protocol::session::{AgentHandle, AgentRequest};
-    let (handle, mut incoming) = AgentHandle::from_transport(connection, options(), info).await?;
+    let (handle, mut incoming) = connector.connect(remote, "manager.example", info).await?;
     let _clone: AgentHandle = handle.clone();
     let _identity = handle.id();
+    let _close = handle.close_reason();
     let _chain = handle.peer_certificates();
     let _config: String = handle.get_config().await?;
     let mut stream = incoming.accept().await?;
@@ -134,11 +136,19 @@ pub async fn typed_agent_operations(
 
 #[cfg(feature = "server")]
 pub async fn server(
-    connection: review_protocol::session::Connection,
+    listener: &review_protocol::session::ServerListener,
+    context: review_protocol::auth::AuthorizationContext,
+    policy: std::sync::Arc<dyn review_protocol::auth::AuthorizerV2>,
 ) -> Result<(), review_protocol::session::SessionError> {
     use review_protocol::session::{ServerHandle, ServerRequest, ServerStream};
-    let (handle, mut incoming) =
-        ServerHandle::from_transport(connection, options(), ">=0.48.0", "0.49.0").await?;
+    let unadmitted = listener
+        .accept()
+        .await?
+        .expect("listener is accepting")
+        .handshake()
+        .await?;
+    let (handle, mut incoming) = unadmitted.admit(context, policy);
+    let _close = handle.close_reason();
     let _clone: ServerHandle = handle.clone();
     let _metadata = handle.metadata();
     let _outcome = handle.node_power(NodePowerRequest::GracefulReboot).await?;
@@ -399,4 +409,37 @@ pub async fn endpoint_senders(
     legacy.report_training_filter(7, training).await?;
     legacy.report_round_filter(-3, "host", round).await?;
     Ok(())
+}
+
+#[cfg(any(feature = "client", feature = "server"))]
+pub fn classify(error: review_protocol::session::SessionError) {
+    use review_protocol::session::{CloseReason, SessionError, TransportCloseKind, TransportFailure};
+    if let SessionError::Transport { source, .. } = error {
+        match source {
+            TransportFailure::Closed {
+                reason: CloseReason::Application { code, reason },
+                ..
+            } => {
+                let _ = (code.get(), reason);
+            }
+            TransportFailure::Closed {
+                reason: CloseReason::Local,
+                ..
+            } => {}
+            TransportFailure::Closed {
+                reason: CloseReason::Transport(kind),
+                ..
+            } => match kind {
+                TransportCloseKind::Crypto { alert } => {
+                    let _: Option<u8> = alert;
+                }
+                TransportCloseKind::IdleTimeout
+                | TransportCloseKind::Reset
+                | TransportCloseKind::VersionMismatch
+                | TransportCloseKind::ConnectionIdExhausted
+                | TransportCloseKind::Other => {}
+            },
+            TransportFailure::StreamFailed(_) | TransportFailure::Other(_) => {}
+        }
+    }
 }

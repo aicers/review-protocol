@@ -71,12 +71,10 @@
 //! `ServerIncoming::accept_next` reports clean exhaustion as `None`.
 //! `ServerListener::wait_idle` waits for transport shutdown.
 //!
-//! The lower-level `from_transport` constructors still take an established
-//! `Connection`. To use them, construct an oinq `Endpoint` with the application's
-//! rustls configuration and `TransportOptions`. Endpoint, owned awaitable
-//! `Incoming`, connection, options, checked `ApplicationCode`, and structured
-//! transport errors remain re-exported from `session`.
-//!
+//! Connections are established through `AgentConnector` and `ServerListener`.
+//! Session limits, application close codes, close reasons and transport failure
+//! classifications are owned by this crate. `close_reason` inspects closure
+//! synchronously; `closed` waits for the same reason asynchronously.
 //!
 //! With `server`, `ServerIncoming::accept` returns a `ServerStream` containing
 //! either a request stream or an event receiver. With `client`, `AgentIncoming::accept`
@@ -165,7 +163,7 @@
 //! `finish` after the final reply. Borrowed framing reads can be suspended and
 //! resumed while their owners are kept.
 //!
-//! Retain a handle while serving requests. Connection clones share a transport
+//! Retain a handle while serving requests. Handle clones share a transport
 //! connection and retain endpoint resources; streams retain connection resources.
 //! Concurrent acceptors on clones of the underlying transport compete for streams;
 //! they do not broadcast. Construct each session once per connection. The unique
@@ -237,6 +235,19 @@
 //! are never used to infer structured wire errors. Typed domain failures, including
 //! package and enrollment refusals, remain typed response values.
 //!
+//! `SessionError::Transport` carries `TransportFailure`: a closed connection's
+//! `CloseReason`, a failed stream on an open connection, or another transport/I/O
+//! failure. Close reasons distinguish peer application codes and reason bytes,
+//! local closure, and `TransportCloseKind` (TLS alerts, idle timeout, reset,
+//! version mismatch, connection-ID exhaustion, or other). The connection's
+//! observed close state takes precedence over the individual stream error.
+//! `AgentHandle::close_reason` and `ServerHandle::close_reason` inspect that state
+//! without waiting; `closed` awaits the same owned reason type.
+//! If TLS establishment fails before a connection is available, only structured
+//! transport-close details can be classified. A peer application close during
+//! that phase is reported as `TransportFailure::Other` because the transport
+//! does not expose its application code or reason on the connect error.
+//!
 //! `certainty()` supplies these outcomes where applicable:
 //!
 //! | Certainty | Meaning |
@@ -282,29 +293,27 @@
 //!
 //! ## Runtime and transport policy
 //!
-//! Oinq 0.14.0 endpoints require an entered Tokio runtime with I/O and time enabled,
-//! including socket-based constructors. Endpoint constructors take caller-supplied
-//! rustls configurations; no configuration or selected transport option is replaced
-//! by these session constructors.
+//! Connector and listener construction requires an entered Tokio runtime with
+//! I/O and time enabled, including socket-based constructors. They take
+//! caller-supplied rustls configurations and preserve the selected transport policy.
 //!
-//! Oinq transport defaults are no keepalive, a 30-second idle timeout, 100 incoming
+//! Transport defaults are no keepalive, a 30-second idle timeout, 100 incoming
 //! streams per direction, a 1,250,000-byte stream receive window, and 10,000,000-byte
 //! connection receive and send windows. Idle timeouts are truncated to milliseconds;
 //! `None` or less than one millisecond disables the local timeout. Keepalive must be
 //! positive and shorter than an enabled truncated idle timeout. The peers negotiate
 //! the effective idle timeout. These settings are independent of frame budgets and
-//! operation deadlines. Pass the application's chosen `TransportOptions` directly
-//! to `Endpoint`; sessions do not silently tune flow control or stream counts.
+//! operation deadlines. Select `AgentTransportOptions` or `ServerTransportOptions`
+//! explicitly; sessions do not silently tune flow control or stream counts.
 //!
-//! Each `endpoint.accept().await` yields an independently owned `Incoming` attempt;
-//! awaiting a failed attempt does not terminate endpoint acceptance.
-//! `set_server_config` affects future connections. `close` is immediate, and
-//! `wait_idle` waits for transport shutdown, not application draining. A stream's
-//! `finish` queues FIN. `stopped` reports peer stop or data/FIN acknowledgment and
-//! makes no application-processing guarantee. A rejected session handshake retains
-//! its transport until the peer stops the stream or rejection bytes/FIN are
-//! acknowledged (or its configured deadline expires), because the failed constructor
-//! returns no session handle.
+//! Each `ServerListener::accept` yields an independently owned `PendingSession`;
+//! a failed handshake does not terminate listener acceptance. `reload_tls` affects
+//! future connections. `close` is immediate, and `wait_idle` waits for transport
+//! shutdown, not application draining. Queuing FIN or receiving a transport
+//! acknowledgment makes no application-processing guarantee. A rejected session
+//! handshake retains its transport until the peer stops the stream or rejection
+//! bytes/FIN are acknowledged (or its configured deadline expires), because the
+//! failed handshake returns no session handle.
 //!
 //! ## Wire and rollout compatibility
 //!
@@ -395,6 +404,7 @@ mod handshake;
 #[cfg(feature = "server")]
 mod listener;
 mod operations;
+mod transport;
 
 use std::{
     sync::{
@@ -411,11 +421,6 @@ pub use listener::{
     PendingSession, ProtocolWindow, ServerListener, ServerListenerOptions, ServerSessionClose,
     ServerSessionControl, ServerTransportOptions, UnadmittedSession,
 };
-pub use oinq::frame::{FrameError, FrameLimit};
-pub use oinq::{
-    ApplicationCode, CloseInfo as CloseReason, Connection, Endpoint, Incoming, TransportError,
-    TransportErrorKind, TransportOptions,
-};
 pub use operations::Reply;
 #[cfg(feature = "client")]
 pub use operations::{
@@ -428,6 +433,11 @@ pub use operations::{
     UnhandledServerRequest,
 };
 use thiserror::Error;
+use transport::SessionConnection;
+pub use transport::{
+    ApplicationCode, CloseReason, FrameError, FrameLimit, FramePart, InvalidApplicationCode,
+    TransportCloseKind, TransportFailure,
+};
 
 /// The certainty of a failed operation's domain outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -448,7 +458,7 @@ pub enum SessionError {
     Transport {
         certainty: OutcomeCertainty,
         #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: TransportFailure,
     },
     /// Invalid local or received protocol data.
     #[error("malformed protocol data: {source}")]
@@ -572,30 +582,6 @@ impl SessionError {
         }
         self
     }
-
-    pub(crate) fn transport(
-        source: impl std::error::Error + Send + Sync + 'static,
-        certainty: OutcomeCertainty,
-    ) -> Self {
-        Self::Transport {
-            certainty,
-            source: Box::new(source),
-        }
-    }
-
-    pub(crate) fn frame(source: FrameError, certainty: OutcomeCertainty) -> Self {
-        match source {
-            FrameError::TooLarge { .. } | FrameError::InvalidLimit => Self::LimitExceeded {
-                certainty: Some(certainty),
-                source,
-            },
-            FrameError::Io(_) => Self::transport(source, certainty),
-            _ => Self::Malformed {
-                certainty: Some(certainty),
-                source: Box::new(source),
-            },
-        }
-    }
 }
 
 /// Required per-family payload and conservative allocation budgets.
@@ -664,7 +650,7 @@ pub enum HandshakeMetadata {
 
 #[derive(Debug)]
 struct Shared {
-    connection: Connection,
+    connection: SessionConnection,
     options: SessionOptions,
     id: SessionId,
     metadata: HandshakeMetadata,
@@ -680,7 +666,7 @@ struct Shared {
 
 impl Shared {
     fn new(
-        connection: Connection,
+        connection: SessionConnection,
         options: SessionOptions,
         metadata: HandshakeMetadata,
         network_list_blocker: Option<String>,
@@ -761,11 +747,16 @@ macro_rules! handle_metadata {
             }
             /// Waits for typed close information; cancelling this wait leaves the connection open.
             pub async fn closed(&self) -> CloseReason {
-                self.0.connection.closed().await
+                CloseReason::from_wire(self.0.connection.closed().await)
+            }
+            /// Returns the close reason immediately, or `None` while the connection is open.
+            #[must_use]
+            pub fn close_reason(&self) -> Option<CloseReason> {
+                transport::close_reason(&self.0.connection)
             }
             /// Immediately closes the shared connection with a checked code and uninterpreted reason.
             pub fn close(&self, code: ApplicationCode, reason: &[u8]) {
-                self.0.connection.close(code, reason);
+                self.0.connection.close(code.wire(), reason);
             }
         }
     };

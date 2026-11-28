@@ -5,13 +5,15 @@
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
+use oinq::{Connection, Endpoint, TransportOptions, frame::FrameLimit};
 use review_protocol::{
     AgentInfo, PROTOCOL_VERSION,
     session::{
-        AgentCommand, AgentHandle, AgentIncoming, AgentRequest, AgentRunError, ApplicationCode,
-        CloseReason, Connection, DetectionEventReceiver, Endpoint, FrameLimit, OutcomeCertainty,
-        ServerHandle, ServerIncoming, ServerRequest, ServerRequestStream, ServerStream,
-        SessionError, SessionOptions, TransportOptions,
+        AgentCommand, AgentConnector, AgentHandle, AgentIncoming, AgentRequest, AgentRunError,
+        AgentTransportOptions, ApplicationCode, CloseReason, DetectionEventReceiver,
+        FrameLimit as SessionFrameLimit, OutcomeCertainty, ProtocolWindow, ServerHandle,
+        ServerIncoming, ServerListener, ServerListenerOptions, ServerRequest, ServerRequestStream,
+        ServerStream, ServerTransportOptions, SessionError, SessionOptions,
     },
     types::{
         ManifestFormatRange, Status,
@@ -67,7 +69,11 @@ fn claims() -> AgentInfo {
     }
 }
 
-async fn connections() -> (Connection, Connection) {
+fn tls() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
+    tls_with_client(true)
+}
+
+fn tls_with_client(trusted: bool) -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let der = CertificateDer::from(cert.cert);
     let key = cert.signing_key.serialize_der();
@@ -89,34 +95,85 @@ async fn connections() -> (Connection, Connection) {
             PrivatePkcs8KeyDer::from(key.clone()).into(),
         )
         .unwrap();
+    let (client_der, client_key) = if trusted {
+        (der, key)
+    } else {
+        let cert = rcgen::generate_simple_self_signed(vec!["untrusted-agent".into()]).unwrap();
+        (
+            CertificateDer::from(cert.cert),
+            cert.signing_key.serialize_der(),
+        )
+    };
     let client_tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_root_certificates(roots)
-        .with_client_auth_cert(vec![der], PrivatePkcs8KeyDer::from(key).into())
+        .with_client_auth_cert(
+            vec![client_der],
+            PrivatePkcs8KeyDer::from(client_key).into(),
+        )
         .unwrap();
-    let options = TransportOptions {
-        max_concurrent_bidi_streams: 7,
-        ..TransportOptions::default()
-    };
-    let server = Endpoint::server(
-        Arc::new(server_tls),
+    (Arc::new(server_tls), Arc::new(client_tls))
+}
+
+fn listener(
+    tls: Arc<rustls::ServerConfig>,
+    options: SessionOptions,
+    requirement: &str,
+    version: &str,
+) -> ServerListener {
+    ServerListener::bind(
         "127.0.0.1:0".parse().unwrap(),
-        options.clone(),
+        tls,
+        ServerListenerOptions {
+            transport: ServerTransportOptions {
+                max_concurrent_bidi_streams: 7,
+                ..ServerTransportOptions::default()
+            },
+            session: options,
+            protocol: ProtocolWindow::new(requirement, version).unwrap(),
+            handshake_timeout: Duration::from_secs(10),
+        },
+    )
+    .unwrap()
+}
+
+async fn accept_session(
+    listener: &ServerListener,
+) -> Result<(ServerHandle, ServerIncoming), SessionError> {
+    let unadmitted = listener.accept().await?.unwrap().handshake().await?;
+    Ok(unadmitted.admit(
+        server_processing::context(),
+        Arc::new(server_processing::Policy::default()),
+    ))
+}
+
+async fn connect_sessions(
+    server_options: SessionOptions,
+    agent_options: SessionOptions,
+    requirement: &str,
+    version: &str,
+    info: &AgentInfo,
+) -> (
+    Result<(ServerHandle, ServerIncoming), SessionError>,
+    Result<(AgentHandle, AgentIncoming), SessionError>,
+) {
+    let (server_tls, client_tls) = tls();
+    let listener = listener(server_tls, server_options, requirement, version);
+    let connector = AgentConnector::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        client_tls,
+        AgentTransportOptions {
+            max_concurrent_bidi_streams: 7,
+            ..AgentTransportOptions::default()
+        },
+        agent_options,
     )
     .unwrap();
-    let client = Endpoint::client(
-        Arc::new(client_tls),
-        "127.0.0.1:0".parse().unwrap(),
-        options,
+    tokio::join!(
+        accept_session(&listener),
+        connector.connect(listener.local_addr().unwrap(), "localhost", info)
     )
-    .unwrap();
-    let (accepted, connected) = tokio::join!(
-        async { server.accept().await.unwrap().await.unwrap() },
-        client.connect(server.local_addr().unwrap(), "localhost")
-    );
-    // Connections retain their endpoint resources after these endpoint handles drop.
-    (accepted, connected.unwrap())
 }
 
 async fn sessions(
@@ -125,47 +182,107 @@ async fn sessions(
     sessions_at(options, "0.49.0").await
 }
 
-/// Connects like [`sessions`], with the agent advertising `version` and the
-/// manager replying with `version` as its ceiling.
 async fn sessions_at(
     options: SessionOptions,
     version: &str,
 ) -> (ServerHandle, ServerIncoming, AgentHandle, AgentIncoming) {
-    let (server, agent) = connections().await;
-    let mut claims = claims();
-    claims.protocol_version = version.into();
-    let (server, agent) = tokio::join!(
-        ServerHandle::from_transport(server, options.clone(), ">=0.48.0", version),
-        AgentHandle::from_transport(agent, options, &claims)
-    );
+    let mut info = claims();
+    info.protocol_version = version.into();
+    let (server, agent) =
+        connect_sessions(options.clone(), options, ">=0.48.0", version, &info).await;
     let (server, server_incoming) = server.unwrap();
     let (agent, agent_incoming) = agent.unwrap();
     (server, server_incoming, agent, agent_incoming)
 }
 
-/// Connects a manager session to an agent transport whose streams the test
-/// answers by hand, with the agent advertising `version` and the manager
-/// replying with `version` as its ceiling.
+/// Performs the normal agent handshake directly for deliberately abnormal peers.
+async fn raw_agent_handshake(connection: &Connection, info: &AgentInfo) {
+    let (send, recv) = connection.open_bi().await.unwrap();
+    let limit = oinq::frame::FrameLimit::new(4096).unwrap();
+    let mut writer = oinq::frame::FramedWriter::new(send, limit);
+    writer.start(info).unwrap();
+    writer.flush().await.unwrap();
+    let mut reader = oinq::frame::FramedReader::new(recv, limit);
+    let response = reader
+        .read()
+        .await
+        .unwrap()
+        .unwrap()
+        .decode::<Result<String, String>>()
+        .unwrap();
+    assert!(response.is_ok(), "{response:?}");
+    writer.into_inner().finish().unwrap();
+}
+
+async fn raw_agent_setup(
+    options: SessionOptions,
+    version: &str,
+    transport: TransportOptions,
+) -> (
+    Result<(ServerHandle, ServerIncoming), SessionError>,
+    Connection,
+) {
+    let (server_tls, client_tls) = tls();
+    let listener = listener(server_tls, options, ">=0.48.0", version);
+    let endpoint = Endpoint::client(client_tls, "127.0.0.1:0".parse().unwrap(), transport).unwrap();
+    let mut info = claims();
+    info.protocol_version = version.into();
+    let (server, node) = tokio::join!(accept_session(&listener), async {
+        let node = endpoint
+            .connect(listener.local_addr().unwrap(), "localhost")
+            .await
+            .unwrap();
+        raw_agent_handshake(&node, &info).await;
+        node
+    });
+    (server, node)
+}
+
 async fn raw_agent(options: SessionOptions, version: &str) -> (ServerHandle, Connection) {
-    let (server, agent) = connections().await;
-    let mut claims = claims();
-    claims.protocol_version = version.into();
-    let (server, _) = tokio::join!(
-        ServerHandle::from_transport(server, options.clone(), ">=0.48.0", version),
-        AgentHandle::from_transport(agent.clone(), options, &claims)
+    let (server, node) = raw_agent_setup(options, version, TransportOptions::default()).await;
+    (server.unwrap().0, node)
+}
+
+async fn raw_manager(
+    options: SessionOptions,
+    version: &str,
+    info: &AgentInfo,
+) -> (Connection, (AgentHandle, AgentIncoming)) {
+    let (server_tls, client_tls) = tls();
+    let endpoint = Endpoint::server(
+        server_tls,
+        "127.0.0.1:0".parse().unwrap(),
+        TransportOptions::default(),
+    )
+    .unwrap();
+    let connector = AgentConnector::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        client_tls,
+        AgentTransportOptions::default(),
+        options,
+    )
+    .unwrap();
+    let (manager, agent) = tokio::join!(
+        async {
+            let manager = endpoint.accept().await.unwrap().await.unwrap();
+            let (send, recv) = manager.accept_bi().await.unwrap();
+            let limit = oinq::frame::FrameLimit::new(4096).unwrap();
+            let mut reader = oinq::frame::FramedReader::new(recv, limit);
+            reader.read().await.unwrap().unwrap();
+            let mut writer = oinq::frame::FramedWriter::new(send, limit);
+            writer.start(Ok::<_, String>(version)).unwrap();
+            writer.flush().await.unwrap();
+            writer.into_inner().finish().unwrap();
+            manager
+        },
+        connector.connect(endpoint.local_addr().unwrap(), "localhost", info)
     );
-    (server.unwrap().0, agent)
+    (manager, agent.unwrap())
 }
 
 async fn agent_with_raw_manager(options: SessionOptions) -> (AgentHandle, Connection) {
-    let (manager, node) = connections().await;
-    let claims = claims();
-    let (server, agent) = tokio::join!(
-        ServerHandle::from_transport(manager.clone(), options.clone(), ">=0.48.0", "0.49.0"),
-        AgentHandle::from_transport(node, options, &claims)
-    );
-    let _server = server.unwrap().0;
-    (agent.unwrap().0, manager)
+    let (manager, (agent, _)) = raw_manager(options, "0.49.0", &claims()).await;
+    (agent, manager)
 }
 
 async fn request_stream(incoming: &mut ServerIncoming) -> ServerRequestStream {
@@ -217,7 +334,7 @@ async fn identity_claims_close_and_domain_errors() {
 #[tokio::test]
 async fn large_configuration_and_model_transfers() {
     let mut options = SessionOptions::legacy_compatible();
-    options.unary = FrameLimit::new(32 * 1024 * 1024).unwrap();
+    options.unary = SessionFrameLimit::new(32 * 1024 * 1024).unwrap();
     let (_, mut incoming, agent, _) = sessions(options).await;
     let model = vec![42_u8; 8 * 1024 * 1024];
     let config = "x".repeat(4 * 1024 * 1024);
@@ -252,27 +369,33 @@ async fn large_configuration_and_model_transfers() {
 #[tokio::test]
 async fn oversized_header_rejected_without_waiting_for_payload() {
     let mut options = SessionOptions::legacy_compatible();
-    options.unary = FrameLimit::new(32).unwrap();
-    let (server, agent) = connections().await;
-    let ((), (agent, _)) = tokio::join!(
+    options.unary = SessionFrameLimit::new(32).unwrap();
+    let (server_tls, client_tls) = tls();
+    let listener = listener(server_tls, options, ">=0.48.0", "0.49.0");
+    let endpoint = Endpoint::client(
+        client_tls,
+        "127.0.0.1:0".parse().unwrap(),
+        TransportOptions::default(),
+    )
+    .unwrap();
+    let ((), agent) = tokio::join!(
         async {
-            let (_, mut incoming) =
-                ServerHandle::from_transport(server, options.clone(), ">=0.48.0", "0.49.0")
-                    .await
-                    .unwrap();
+            let (_, mut incoming) = accept_session(&listener).await.unwrap();
             let mut stream = request_stream(&mut incoming).await;
-            let error = stream.next().await.err().unwrap();
-            assert!(matches!(error, SessionError::LimitExceeded { .. }));
+            assert!(matches!(
+                stream.next().await,
+                Err(SessionError::LimitExceeded { .. })
+            ));
         },
         async {
-            let (handle, incoming) =
-                AgentHandle::from_transport(agent.clone(), options.clone(), &claims())
-                    .await
-                    .unwrap();
-            let (mut send, _recv) = agent.open_bi().await.unwrap();
+            let agent = endpoint
+                .connect(listener.local_addr().unwrap(), "localhost")
+                .await
+                .unwrap();
+            raw_agent_handshake(&agent, &claims()).await;
+            let (mut send, recv) = agent.open_bi().await.unwrap();
             send.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
-            // There is no payload; a reader waiting for it would hang.
-            (handle, incoming)
+            (agent, send, recv)
         }
     );
     drop(agent);
@@ -312,28 +435,13 @@ async fn abandoning_outbound_exchange_resets_and_stops_both_directions() {
 
 #[tokio::test]
 async fn retained_request_stream_resumes_partial_frame() {
-    let (server, agent) = connections().await;
-    let ((_, mut incoming), _) = tokio::join!(
-        async {
-            ServerHandle::from_transport(
-                server,
-                SessionOptions::legacy_compatible(),
-                ">=0.48.0",
-                "0.49.0",
-            )
-            .await
-            .unwrap()
-        },
-        async {
-            AgentHandle::from_transport(
-                agent.clone(),
-                SessionOptions::legacy_compatible(),
-                &claims(),
-            )
-            .await
-            .unwrap()
-        }
-    );
+    let (server, agent) = raw_agent_setup(
+        SessionOptions::legacy_compatible(),
+        "0.49.0",
+        TransportOptions::default(),
+    )
+    .await;
+    let (_, mut incoming) = server.unwrap();
     let (mut send, recv) = agent.open_bi().await.unwrap();
     send.write_all(&[0, 0]).await.unwrap();
     let mut stream = request_stream(&mut incoming).await;
@@ -480,7 +588,7 @@ fn install_request(size: u64) -> NodePackageRequest {
 async fn install_transfer_stops_at_size_and_truncation_aborts() {
     use review_protocol::{server::node::InstallOutcome, types::node::NodePackageResponse};
     let mut options = SessionOptions::legacy_compatible();
-    options.package_chunks = FrameLimit::new(1024).unwrap();
+    options.package_chunks = SessionFrameLimit::new(1024).unwrap();
     let (server, _, _, mut incoming) = sessions(options).await;
     let bytes = vec![7; 4096];
     let mut source = std::io::Cursor::new(bytes.clone());
@@ -551,18 +659,16 @@ async fn install_transfer_stops_at_size_and_truncation_aborts() {
 
 #[tokio::test]
 async fn caller_selected_handshake_window_accepts_previous_protocol() {
-    let (server, agent) = connections().await;
     let mut info = claims();
     info.protocol_version = "0.48.0".into();
-    let (manager, node) = tokio::join!(
-        ServerHandle::from_transport(
-            server,
-            SessionOptions::legacy_compatible(),
-            ">=0.48.0",
-            "0.49.0"
-        ),
-        AgentHandle::from_transport(agent, SessionOptions::legacy_compatible(), &info)
-    );
+    let (manager, node) = connect_sessions(
+        SessionOptions::legacy_compatible(),
+        SessionOptions::legacy_compatible(),
+        ">=0.48.0",
+        "0.49.0",
+        &info,
+    )
+    .await;
     let (manager, _) = manager.unwrap();
     node.unwrap();
     assert!(
@@ -572,18 +678,16 @@ async fn caller_selected_handshake_window_accepts_previous_protocol() {
 
 #[tokio::test]
 async fn handshake_version_rejection_is_structured_on_both_sides() {
-    let (server, agent) = connections().await;
     let mut info = claims();
     info.protocol_version = "0.48.0".into();
-    let (manager, node) = tokio::join!(
-        ServerHandle::from_transport(
-            server,
-            SessionOptions::legacy_compatible(),
-            ">=0.49.0",
-            "0.49.0"
-        ),
-        AgentHandle::from_transport(agent, SessionOptions::legacy_compatible(), &info)
-    );
+    let (manager, node) = connect_sessions(
+        SessionOptions::legacy_compatible(),
+        SessionOptions::legacy_compatible(),
+        ">=0.49.0",
+        "0.49.0",
+        &info,
+    )
+    .await;
     assert!(
         matches!(manager, Err(SessionError::IncompatibleProtocol { version, required }) if version == "0.48.0" && required == ">=0.49.0, <=0.49.0")
     );
@@ -595,15 +699,10 @@ async fn handshake_version_rejection_is_structured_on_both_sides() {
 #[tokio::test]
 async fn nested_response_allocations_are_classified_as_limits() {
     let mut options = SessionOptions::legacy_compatible();
-    options.unary = FrameLimit::new(1024).unwrap();
-    let (manager, node) = connections().await;
+    options.unary = SessionFrameLimit::new(1024).unwrap();
     let info = claims();
-    let (_manager_session, node_session) = tokio::join!(
-        ServerHandle::from_transport(manager.clone(), options.clone(), ">=0.48.0", "0.49.0"),
-        AgentHandle::from_transport(node, options, &info)
-    );
-    let (node, _) = node_session.unwrap();
-    let (result, ()) = tokio::join!(node.get_model_names(), async {
+    let (manager, (agent, _)) = raw_manager(options, "0.49.0", &info).await;
+    let (result, ()) = tokio::join!(agent.get_model_names(), async {
         let (send, recv) = manager.accept_bi().await.unwrap();
         let mut reader = oinq::frame::FramedReader::new(recv, FrameLimit::new(4096).unwrap());
         reader.read().await.unwrap().unwrap();
@@ -618,7 +717,7 @@ async fn nested_response_allocations_are_classified_as_limits() {
     assert!(matches!(
         result,
         Err(SessionError::LimitExceeded {
-            source: oinq::frame::FrameError::Decode(_),
+            source: review_protocol::session::FrameError::Decode(_),
             ..
         })
     ));
@@ -661,18 +760,13 @@ async fn event_stream_round_trip_and_resumption() {
 
 #[tokio::test]
 async fn retained_event_header_and_payload_resume_after_cancellation() {
-    let (manager, node) = connections().await;
-    let info = claims();
-    let (manager_session, _node_session) = tokio::join!(
-        ServerHandle::from_transport(
-            manager,
-            SessionOptions::legacy_compatible(),
-            ">=0.48.0",
-            "0.49.0"
-        ),
-        AgentHandle::from_transport(node.clone(), SessionOptions::legacy_compatible(), &info)
-    );
-    let (_, mut incoming) = manager_session.unwrap();
+    let (server, node) = raw_agent_setup(
+        SessionOptions::legacy_compatible(),
+        "0.49.0",
+        TransportOptions::default(),
+    )
+    .await;
+    let (_, mut incoming) = server.unwrap();
     let mut send = node.open_uni().await.unwrap();
     send.write_all(&[0]).await.unwrap();
     let mut sequence = event_stream(&mut incoming).await;
@@ -701,21 +795,20 @@ async fn retained_event_header_and_payload_resume_after_cancellation() {
 
 #[tokio::test]
 async fn timeout_while_waiting_for_stream_credit_is_not_sent() {
-    let (manager, node) = connections().await;
     let mut options = SessionOptions::legacy_compatible();
     options.operation_timeout = Some(Duration::from_secs(1));
-    let info = claims();
-    let (manager_session, _node_session) = tokio::join!(
-        ServerHandle::from_transport(manager.clone(), options, ">=0.48.0", "0.49.0"),
-        AgentHandle::from_transport(node, SessionOptions::legacy_compatible(), &info)
-    );
-    let (server, _) = manager_session.unwrap();
-    let mut held = Vec::new();
-    // The endpoint helper deliberately selects seven incoming bidi streams.
-    for _ in 0..7 {
-        held.push(manager.open_bi().await.unwrap());
-    }
+    let (server, _peer) = raw_agent_setup(
+        options,
+        "0.49.0",
+        TransportOptions {
+            max_concurrent_bidi_streams: 0,
+            ..TransportOptions::default()
+        },
+    )
+    .await;
     let error = server
+        .unwrap()
+        .0
         .node_power(NodePowerRequest::GracefulReboot)
         .await
         .unwrap_err();
@@ -731,47 +824,57 @@ async fn timeout_while_waiting_for_stream_credit_is_not_sent() {
 
 #[tokio::test]
 async fn handshake_limit_and_base_only_wire_compatibility() {
-    let (manager, node) = connections().await;
-    let (accepted, ()) = tokio::join!(
-        ServerHandle::from_transport(
-            manager,
-            SessionOptions::legacy_compatible(),
-            ">=0.48.0",
-            "0.49.0"
-        ),
-        async {
-            let (send, recv) = node.open_bi().await.unwrap();
-            let mut writer = oinq::frame::FramedWriter::new(send, FrameLimit::new(4096).unwrap());
-            writer
-                .start_raw(include_bytes!("fixtures/0.21.0/handshake-base.bin"))
-                .unwrap();
-            writer.flush().await.unwrap();
-            let mut reader = oinq::frame::FramedReader::new(recv, FrameLimit::new(4096).unwrap());
-            assert_eq!(
-                reader
-                    .read()
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .decode::<Result<String, String>>()
-                    .unwrap(),
-                Ok("0.49.0".into())
-            );
-        }
+    let (server_tls, client_tls) = tls();
+    let listener = listener(
+        server_tls,
+        SessionOptions::legacy_compatible(),
+        ">=0.48.0",
+        "0.49.0",
     );
+    let endpoint = Endpoint::client(
+        client_tls,
+        "127.0.0.1:0".parse().unwrap(),
+        TransportOptions::default(),
+    )
+    .unwrap();
+    let (accepted, ()) = tokio::join!(accept_session(&listener), async {
+        let node = endpoint
+            .connect(listener.local_addr().unwrap(), "localhost")
+            .await
+            .unwrap();
+        let (send, recv) = node.open_bi().await.unwrap();
+        let mut writer = oinq::frame::FramedWriter::new(send, FrameLimit::new(4096).unwrap());
+        writer
+            .start_raw(include_bytes!("fixtures/0.21.0/handshake-base.bin"))
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mut reader = oinq::frame::FramedReader::new(recv, FrameLimit::new(4096).unwrap());
+        assert_eq!(
+            reader
+                .read()
+                .await
+                .unwrap()
+                .unwrap()
+                .decode::<Result<String, String>>()
+                .unwrap(),
+            Ok("0.49.0".into())
+        );
+    });
     let (handle, _) = accepted.unwrap();
     assert!(
         matches!(handle.metadata(), review_protocol::session::HandshakeMetadata::Agent(info) if info.capabilities.is_empty())
     );
 
-    let (manager, node) = connections().await;
     let mut options = SessionOptions::legacy_compatible();
-    options.handshake = FrameLimit::new(8).unwrap();
-    let info = claims();
-    let (manager_result, node_result) = tokio::join!(
-        ServerHandle::from_transport(manager, options, ">=0.48.0", "0.49.0"),
-        AgentHandle::from_transport(node, SessionOptions::legacy_compatible(), &info)
-    );
+    options.handshake = SessionFrameLimit::new(8).unwrap();
+    let (manager_result, node_result) = connect_sessions(
+        options,
+        SessionOptions::legacy_compatible(),
+        ">=0.48.0",
+        "0.49.0",
+        &claims(),
+    )
+    .await;
     assert!(matches!(
         manager_result,
         Err(SessionError::LimitExceeded { .. })
@@ -792,14 +895,19 @@ async fn raw_sessions_at(
     options: SessionOptions,
     version: &str,
 ) -> (ServerIncoming, AgentIncoming, Connection, Connection) {
-    let (manager, node) = connections().await;
+    let (server, node) = raw_agent_setup(
+        options.clone(),
+        version,
+        TransportOptions {
+            max_concurrent_bidi_streams: 7,
+            ..TransportOptions::default()
+        },
+    )
+    .await;
     let mut info = claims();
     info.protocol_version = version.into();
-    let (server, agent) = tokio::join!(
-        ServerHandle::from_transport(manager.clone(), options.clone(), ">=0.48.0", version),
-        AgentHandle::from_transport(node.clone(), options, &info),
-    );
-    (server.unwrap().1, agent.unwrap().1, manager, node)
+    let (manager, (_agent, agent_incoming)) = raw_manager(options, version, &info).await;
+    (server.unwrap().1, agent_incoming, manager, node)
 }
 
 #[tokio::test]
@@ -860,8 +968,8 @@ async fn agent_request_stream_continues_after_install_and_immediate_power() {
         NodeHostnameRequest, NodeHostnameResponse, NodePackageResponse,
     };
     let mut options = SessionOptions::legacy_compatible();
-    options.unary = FrameLimit::new(4096).unwrap();
-    options.package_chunks = FrameLimit::new(1).unwrap();
+    options.unary = SessionFrameLimit::new(4096).unwrap();
+    options.package_chunks = SessionFrameLimit::new(1).unwrap();
     let (_, mut incoming, manager, _) = raw_sessions(options).await;
     let (send, recv) = manager.open_bi().await.unwrap();
     let limit = FrameLimit::new(4096).unwrap();
@@ -1572,21 +1680,9 @@ async fn list_pulls_reject_legacy_host_network_group_reply() {
     );
 
     let options = SessionOptions::legacy_compatible();
-    let (manager, node) = connections().await;
     let mut info = claims();
     info.protocol_version = PROTOCOL_VERSION.into();
-    let (server, agent) = tokio::join!(
-        ServerHandle::from_transport(
-            manager.clone(),
-            options.clone(),
-            ">=0.48.0",
-            PROTOCOL_VERSION
-        ),
-        AgentHandle::from_transport(node, options, &info),
-    );
-    // Keep the manager session alive without accepting its streams.
-    let _server = server.unwrap();
-    let (agent, _) = agent.unwrap();
+    let (manager, (agent, _)) = raw_manager(options, PROTOCOL_VERSION, &info).await;
     for pull_watchlist in [false, true] {
         let ((), result) = tokio::join!(
             async {
@@ -1954,20 +2050,9 @@ async fn assert_list_pulls_refused_locally(
 async fn list_pulls_refuse_an_agent_advertising_0_49_0() {
     assert_legacy_list_reply_decodes_in_full();
     let options = SessionOptions::legacy_compatible();
-    let (manager, node) = connections().await;
     let info = claims();
     assert_eq!(info.protocol_version, "0.49.0");
-    let (server, agent) = tokio::join!(
-        ServerHandle::from_transport(
-            manager.clone(),
-            options.clone(),
-            ">=0.48.0",
-            PROTOCOL_VERSION
-        ),
-        AgentHandle::from_transport(node, options, &info),
-    );
-    let _server = server.unwrap();
-    let (agent, _) = agent.unwrap();
+    let (manager, (agent, _)) = raw_manager(options, "0.49.0", &info).await;
     assert_list_pulls_refused_locally(&agent, &manager, "0.49.0").await;
 }
 
@@ -1975,27 +2060,11 @@ async fn list_pulls_refuse_an_agent_advertising_0_49_0() {
 /// before sending them when the manager's handshake reply is `0.49.0`.
 #[tokio::test]
 async fn list_pulls_refuse_a_manager_replying_0_49_0() {
-    use oinq::frame::{FramedReader, FramedWriter};
-
     assert_legacy_list_reply_decodes_in_full();
-    let options = SessionOptions::legacy_compatible();
-    let (manager, node) = connections().await;
     let mut info = claims();
     info.protocol_version = PROTOCOL_VERSION.into();
-    let ((), agent) = tokio::join!(
-        async {
-            let (send, recv) = manager.accept_bi().await.unwrap();
-            let limit = FrameLimit::new(4096).unwrap();
-            let mut reader = FramedReader::new(recv, limit);
-            reader.read().await.unwrap().unwrap();
-            let mut writer = FramedWriter::new(send, limit);
-            writer.start(Ok::<_, String>("0.49.0".to_string())).unwrap();
-            writer.flush().await.unwrap();
-            writer.into_inner().finish().unwrap();
-        },
-        AgentHandle::from_transport(node, options, &info),
-    );
-    let (agent, _) = agent.unwrap();
+    let (manager, (agent, _)) =
+        raw_manager(SessionOptions::legacy_compatible(), "0.49.0", &info).await;
     assert_list_pulls_refused_locally(&agent, &manager, "0.49.0").await;
 }
 
@@ -2224,7 +2293,7 @@ async fn undecodable_event_leaves_the_stream_aligned() {
 async fn install_failure_is_answered_after_draining_the_payload() {
     use review_protocol::types::node::NodePackageResponse;
     let mut options = SessionOptions::legacy_compatible();
-    options.package_chunks = FrameLimit::new(1024).unwrap();
+    options.package_chunks = SessionFrameLimit::new(1024).unwrap();
     let (server, _, _, mut incoming) = sessions(options).await;
     let mut source = std::io::Cursor::new(vec![3; 4000]);
     let (result, ()) = tokio::join!(
@@ -2257,16 +2326,9 @@ async fn install_failure_is_answered_after_draining_the_payload() {
 async fn undecodable_or_oversized_response_after_sending_is_unknown() {
     use oinq::frame::{FramedReader, FramedWriter};
     let mut options = SessionOptions::legacy_compatible();
-    options.unary = FrameLimit::new(64).unwrap();
-    let (manager, node) = connections().await;
+    options.unary = SessionFrameLimit::new(64).unwrap();
     let info = claims();
-    let (server, agent) = tokio::join!(
-        ServerHandle::from_transport(manager.clone(), options.clone(), ">=0.48.0", "0.49.0"),
-        AgentHandle::from_transport(node, options, &info),
-    );
-    // Keep the manager session alive without accepting its streams.
-    let _server = server.unwrap();
-    let (agent, _) = agent.unwrap();
+    let (manager, (agent, _)) = raw_manager(options, "0.49.0", &info).await;
     for response in [vec![7_u8], vec![0; 65]] {
         let (result, ()) = tokio::join!(agent.get_config(), async {
             let (send, recv) = manager.accept_bi().await.unwrap();
@@ -2295,7 +2357,7 @@ async fn undecodable_or_oversized_response_after_sending_is_unknown() {
 async fn incomplete_install_cannot_send_a_terminal_success() {
     use review_protocol::types::node::NodePackageResponse;
     let mut options = SessionOptions::legacy_compatible();
-    options.package_chunks = FrameLimit::new(1024).unwrap();
+    options.package_chunks = SessionFrameLimit::new(1024).unwrap();
     let (server, _, _, mut incoming) = sessions(options).await;
     let (result, ()) = tokio::join!(
         server.node_package_install(install_request(4000), std::io::Cursor::new(vec![3; 4000])),
@@ -2539,18 +2601,8 @@ async fn hog_event_message_wire_shape_is_preserved() {
         #[serde(with = "serde_bytes")]
         fields: Vec<u8>,
     }
-    let (server, agent) = connections().await;
-    let info = claims();
-    let (_, agent) = tokio::join!(
-        ServerHandle::from_transport(
-            server.clone(),
-            SessionOptions::legacy_compatible(),
-            ">=0.48.0",
-            "0.49.0"
-        ),
-        AgentHandle::from_transport(agent, SessionOptions::legacy_compatible(), &info),
-    );
-    let (agent, _) = agent.unwrap();
+    let (server, (agent, _)) =
+        raw_manager(SessionOptions::legacy_compatible(), "0.49.0", &claims()).await;
     let ((), ()) = tokio::join!(
         async {
             let mut sender = agent.open_detection_event_stream().await.unwrap();
@@ -2755,7 +2807,7 @@ async fn agent_runner_oversized_response_after_handler_is_unknown() {
     }
 
     let mut options = SessionOptions::legacy_compatible();
-    options.unary = FrameLimit::new(32).unwrap();
+    options.unary = SessionFrameLimit::new(32).unwrap();
     let (_, mut incoming, manager, _) = raw_sessions(options).await;
     let (send, recv) = manager.open_bi().await.unwrap();
     let limit = FrameLimit::new(1024).unwrap();
@@ -3172,16 +3224,10 @@ async fn commands_progress_while_agent_request_and_event_are_open() {
 
 #[tokio::test]
 async fn event_sender_resumes_after_backpressure() {
-    let (manager, node) = connections().await;
     let mut options = SessionOptions::legacy_compatible();
-    options.detection_events = FrameLimit::new(32 * 1024 * 1024).unwrap();
+    options.detection_events = SessionFrameLimit::new(32 * 1024 * 1024).unwrap();
     let info = claims();
-    let (manager_session, agent_session) = tokio::join!(
-        ServerHandle::from_transport(manager.clone(), options.clone(), ">=0.48.0", "0.49.0"),
-        AgentHandle::from_transport(node, options, &info)
-    );
-    let _server = manager_session.unwrap();
-    let (agent, _) = agent_session.unwrap();
+    let (manager, (agent, _)) = raw_manager(options, "0.49.0", &info).await;
     let mut sender = agent.open_detection_event_stream().await.unwrap();
     let payload = vec![42_u8; 24 * 1024 * 1024];
     sender.start_serialized(&payload).unwrap();
@@ -3212,19 +3258,9 @@ async fn event_sender_resumes_after_backpressure() {
 
 #[tokio::test]
 async fn dropping_event_sender_aborts_stream() {
-    let (manager, node) = connections().await;
+    let options = SessionOptions::legacy_compatible();
     let info = claims();
-    let (server, agent) = tokio::join!(
-        ServerHandle::from_transport(
-            manager.clone(),
-            SessionOptions::legacy_compatible(),
-            ">=0.48.0",
-            "0.49.0"
-        ),
-        AgentHandle::from_transport(node, SessionOptions::legacy_compatible(), &info)
-    );
-    let _server = server.unwrap();
-    let (agent, _) = agent.unwrap();
+    let (manager, (agent, _)) = raw_manager(options, "0.49.0", &info).await;
     let sender = agent.open_detection_event_stream().await.unwrap();
     let mut recv = manager.accept_uni().await.unwrap();
     drop(sender);
@@ -3320,3 +3356,6 @@ async fn endpoint_requests_round_trip() {
         }
     );
 }
+
+#[path = "session_transport/classification.rs"]
+mod classification;

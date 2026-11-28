@@ -573,10 +573,15 @@ impl ServerSessionControl {
                 code: code.get(),
                 reason,
             },
-            CloseInfo::Transport(error) => ServerSessionClose::Transport(unsent(error)),
-            other => ServerSessionClose::Transport(unsent(std::io::Error::other(format!(
-                "connection closed: {other:?}"
-            )))),
+            CloseInfo::Transport(error) => {
+                ServerSessionClose::Transport(unsent(error).on_connection(&self.connection))
+            }
+            other => ServerSessionClose::Transport(
+                unsent(std::io::Error::other(format!(
+                    "connection closed: {other:?}"
+                )))
+                .on_connection(&self.connection),
+            ),
         }
     }
 

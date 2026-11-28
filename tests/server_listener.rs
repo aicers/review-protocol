@@ -1112,7 +1112,10 @@ async fn agent_connector_preserves_tls_name_and_session_lifetime() {
     drop(connector);
     assert_eq!(agent.remote_addr(), address);
     assert_eq!(agent.local_addr().unwrap(), local);
-    agent.close(ApplicationCode::new(0).unwrap(), b"done");
+    agent.close(
+        review_protocol::session::ApplicationCode::new(0).unwrap(),
+        b"done",
+    );
     drop(server);
     listener.close(b"done");
     listener.wait_idle().await;

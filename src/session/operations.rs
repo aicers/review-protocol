@@ -193,9 +193,14 @@ struct RequestOwner {
     answering: bool,
 }
 impl RequestOwner {
-    fn new(send: oinq::SendStream, recv: oinq::RecvStream, options: super::SessionOptions) -> Self {
+    fn new(
+        send: oinq::SendStream,
+        recv: oinq::RecvStream,
+        options: super::SessionOptions,
+        connection: &oinq::Connection,
+    ) -> Self {
         Self {
-            exchange: Exchange::new(send, recv, options.unary),
+            exchange: Exchange::new(send, recv, options.unary, connection),
             options,
             ended: false,
             answering: false,
@@ -415,11 +420,6 @@ pub struct ServerIncoming {
 }
 #[cfg(feature = "server")]
 impl ServerIncoming {
-    pub(super) fn new(shared: Arc<Shared>) -> Self {
-        let control = ServerSessionControl::new(shared.connection.clone());
-        Self::with_control(shared, control)
-    }
-
     pub(super) fn with_control(shared: Arc<Shared>, control: ServerSessionControl) -> Self {
         Self {
             shared,
@@ -479,10 +479,10 @@ impl ServerIncoming {
         tokio::select! {
             biased;
             () = self.control.drained() => Ok(None),
-            closed = self.control.closed() => exhausted(closed),
+            closed = self.control.closed() => exhausted(closed, &self.shared.connection),
             stream = self.accept_stream() => match stream {
                 Ok(stream) => Ok(Some(stream)),
-                Err(_) => exhausted(self.control.closed().await),
+                Err(_) => exhausted(self.control.closed().await, &self.shared.connection),
             },
         }
     }
@@ -498,15 +498,15 @@ impl ServerIncoming {
     async fn accept_stream(&self) -> Result<ServerStream, SessionError> {
         tokio::select! {
             result = self.shared.connection.accept_bi() => {
-                let (send, recv) = result.map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent))?;
+                let (send, recv) = result.map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent).on_connection(&self.shared.connection))?;
                 Ok(ServerStream::Requests(ServerRequestStream {
-                    owner: RequestOwner::new(send, recv, self.shared.options.clone()),
+                    owner: RequestOwner::new(send, recv, self.shared.options.clone(), &self.shared.connection),
                     authorization: self.authorization.clone(),
                     session: self.shared.clone(),
                 }))
             }
             result = self.shared.connection.accept_uni() => {
-                let recv = result.map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent))?;
+                let recv = result.map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent).on_connection(&self.shared.connection))?;
                 Ok(ServerStream::DetectionEvents(super::DetectionEventReceiver::new(
                     recv,
                     self.shared.options.detection_events,
@@ -518,10 +518,15 @@ impl ServerIncoming {
 }
 
 #[cfg(feature = "server")]
-fn exhausted(closed: ServerSessionClose) -> Result<Option<ServerStream>, SessionError> {
+fn exhausted(
+    closed: ServerSessionClose,
+    connection: &oinq::Connection,
+) -> Result<Option<ServerStream>, SessionError> {
     match closed {
         ServerSessionClose::Local | ServerSessionClose::Peer { code: 0, .. } => Ok(None),
-        ServerSessionClose::Peer { code, reason } => Err(unsent(PeerClosed { code, reason })),
+        ServerSessionClose::Peer { code, reason } => {
+            Err(unsent(PeerClosed { code, reason }).on_connection(connection))
+        }
         ServerSessionClose::Transport(error) => Err(error),
     }
 }
@@ -1072,16 +1077,14 @@ impl AgentIncoming {
     /// # Errors
     /// Returns a classified transport error when the connection closes.
     pub async fn accept(&mut self) -> Result<AgentRequestStream, SessionError> {
-        let (send, recv) = self
-            .0
-            .connection
-            .accept_bi()
-            .await
-            .map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent))?;
+        let (send, recv) = self.0.connection.accept_bi().await.map_err(|e| {
+            SessionError::transport(e, OutcomeCertainty::NotSent).on_connection(&self.0.connection)
+        })?;
         Ok(AgentRequestStream(RequestOwner::new(
             send,
             recv,
             self.0.options.clone(),
+            &self.0.connection,
         )))
     }
 }
@@ -2482,13 +2485,10 @@ impl super::AgentHandle {
     ) -> Result<ReportRunExchange, SessionError> {
         let mut certainty = OutcomeCertainty::NotSent;
         let operation = async {
-            let (send, recv) = self
-                .0
-                .connection
-                .open_bi()
-                .await
-                .map_err(|error| SessionError::transport(error, certainty))?;
-            let mut exchange = Exchange::new(send, recv, self.0.options.unary);
+            let (send, recv) = self.0.connection.open_bi().await.map_err(|error| {
+                SessionError::transport(error, certainty).on_connection(&self.0.connection)
+            })?;
+            let mut exchange = Exchange::new(send, recv, self.0.options.unary, &self.0.connection);
             exchange.start_request(
                 u32::from(crate::server::RequestCode::ReportRun),
                 (run_id, state, reason),
@@ -3366,13 +3366,10 @@ impl super::ServerHandle {
         let options = &self.0.options;
         let mut certainty = OutcomeCertainty::NotSent;
         let operation = async {
-            let (send, recv) = self
-                .0
-                .connection
-                .open_bi()
-                .await
-                .map_err(|e| SessionError::transport(e, certainty))?;
-            let mut exchange = Exchange::new(send, recv, options.unary);
+            let (send, recv) = self.0.connection.open_bi().await.map_err(|e| {
+                SessionError::transport(e, certainty).on_connection(&self.0.connection)
+            })?;
+            let mut exchange = Exchange::new(send, recv, options.unary, &self.0.connection);
             exchange.start_request(u32::from(crate::client::RequestCode::NodePackage), &request)?;
             certainty = OutcomeCertainty::Unknown;
             exchange.flush().await?;
@@ -3392,7 +3389,7 @@ impl super::ServerHandle {
             // Sender tuning only; the configured limit is always respected.
             let chunk_size = options.package_chunks.get().min(64 * 1024);
             if chunk_size == 0 && remaining > 0 {
-                return Err(SessionError::limit(oinq::frame::FrameError::TooLarge {
+                return Err(SessionError::limit(super::FrameError::TooLarge {
                     length: 1,
                     limit: options.package_chunks,
                 })
@@ -3616,9 +3613,9 @@ impl crate::request::SessionPackageSource for PackageReply<'_> {
                     SessionError::Malformed { source, .. } => {
                         let kind = if source
                             .as_ref()
-                            .downcast_ref::<oinq::frame::FrameError>()
+                            .downcast_ref::<super::FrameError>()
                             .is_some_and(|error| {
-                                matches!(error, oinq::frame::FrameError::Truncated { .. })
+                                matches!(error, super::FrameError::Truncated { .. })
                             }) {
                             std::io::ErrorKind::UnexpectedEof
                         } else {
