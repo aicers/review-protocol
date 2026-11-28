@@ -22,6 +22,8 @@ const LOOPBACK: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
 /// The longest the whole demonstration may take before it is reported as hung.
 const DEMO_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a drained session's runners may take before they are aborted.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
 const DETECTOR_ID: i32 = 7;
 
 #[tokio::main(flavor = "current_thread")]
@@ -122,7 +124,7 @@ mod server {
         task::{JoinError, JoinHandle, JoinSet},
     };
 
-    use super::{BoxError, pki::Credential};
+    use super::{BoxError, DRAIN_GRACE, pki::Credential};
 
     /// Handshakes in progress at once; further connection attempts wait in
     /// the transport until a permit frees up.
@@ -131,8 +133,6 @@ mod server {
     const MAX_STREAMS_PER_SESSION: usize = 8;
     /// The deadline for TLS and the protocol handshake together.
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-    /// How long a drained session's runners may take before they are aborted.
-    const DRAIN_GRACE: Duration = Duration::from_secs(5);
     /// The only services this deployment grants to agents.
     const GRANTED: &[ServiceId] = &[service_id::SERVER_CONFIG_GET];
     const SHUTDOWN_REASON: &[u8] = b"server shutdown";
@@ -575,6 +575,20 @@ mod server {
                     describe(&report)
                 );
             }
+            let active = self.control.lifecycle().active_work();
+            println!(
+                "[server] shutdown: {}: {active} exchange(s) still counted active",
+                self.identity
+            );
+            if tokio::time::timeout(DRAIN_GRACE, self.control.wait_idle())
+                .await
+                .is_err()
+            {
+                println!(
+                    "[server] shutdown: {}: active exchanges outlived the drain grace",
+                    self.identity
+                );
+            }
             self.control.close(SHUTDOWN_REASON);
             let closed = match self.control.closed().await {
                 ServerSessionClose::Local => "closed locally".to_owned(),
@@ -604,7 +618,7 @@ mod agent {
     };
     use tokio::task::JoinHandle;
 
-    use super::{BoxError, LOOPBACK, pki};
+    use super::{BoxError, DRAIN_GRACE, LOOPBACK, pki};
 
     pub(super) struct Agent {
         name: &'static str,
@@ -684,14 +698,25 @@ mod agent {
             Ok(3)
         }
 
-        /// Joins the agent's tasks after the server closed the connection.
+        /// Drains new agent work, joins its tasks, then closes its control.
+        ///
+        /// The server usually closes first; draining here still demonstrates the
+        /// agent-side symmetric stop and prevents any further local production
+        /// before the owned command task is joined.
         pub(super) async fn join(self) -> Result<(), BoxError> {
+            let control = self.handle.control();
+            control.drain();
             let closed = describe(self.handle.closed().await);
             let answered = self.commands.await?;
+            let active = control.lifecycle().active_work();
             println!(
-                "[agent {}] {closed}; answered {answered} command(s)",
+                "[agent {}] {closed}; answered {answered} command(s); {active} exchange(s) active",
                 self.name
             );
+            tokio::time::timeout(DRAIN_GRACE, control.wait_idle())
+                .await
+                .map_err(|_| "agent exchanges outlived the drain grace")?;
+            control.close(b"agent shutdown");
             Ok(())
         }
     }

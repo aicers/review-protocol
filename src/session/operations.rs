@@ -2,9 +2,11 @@
 #[cfg(feature = "server")]
 use std::collections::HashSet;
 use std::{
+    future::poll_fn,
     marker::PhantomData,
     ops::{Deref, DerefMut},
     sync::Arc,
+    task::Poll,
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -12,7 +14,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 #[cfg(feature = "client")]
 use super::exchange::{Decoding, unary_as};
 use super::{
-    OutcomeCertainty, SessionError, Shared,
+    OutcomeCertainty, SessionActivity, SessionError, SessionLifecycle, Shared,
     decode::decode,
     exchange::{Exchange, unary},
 };
@@ -45,6 +47,57 @@ use crate::{
         TimeSeriesGenerationPolicy, TimeSeriesUpdate, TrafficFilterRule, UpdateClusterRequest,
     },
 };
+
+impl Shared {
+    pub(super) async fn unary<I: Serialize, O: DeserializeOwned>(
+        &self,
+        code: u32,
+        input: I,
+    ) -> Result<O, SessionError> {
+        unary(
+            &self.lifecycle,
+            &self.connection,
+            &self.options,
+            code,
+            input,
+        )
+        .await
+    }
+
+    #[cfg(feature = "client")]
+    pub(super) async fn unary_as<I: Serialize, O: DeserializeOwned>(
+        &self,
+        code: u32,
+        input: I,
+        decoding: Decoding,
+    ) -> Result<O, SessionError> {
+        unary_as(
+            &self.lifecycle,
+            &self.connection,
+            &self.options,
+            code,
+            input,
+            decoding,
+        )
+        .await
+    }
+
+    #[cfg(feature = "server")]
+    pub(super) async fn send_only<I: Serialize>(
+        &self,
+        code: u32,
+        input: I,
+    ) -> Result<(), SessionError> {
+        super::exchange::send_only(
+            &self.lifecycle,
+            &self.connection,
+            &self.options,
+            code,
+            input,
+        )
+        .await
+    }
+}
 
 /// A single-use typed response capability borrowing its request stream.
 ///
@@ -189,8 +242,13 @@ struct RequestOwner {
     exchange: Exchange,
     options: super::SessionOptions,
     ended: bool,
+    /// Whether this stream has already read at least one request frame.
+    started: bool,
     /// An answer to an unserved request code is prepared but not yet flushed.
     answering: bool,
+    lifecycle: SessionLifecycle,
+    /// Keeps this accepted stream counted as active work until it drops.
+    _activity: SessionActivity,
 }
 impl RequestOwner {
     fn new(
@@ -198,12 +256,17 @@ impl RequestOwner {
         recv: oinq::RecvStream,
         options: super::SessionOptions,
         connection: &oinq::Connection,
+        lifecycle: SessionLifecycle,
+        activity: SessionActivity,
     ) -> Self {
         Self {
             exchange: Exchange::new(send, recv, options.unary, connection),
             options,
             ended: false,
+            started: false,
             answering: false,
+            lifecycle,
+            _activity: activity,
         }
     }
 
@@ -254,11 +317,74 @@ impl RequestOwner {
         if self.ended {
             return Ok(None);
         }
-        let Some(frame) = self.exchange.next_frame().await? else {
+        let lifecycle = self.lifecycle.clone();
+        // Before this stream's first invocation, a request that is already
+        // buffered is the current invocation and may complete even when drain
+        // has started. From the second invocation on, drain wins the ordering
+        // point so a second buffered request is not executed.
+        let prefer_buffered = !self.started;
+        if self.lifecycle.is_draining() && !prefer_buffered {
+            let partial = self.exchange.buffered_since_boundary();
+            self.ended = true;
+            self.exchange.finish()?;
+            return if partial {
+                Err(SessionError::Draining)
+            } else {
+                Ok(None)
+            };
+        }
+        let outcome = {
+            let mut read = Box::pin(self.exchange.next_frame());
+            let drain = lifecycle.wait_drained();
+            tokio::pin!(drain);
+            poll_fn(|context| {
+                // Prefer an immediately ready frame or clean EOF over drain so
+                // a buffered invocation and a FIN are not lost to the race.
+                match read.as_mut().poll(context) {
+                    Poll::Ready(result) => return Poll::Ready(Some(result)),
+                    Poll::Pending => {}
+                }
+                if drain.as_mut().poll(context).is_ready() {
+                    // One final poll distinguishes an already buffered frame
+                    // or EOF from a stalled or partially read request.
+                    return Poll::Ready(match read.as_mut().poll(context) {
+                        Poll::Ready(result) => Some(result),
+                        Poll::Pending => None,
+                    });
+                }
+                Poll::Pending
+            })
+            .await
+        };
+        let frame = if let Some(frame) = outcome {
+            frame?
+        } else {
+            // Drain raced a read in progress. If the framing layer consumed
+            // no byte since the last frame boundary, the stream was idle and
+            // this is a clean stop. A partially read header or payload is
+            // not a successful completion, so surface the local drain.
+            let partial = self.exchange.buffered_since_boundary();
+            self.ended = true;
+            self.exchange.finish()?;
+            return if partial {
+                Err(SessionError::Draining)
+            } else {
+                Ok(None)
+            };
+        };
+        let Some(frame) = frame else {
             self.ended = true;
             self.exchange.complete();
             return Ok(None);
         };
+        if self.lifecycle.is_draining() && !prefer_buffered {
+            // Drain won the ordering point after this stream's first
+            // invocation. Discard the buffered frame rather than executing it.
+            self.ended = true;
+            self.exchange.finish()?;
+            return Ok(None);
+        }
+        self.started = true;
         let Some(code) = frame.as_bytes().first_chunk::<4>() else {
             self.exchange.cancel();
             return Err(malformed("request code is truncated"));
@@ -471,11 +597,30 @@ impl ServerIncoming {
         })
     }
 
+    /// Returns the cloneable drain state shared with this connection's owners.
+    #[must_use]
+    pub fn lifecycle(&self) -> SessionLifecycle {
+        self.shared.lifecycle.clone()
+    }
+
+    /// Stops incoming acceptance and refuses new outgoing exchanges.
+    ///
+    /// Repeated calls are idempotent and wake a blocked accept.
+    pub fn drain(&self) {
+        self.shared.lifecycle.drain();
+    }
+
+    /// Waits until every admitted exchange of this connection completes.
+    pub async fn wait_idle(&self) {
+        self.shared.lifecycle.wait_idle().await;
+    }
+
     /// Accepts the next stream or returns `None` on clean exhaustion.
     ///
     /// Drain, local closure, or peer closure with application code zero ends
-    /// acceptance. An accept that wins a race with drain can still return
-    /// its stream. Cancellation consumes no stream.
+    /// acceptance. An accept that wins the admission race with drain returns a
+    /// stream already counted as active; a stream that loses the race is
+    /// dropped and never escapes untracked. Cancellation consumes no stream.
     ///
     /// # Errors
     /// Returns a typed transport failure for abnormal connection closure.
@@ -486,6 +631,7 @@ impl ServerIncoming {
             closed = self.control.closed() => exhausted(closed, &self.shared.connection),
             stream = self.accept_stream() => match stream {
                 Ok(stream) => Ok(Some(stream)),
+                Err(SessionError::Draining) => Ok(None),
                 Err(_) => exhausted(self.control.closed().await, &self.shared.connection),
             },
         }
@@ -495,7 +641,11 @@ impl ServerIncoming {
         tokio::select! {
             biased;
             () = self.control.drained() => Ok(None),
-            stream = self.accept_stream() => stream.map(Some),
+            stream = self.accept_stream() => match stream {
+                Ok(stream) => Ok(Some(stream)),
+                Err(SessionError::Draining) => Ok(None),
+                Err(error) => Err(error),
+            },
         }
     }
 
@@ -503,18 +653,28 @@ impl ServerIncoming {
         tokio::select! {
             result = self.shared.connection.accept_bi() => {
                 let (send, recv) = result.map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent).on_connection(&self.shared.connection))?;
+                let activity = self.shared.lifecycle.try_admit()?;
                 Ok(ServerStream::Requests(ServerRequestStream {
-                    owner: RequestOwner::new(send, recv, self.shared.options.clone(), &self.shared.connection),
+                    owner: RequestOwner::new(
+                        send,
+                        recv,
+                        self.shared.options.clone(),
+                        &self.shared.connection,
+                        self.shared.lifecycle.clone(),
+                        activity,
+                    ),
                     authorization: self.authorization.clone(),
                     session: self.shared.clone(),
                 }))
             }
             result = self.shared.connection.accept_uni() => {
                 let recv = result.map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent).on_connection(&self.shared.connection))?;
+                let activity = self.shared.lifecycle.try_admit()?;
                 Ok(ServerStream::DetectionEvents(super::DetectionEventReceiver::new(
                     recv,
                     self.shared.options.detection_events,
                     self.shared.clone(),
+                    activity,
                 )))
             }
         }
@@ -1043,6 +1203,8 @@ server_operations! {
 pub struct ReportRunExchange {
     exchange: Exchange,
     operation_timeout: Option<std::time::Duration>,
+    /// Keeps the sent exchange counted as active until its response completes.
+    _activity: SessionActivity,
 }
 
 #[cfg(feature = "client")]
@@ -1079,21 +1241,74 @@ impl AgentIncoming {
         Self(shared)
     }
 
+    /// Returns a cloneable control for draining, closing, or waiting.
+    #[must_use]
+    pub fn control(&self) -> super::AgentSessionControl {
+        super::AgentSessionControl::new(self.0.connection.clone(), self.0.lifecycle.clone())
+    }
+
+    /// Returns the cloneable drain state shared with this connection's owners.
+    #[must_use]
+    pub fn lifecycle(&self) -> SessionLifecycle {
+        self.0.lifecycle.clone()
+    }
+
+    /// Stops incoming acceptance and refuses new outgoing exchanges.
+    ///
+    /// Repeated calls are idempotent and wake a blocked accept.
+    pub fn drain(&self) {
+        self.0.lifecycle.drain();
+    }
+
+    /// Waits until every admitted exchange of this connection completes.
+    pub async fn wait_idle(&self) {
+        self.0.lifecycle.wait_idle().await;
+    }
+
     /// Accepts a command stream without waiting for its first request frame.
     ///
     /// Cancellation consumes no stream. Supervise returned stream owners independently.
     /// # Errors
-    /// Returns a classified transport error when the connection closes.
+    /// Returns a classified transport error when the connection closes, or
+    /// [`SessionError::Draining`] once acceptance has drained.
     pub async fn accept(&mut self) -> Result<AgentRequestStream, SessionError> {
-        let (send, recv) = self.0.connection.accept_bi().await.map_err(|e| {
-            SessionError::transport(e, OutcomeCertainty::NotSent).on_connection(&self.0.connection)
-        })?;
-        Ok(AgentRequestStream(RequestOwner::new(
-            send,
-            recv,
-            self.0.options.clone(),
-            &self.0.connection,
-        )))
+        self.accept_next().await?.ok_or(SessionError::Draining)
+    }
+
+    /// Accepts the next command stream or returns `None` on clean exhaustion.
+    ///
+    /// Drain, local closure, or peer closure ends acceptance. A stream that wins
+    /// the admission race with drain is returned already counted as active; a
+    /// stream that loses is dropped and never escapes untracked. Cancellation
+    /// consumes no stream.
+    ///
+    /// # Errors
+    /// Returns a classified transport error when the connection closes abnormally.
+    pub async fn accept_next(&mut self) -> Result<Option<AgentRequestStream>, SessionError> {
+        let lifecycle = self.0.lifecycle.clone();
+        tokio::select! {
+            biased;
+            () = lifecycle.wait_drained() => Ok(None),
+            result = self.0.connection.accept_bi() => {
+                let (send, recv) = result.map_err(|e| {
+                    SessionError::transport(e, OutcomeCertainty::NotSent)
+                        .on_connection(&self.0.connection)
+                })?;
+                let activity = match self.0.lifecycle.try_admit() {
+                    Ok(activity) => activity,
+                    Err(SessionError::Draining) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                Ok(Some(AgentRequestStream(RequestOwner::new(
+                    send,
+                    recv,
+                    self.0.options.clone(),
+                    &self.0.connection,
+                    lifecycle,
+                    activity,
+                ))))
+            }
+        }
     }
 }
 
@@ -2098,13 +2313,9 @@ impl super::AgentHandle {
         &self,
         key: &crate::types::DataSourceKey<'_>,
     ) -> Result<Option<crate::types::DataSource>, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetDataSource),
-            key,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::server::RequestCode::GetDataSource), key)
+            .await
     }
 
     /// Fetches an indicator by name.
@@ -2115,13 +2326,9 @@ impl super::AgentHandle {
         &self,
         name: &str,
     ) -> Result<std::collections::HashSet<Vec<String>>, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetIndicator),
-            name,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::server::RequestCode::GetIndicator), name)
+            .await
     }
 
     /// Fetches the internal-network list.
@@ -2131,13 +2338,12 @@ impl super::AgentHandle {
     pub async fn get_internal_network_list(
         &self,
     ) -> Result<crate::types::HostNetworkGroup, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetInternalNetworkList),
-            (),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::GetInternalNetworkList),
+                (),
+            )
+            .await
     }
 
     /// Fetches label-database patterns for the requested databases.
@@ -2148,13 +2354,12 @@ impl super::AgentHandle {
         &self,
         labeldbs: &[(&str, &str)],
     ) -> Result<Vec<(String, Option<crate::types::LabelDb>)>, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetLabelDbPatterns),
-            labeldbs,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::GetLabelDbPatterns),
+                labeldbs,
+            )
+            .await
     }
 
     /// Fetches the Tor exit-node list.
@@ -2162,13 +2367,12 @@ impl super::AgentHandle {
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
     pub async fn get_tor_exit_node_list(&self) -> Result<Vec<String>, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetTorExitNodeList),
-            (),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::GetTorExitNodeList),
+                (),
+            )
+            .await
     }
 
     /// Fetches the trusted-domain list.
@@ -2176,13 +2380,12 @@ impl super::AgentHandle {
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
     pub async fn get_trusted_domain_list(&self) -> Result<Vec<String>, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetTrustedDomainList),
-            (),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::GetTrustedDomainList),
+                (),
+            )
+            .await
     }
 
     /// Fetches the trusted-user-agent list.
@@ -2190,13 +2393,12 @@ impl super::AgentHandle {
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
     pub async fn get_trusted_user_agent_list(&self) -> Result<Vec<String>, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetTrustedUserAgentList),
-            (),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::GetTrustedUserAgentList),
+                (),
+            )
+            .await
     }
 
     /// Fetches the time-series generation policies.
@@ -2206,13 +2408,12 @@ impl super::AgentHandle {
     pub async fn get_time_series_generation_policy_list(
         &self,
     ) -> Result<Vec<crate::types::TimeSeriesGenerationPolicy>, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetTimeSeriesGenerationPolicyList),
-            (),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::GetTimeSeriesGenerationPolicyList),
+                (),
+            )
+            .await
     }
 
     /// Requests a renewed certificate and private key.
@@ -2220,13 +2421,9 @@ impl super::AgentHandle {
     /// # Errors
     /// Returns a classified transport, framing, limit, or remote rejection error.
     pub async fn renew_certificate(&self) -> Result<(String, String), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::RenewCertificate),
-            (),
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::server::RequestCode::RenewCertificate), ())
+            .await
     }
 
     /// Inserts column statistics for a model batch.
@@ -2239,13 +2436,12 @@ impl super::AgentHandle {
         model_id: u32,
         batch_ts: i64,
     ) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::InsertColumnStatistics),
-            &(statistics, model_id, batch_ts),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::InsertColumnStatistics),
+                &(statistics, model_id, batch_ts),
+            )
+            .await
     }
 
     /// Inserts time-series updates for a model batch.
@@ -2258,13 +2454,12 @@ impl super::AgentHandle {
         model_id: u32,
         batch_ts: i64,
     ) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::InsertTimeSeries),
-            &(time_series, model_id, batch_ts),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::InsertTimeSeries),
+                &(time_series, model_id, batch_ts),
+            )
+            .await
     }
 
     /// Updates a model's clusters.
@@ -2276,13 +2471,12 @@ impl super::AgentHandle {
         input: &[crate::types::UpdateClusterRequest],
         model_id: u32,
     ) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::UpdateClusters),
-            &(input, model_id),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::UpdateClusters),
+                &(input, model_id),
+            )
+            .await
     }
 
     /// Updates a model's outliers at a timestamp.
@@ -2295,13 +2489,12 @@ impl super::AgentHandle {
         model_id: u32,
         timestamp: i64,
     ) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::UpdateOutliers),
-            &(outliers, model_id, timestamp),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::UpdateOutliers),
+                &(outliers, model_id, timestamp),
+            )
+            .await
     }
 
     /// Inserts a model round's detection events.
@@ -2314,13 +2507,12 @@ impl super::AgentHandle {
         round: u32,
         events: &[crate::types::DetectionEvent],
     ) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::InsertDetectionEvents),
-            &(model_id, round, events),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::InsertDetectionEvents),
+                &(model_id, round, events),
+            )
+            .await
     }
 
     /// Inserts a data source and returns its identifier.
@@ -2331,13 +2523,12 @@ impl super::AgentHandle {
         &self,
         data_source: &crate::types::DataSource,
     ) -> Result<u32, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::InsertDataSource),
-            data_source,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::InsertDataSource),
+                data_source,
+            )
+            .await
     }
 
     /// Fetches a model's outliers at a timestamp.
@@ -2349,13 +2540,12 @@ impl super::AgentHandle {
         model_id: u32,
         timestamp: i64,
     ) -> Result<Vec<(String, Vec<i64>)>, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetOutliers),
-            &(model_id, timestamp),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::GetOutliers),
+                &(model_id, timestamp),
+            )
+            .await
     }
 
     /// Fetches the DAI extractor configuration for sensors.
@@ -2366,13 +2556,12 @@ impl super::AgentHandle {
         &self,
         sensors: &[String],
     ) -> Result<crate::types::DaiExtractorConfig, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetDaiExtractorConfig),
-            sensors,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::GetDaiExtractorConfig),
+                sensors,
+            )
+            .await
     }
 
     /// Fetches DAI read cursors for sensors.
@@ -2383,13 +2572,12 @@ impl super::AgentHandle {
         &self,
         sensors: &[String],
     ) -> Result<crate::types::DaiCursors, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetDaiCursors),
-            sensors,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::GetDaiCursors),
+                sensors,
+            )
+            .await
     }
 
     /// Sends a DAI observation batch.
@@ -2400,13 +2588,12 @@ impl super::AgentHandle {
         &self,
         batch: &crate::types::DaiObservationBatch,
     ) -> Result<crate::types::DaiStoreAck, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::SendDaiObservations),
-            batch,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::SendDaiObservations),
+                batch,
+            )
+            .await
     }
 
     /// Starts a DAI range-day round.
@@ -2418,13 +2605,12 @@ impl super::AgentHandle {
         unit: &crate::types::DaiRangeUnit,
         restore_generation: u64,
     ) -> Result<crate::types::DaiRangeGrant, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::BeginDaiRangeDay),
-            (unit, restore_generation),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::BeginDaiRangeDay),
+                (unit, restore_generation),
+            )
+            .await
     }
 
     /// Renews a DAI range-day lease.
@@ -2436,13 +2622,12 @@ impl super::AgentHandle {
         unit: &crate::types::DaiRangeUnit,
         lease_token: u64,
     ) -> Result<Option<i64>, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::RenewDaiRangeDay),
-            (unit, lease_token),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::RenewDaiRangeDay),
+                (unit, lease_token),
+            )
+            .await
     }
 
     /// Sends DAI range-day counts.
@@ -2453,13 +2638,9 @@ impl super::AgentHandle {
         &self,
         day: &crate::types::DaiRangeDay,
     ) -> Result<crate::types::DaiStoreAck, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::SendDaiRangeDay),
-            day,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::server::RequestCode::SendDaiRangeDay), day)
+            .await
     }
 
     /// Reports late DAI range days and returns their assigned marks.
@@ -2470,26 +2651,24 @@ impl super::AgentHandle {
         &self,
         late: &crate::types::DaiRangeLate,
     ) -> Result<Vec<crate::types::DaiRangeMark>, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::ReportDaiRangeLate),
-            late,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::ReportDaiRangeLate),
+                late,
+            )
+            .await
     }
 
     /// Sends the `upload_run_model` engine operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn upload_run_model(&self, run_id: u32, model: &[u8]) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::UploadRunModel),
-            (run_id, model),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::UploadRunModel),
+                (run_id, model),
+            )
+            .await
     }
 
     /// Sends a run report and returns an owned response exchange.
@@ -2503,6 +2682,8 @@ impl super::AgentHandle {
         state: ReportedRunState,
         reason: Option<&str>,
     ) -> Result<ReportRunExchange, SessionError> {
+        let activity = self.0.lifecycle.try_admit()?;
+        let mut activity = Some(activity);
         let mut certainty = OutcomeCertainty::NotSent;
         let operation = async {
             let (send, recv) = self.0.connection.open_bi().await.map_err(|error| {
@@ -2515,9 +2696,11 @@ impl super::AgentHandle {
             )?;
             certainty = OutcomeCertainty::Unknown;
             exchange.flush().await?;
+            let activity = activity.take().ok_or(SessionError::Draining)?;
             Ok(ReportRunExchange {
                 exchange,
                 operation_timeout: self.0.options.operation_timeout,
+                _activity: activity,
             })
         };
         if let Some(timeout) = self.0.options.operation_timeout {
@@ -2542,26 +2725,24 @@ impl super::AgentHandle {
         state: ReportedRunState,
         reason: Option<&str>,
     ) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::ReportRun),
-            (run_id, state, reason),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::ReportRun),
+                (run_id, state, reason),
+            )
+            .await
     }
 
     /// Sends the `report_active_runs` engine operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn report_active_runs(&self, run_ids: &[u32]) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::ReportActiveRuns),
-            run_ids,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::ReportActiveRuns),
+                run_ids,
+            )
+            .await
     }
 
     /// Sends the `report_detector_status` engine operation.
@@ -2571,13 +2752,12 @@ impl super::AgentHandle {
         &self,
         report: &DetectorStatusReport,
     ) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::ReportDetectorStatus),
-            report,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::ReportDetectorStatus),
+                report,
+            )
+            .await
     }
 
     /// Sends the `report_exclusion_counts` engine operation, the raw events
@@ -2589,13 +2769,12 @@ impl super::AgentHandle {
         &self,
         report: &EngineExclusionReport,
     ) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::ReportExclusionCounts),
-            report,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::ReportExclusionCounts),
+                report,
+            )
+            .await
     }
 
     /// Sends the `get_signature_rules` engine operation, pulling the
@@ -2611,13 +2790,12 @@ impl super::AgentHandle {
         &self,
         known_revision: Option<u64>,
     ) -> Result<Option<SignatureRules>, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetSignatureRules),
-            known_revision,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::GetSignatureRules),
+                known_revision,
+            )
+            .await
     }
 
     /// Sends the `report_signature_status` engine operation, the status of a
@@ -2628,13 +2806,12 @@ impl super::AgentHandle {
         &self,
         report: &SignatureStatusReport,
     ) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::ReportSignatureStatus),
-            report,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::ReportSignatureStatus),
+                report,
+            )
+            .await
     }
 
     /// Resolves endpoint sources at training start or before an analysis round.
@@ -2646,13 +2823,12 @@ impl super::AgentHandle {
         &self,
         request: &EndpointSourcesRequest,
     ) -> Result<EndpointSources, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetEndpointSources),
-            request,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::GetEndpointSources),
+                request,
+            )
+            .await
     }
 
     /// Reports training filter counts before model upload.
@@ -2665,13 +2841,12 @@ impl super::AgentHandle {
         run_id: u32,
         report: &TrainingFilterReport,
     ) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::ReportTrainingFilter),
-            (run_id, report),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::ReportTrainingFilter),
+                (run_id, report),
+            )
+            .await
     }
 
     /// Reports endpoint-scope round filter counts after its status report.
@@ -2685,62 +2860,48 @@ impl super::AgentHandle {
         model: &str,
         report: &RoundFilterReport,
     ) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::ReportRoundFilter),
-            (detector_id, model, report),
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::ReportRoundFilter),
+                (detector_id, model, report),
+            )
+            .await
     }
 
     /// Sends the `get_config` domain operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn get_config(&self) -> Result<String, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetConfig),
-            (),
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::server::RequestCode::GetConfig), ())
+            .await
     }
     /// Sends the `get_model` domain operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn get_model(&self, request: &str) -> Result<Vec<u8>, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetModel),
-            request,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::server::RequestCode::GetModel), request)
+            .await
     }
     /// Sends the `get_pretrained_model` domain operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn get_pretrained_model(&self, request: &str) -> Result<Vec<u8>, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetPretrainedModel),
-            request,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::GetPretrainedModel),
+                request,
+            )
+            .await
     }
     /// Sends the `get_model_names` domain operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn get_model_names(&self) -> Result<Vec<String>, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetModelNames),
-            (),
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::server::RequestCode::GetModelNames), ())
+            .await
     }
     /// Sends the `get_exclusion_list` domain operation.
     ///
@@ -2754,14 +2915,13 @@ impl super::AgentHandle {
     /// data, remote rejection, limit, or deadline errors.
     pub async fn get_exclusion_list(&self) -> Result<Vec<NetworkListItem>, SessionError> {
         self.check_network_lists()?;
-        unary_as(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetExclusionList),
-            (),
-            Decoding::Exact,
-        )
-        .await
+        self.0
+            .unary_as(
+                u32::from(crate::server::RequestCode::GetExclusionList),
+                (),
+                Decoding::Exact,
+            )
+            .await
     }
     /// Sends the `get_watchlist` domain operation.
     ///
@@ -2775,50 +2935,37 @@ impl super::AgentHandle {
     /// data, remote rejection, limit, or deadline errors.
     pub async fn get_watchlist(&self) -> Result<Vec<NetworkListItem>, SessionError> {
         self.check_network_lists()?;
-        unary_as(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::GetWatchlist),
-            (),
-            Decoding::Exact,
-        )
-        .await
+        self.0
+            .unary_as(
+                u32::from(crate::server::RequestCode::GetWatchlist),
+                (),
+                Decoding::Exact,
+            )
+            .await
     }
     /// Sends the `insert_model` domain operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn insert_model(&self, request: &[u8]) -> Result<u32, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::InsertModel),
-            request,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::server::RequestCode::InsertModel), request)
+            .await
     }
     /// Sends the `update_model` domain operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn update_model(&self, request: &[u8]) -> Result<u32, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::UpdateModel),
-            request,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::server::RequestCode::UpdateModel), request)
+            .await
     }
     /// Sends the `remove_model` domain operation.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn remove_model(&self, request: &str) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::RemoveModel),
-            request,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::server::RequestCode::RemoveModel), request)
+            .await
     }
     /// Sends the `report_customer_data_deletion` domain operation.
     /// # Errors
@@ -2827,13 +2974,12 @@ impl super::AgentHandle {
         &self,
         request: &CustomerDataDeletionReport,
     ) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::server::RequestCode::ReportCustomerDataDeletion),
-            request,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::server::RequestCode::ReportCustomerDataDeletion),
+                request,
+            )
+            .await
     }
 }
 
@@ -2845,13 +2991,9 @@ impl super::ServerHandle {
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn send_train_model(&self, request: &TrainModelRequest) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::client::RequestCode::TrainModel),
-            request,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::client::RequestCode::TrainModel), request)
+            .await
     }
 
     /// Sends the `send_clone_model` engine operation.
@@ -2860,39 +3002,30 @@ impl super::ServerHandle {
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn send_clone_model(&self, request: &CloneModelRequest) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::client::RequestCode::CloneModel),
-            request,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::client::RequestCode::CloneModel), request)
+            .await
     }
 
     /// Requests cancellation of an engine run.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn send_cancel_run(&self, run_id: u32) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::client::RequestCode::CancelRun),
-            run_id,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::client::RequestCode::CancelRun), run_id)
+            .await
     }
 
     /// Requests one round of an engine detector.
     /// # Errors
     /// Returns classified transport, malformed data, remote rejection, limit, or deadline errors.
     pub async fn send_run_detector_once(&self, detector_id: i32) -> Result<(), SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::client::RequestCode::RunDetectorOnce),
-            detector_id,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::client::RequestCode::RunDetectorOnce),
+                detector_id,
+            )
+            .await
     }
 
     /// Pushes the signature rule sets to a Semi-supervised Engine.
@@ -3039,7 +3172,7 @@ impl super::ServerHandle {
         code: crate::client::RequestCode,
         input: I,
     ) -> Result<(), SessionError> {
-        unary(&self.0.connection, &self.0.options, u32::from(code), input).await
+        self.0.unary(u32::from(code), input).await
     }
 
     /// Sends a typed node service operation.
@@ -3049,13 +3182,9 @@ impl super::ServerHandle {
         &self,
         request: NodeServiceRequest,
     ) -> Result<NodeServiceResponse, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::client::RequestCode::NodeService),
-            request,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::client::RequestCode::NodeService), request)
+            .await
     }
     /// Sends a typed node network interface operation.
     /// # Errors
@@ -3064,13 +3193,12 @@ impl super::ServerHandle {
         &self,
         request: NodeNetworkInterfaceRequest,
     ) -> Result<NodeNetworkInterfaceResponse, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::client::RequestCode::NodeNetworkInterface),
-            request,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::client::RequestCode::NodeNetworkInterface),
+                request,
+            )
+            .await
     }
     /// Sends a typed node hostname operation.
     /// # Errors
@@ -3079,13 +3207,9 @@ impl super::ServerHandle {
         &self,
         request: NodeHostnameRequest,
     ) -> Result<NodeHostnameResponse, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::client::RequestCode::NodeHostname),
-            request,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::client::RequestCode::NodeHostname), request)
+            .await
     }
     /// Sends a typed node time sync operation.
     /// # Errors
@@ -3094,13 +3218,9 @@ impl super::ServerHandle {
         &self,
         request: NodeTimeSyncRequest,
     ) -> Result<NodeTimeSyncResponse, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::client::RequestCode::NodeTimeSync),
-            request,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::client::RequestCode::NodeTimeSync), request)
+            .await
     }
     /// Sends a typed node logging operation.
     /// # Errors
@@ -3109,13 +3229,9 @@ impl super::ServerHandle {
         &self,
         request: NodeLoggingRequest,
     ) -> Result<NodeLoggingResponse, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::client::RequestCode::NodeLogging),
-            request,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::client::RequestCode::NodeLogging), request)
+            .await
     }
     /// Sends a typed node remote access operation.
     /// # Errors
@@ -3124,13 +3240,12 @@ impl super::ServerHandle {
         &self,
         request: NodeRemoteAccessRequest,
     ) -> Result<NodeRemoteAccessResponse, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::client::RequestCode::NodeRemoteAccess),
-            request,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::client::RequestCode::NodeRemoteAccess),
+                request,
+            )
+            .await
     }
     /// Sends a typed node observation operation.
     /// # Errors
@@ -3139,13 +3254,12 @@ impl super::ServerHandle {
         &self,
         request: NodeObservationRequest,
     ) -> Result<NodeObservationResponse, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::client::RequestCode::NodeObservation),
-            request,
-        )
-        .await
+        self.0
+            .unary(
+                u32::from(crate::client::RequestCode::NodeObservation),
+                request,
+            )
+            .await
     }
     /// Sends a typed node version operation.
     /// # Errors
@@ -3154,13 +3268,9 @@ impl super::ServerHandle {
         &self,
         request: NodeVersionRequest,
     ) -> Result<NodeVersionResponse, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::client::RequestCode::NodeVersion),
-            request,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::client::RequestCode::NodeVersion), request)
+            .await
     }
     /// Sends a typed node enroll operation.
     /// # Errors
@@ -3169,13 +3279,9 @@ impl super::ServerHandle {
         &self,
         request: NodeEnrollRequest,
     ) -> Result<NodeEnrollResponse, SessionError> {
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::client::RequestCode::NodeEnroll),
-            request,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::client::RequestCode::NodeEnroll), request)
+            .await
     }
     /// Sends a typed node package operation.
     /// # Errors
@@ -3187,13 +3293,9 @@ impl super::ServerHandle {
         if matches!(request, NodePackageRequest::Install { .. }) {
             return Err(malformed("use node_package_install for streaming installs"));
         }
-        unary(
-            &self.0.connection,
-            &self.0.options,
-            u32::from(crate::client::RequestCode::NodePackage),
-            request,
-        )
-        .await
+        self.0
+            .unary(u32::from(crate::client::RequestCode::NodePackage), request)
+            .await
     }
 }
 
@@ -3343,23 +3445,15 @@ impl super::ServerHandle {
             request,
             NodePowerRequest::Reboot | NodePowerRequest::Shutdown
         ) {
-            super::exchange::send_only(
-                &self.0.connection,
-                &self.0.options,
-                u32::from(crate::client::RequestCode::NodePower),
-                request,
-            )
-            .await?;
+            self.0
+                .send_only(u32::from(crate::client::RequestCode::NodePower), request)
+                .await?;
             Ok(NodePowerOutcome::Sent)
         } else {
-            unary(
-                &self.0.connection,
-                &self.0.options,
-                u32::from(crate::client::RequestCode::NodePower),
-                request,
-            )
-            .await
-            .map(NodePowerOutcome::Response)
+            self.0
+                .unary(u32::from(crate::client::RequestCode::NodePower), request)
+                .await
+                .map(NodePowerOutcome::Response)
         }
     }
 
@@ -3384,6 +3478,7 @@ impl super::ServerHandle {
         };
         let mut remaining = *size;
         let options = &self.0.options;
+        let _activity = self.0.lifecycle.try_admit()?;
         let mut certainty = OutcomeCertainty::NotSent;
         let operation = async {
             let (send, recv) = self.0.connection.open_bi().await.map_err(|e| {

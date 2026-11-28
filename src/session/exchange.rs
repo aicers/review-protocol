@@ -1,15 +1,65 @@
 //! Stream ownership and the single bounded request/exchange path.
+use std::{
+    io,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::{Context, Poll},
+};
+
 use oinq::{
     ApplicationCode, Connection, RecvStream, SendStream,
     frame::{Frame, FramedReader, FramedWriter},
 };
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::io::{AsyncRead, ReadBuf};
 
-use super::{FrameLimit, OutcomeCertainty, SessionError, SessionOptions};
+use super::{FrameLimit, OutcomeCertainty, SessionError, SessionLifecycle, SessionOptions};
+
+/// A receive stream that records how many bytes the framing layer consumed.
+///
+/// The counter lets drain distinguish a request read that stalled at a frame
+/// boundary from one that had already consumed part of a header or payload.
+pub(super) struct TrackedRecv {
+    inner: RecvStream,
+    bytes: Arc<AtomicU64>,
+}
+
+impl TrackedRecv {
+    pub(super) fn new(inner: RecvStream, bytes: Arc<AtomicU64>) -> Self {
+        Self { inner, bytes }
+    }
+
+    pub(super) fn into_inner(self) -> RecvStream {
+        self.inner
+    }
+}
+
+impl AsyncRead for TrackedRecv {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(context, buffer);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            let read = buffer.filled().len().saturating_sub(before);
+            this.bytes
+                .fetch_add(u64::try_from(read).unwrap_or(u64::MAX), Ordering::Relaxed);
+        }
+        result
+    }
+}
 
 pub(crate) struct Exchange {
     connection: Connection,
-    reader: Option<FramedReader<RecvStream>>,
+    reader: Option<FramedReader<TrackedRecv>>,
+    read_bytes: Arc<AtomicU64>,
+    frame_start: u64,
     writer: Option<FramedWriter<SendStream>>,
     finishing: Option<SendStream>,
     limit: FrameLimit,
@@ -24,15 +74,26 @@ impl Exchange {
         limit: FrameLimit,
         connection: &Connection,
     ) -> Self {
+        let read_bytes = Arc::new(AtomicU64::new(0));
         Self {
             connection: connection.clone(),
             finishing: None,
             limit,
             read_ended: false,
-            reader: Some(FramedReader::new(recv, limit.wire())),
+            reader: Some(FramedReader::new(
+                TrackedRecv::new(recv, read_bytes.clone()),
+                limit.wire(),
+            )),
+            read_bytes,
+            frame_start: 0,
             writer: Some(FramedWriter::new(send, limit.wire())),
             certainty: OutcomeCertainty::NotSent,
         }
+    }
+
+    /// Whether a read consumed bytes since the last completed frame boundary.
+    pub(super) fn buffered_since_boundary(&self) -> bool {
+        self.read_bytes.load(Ordering::Relaxed) != self.frame_start
     }
 
     fn frame_error(
@@ -117,7 +178,10 @@ impl Exchange {
             .read()
             .await;
         match result {
-            Ok(frame) => Ok(frame),
+            Ok(frame) => {
+                self.frame_start = self.read_bytes.load(Ordering::Relaxed);
+                Ok(frame)
+            }
             Err(error) => {
                 self.read_ended = true;
                 self.stop_reader();
@@ -129,7 +193,7 @@ impl Exchange {
     #[cfg(feature = "client")]
     fn stop_reader(&mut self) {
         if let Some(reader) = self.reader.take() {
-            let _ = reader.into_inner().stop(abort_code());
+            let _ = reader.into_inner().into_inner().stop(abort_code());
         }
     }
 
@@ -144,7 +208,10 @@ impl Exchange {
             .read()
             .await;
         match result {
-            Ok(frame) => Ok(frame),
+            Ok(frame) => {
+                self.frame_start = self.read_bytes.load(Ordering::Relaxed);
+                Ok(frame)
+            }
             Err(e) => {
                 self.abort();
                 Err(self.frame_error(e, self.certainty))
@@ -247,7 +314,7 @@ impl Exchange {
         }
         if let Some(reader) = self.reader.take() {
             // No additional response is part of this exchange.
-            let _ = reader.into_inner().stop(abort_code());
+            let _ = reader.into_inner().into_inner().stop(abort_code());
         }
         Ok(())
     }
@@ -271,7 +338,7 @@ impl Exchange {
             let _ = writer.into_inner().reset(abort_code());
         }
         if let Some(reader) = self.reader.take() {
-            let _ = reader.into_inner().stop(abort_code());
+            let _ = reader.into_inner().into_inner().stop(abort_code());
         }
     }
 }
@@ -301,21 +368,32 @@ pub(super) enum Decoding {
 }
 
 pub(super) async fn unary<I: Serialize, O: DeserializeOwned>(
+    lifecycle: &SessionLifecycle,
     connection: &Connection,
     options: &SessionOptions,
     code: u32,
     input: I,
 ) -> Result<O, SessionError> {
-    unary_as(connection, options, code, input, Decoding::Prefix).await
+    unary_as(
+        lifecycle,
+        connection,
+        options,
+        code,
+        input,
+        Decoding::Prefix,
+    )
+    .await
 }
 
 pub(super) async fn unary_as<I: Serialize, O: DeserializeOwned>(
+    lifecycle: &SessionLifecycle,
     connection: &Connection,
     options: &SessionOptions,
     code: u32,
     input: I,
     decoding: Decoding,
 ) -> Result<O, SessionError> {
+    let _activity = lifecycle.try_admit()?;
     let mut certainty = OutcomeCertainty::NotSent;
     let operation = async {
         let (send, recv) = connection
@@ -345,11 +423,13 @@ pub(super) async fn unary_as<I: Serialize, O: DeserializeOwned>(
 
 #[cfg(feature = "server")]
 pub(super) async fn send_only<I: Serialize>(
+    lifecycle: &SessionLifecycle,
     connection: &Connection,
     options: &SessionOptions,
     code: u32,
     input: I,
 ) -> Result<(), SessionError> {
+    let _activity = lifecycle.try_admit()?;
     let mut certainty = OutcomeCertainty::NotSent;
     let operation = async {
         let (send, recv) = connection

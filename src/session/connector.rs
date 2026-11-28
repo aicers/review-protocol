@@ -6,7 +6,10 @@ use std::{
 
 use oinq::{Endpoint, TransportOptions};
 
-use super::{AgentHandle, AgentIncoming, OutcomeCertainty, SessionError, SessionOptions};
+use super::{
+    AgentHandle, AgentIncoming, CloseReason, OutcomeCertainty, SessionError, SessionLifecycle,
+    SessionOptions,
+};
 
 const MAX_RECEIVE_WINDOW: u64 = (1 << 62) - 1;
 
@@ -59,6 +62,75 @@ agent_transport_options! {
     receive_window: u64,
     /// Maximum buffered unacknowledged outgoing bytes.
     send_window: u64,
+}
+
+/// A cloneable agent-side connection control without a dispatch surface.
+///
+/// It shares drain state with the agent handle, the incoming owner, accepted
+/// request streams, event owners, and outgoing exchanges of the same
+/// connection. Applications own task cancellation and the deadline at which
+/// they abort leftover tasks.
+#[derive(Clone, Debug)]
+pub struct AgentSessionControl {
+    connection: oinq::Connection,
+    lifecycle: SessionLifecycle,
+}
+
+impl AgentSessionControl {
+    pub(super) fn new(connection: oinq::Connection, lifecycle: SessionLifecycle) -> Self {
+        Self {
+            connection,
+            lifecycle,
+        }
+    }
+
+    /// Returns the cloneable drain state shared by every connection owner.
+    #[must_use]
+    pub fn lifecycle(&self) -> SessionLifecycle {
+        self.lifecycle.clone()
+    }
+
+    /// Stops incoming acceptance and refuses new outgoing exchanges.
+    ///
+    /// Already admitted work may complete. Repeated calls are idempotent.
+    pub fn drain(&self) {
+        self.lifecycle.drain();
+    }
+
+    /// Waits until every admitted exchange of this connection completes.
+    ///
+    /// Drain first and apply the application's own deadline outside this future.
+    pub async fn wait_idle(&self) {
+        self.lifecycle.wait_idle().await;
+    }
+
+    /// Waits for closure. Cancelling the wait leaves the session open.
+    pub async fn closed(&self) -> CloseReason {
+        CloseReason::from_wire(self.connection.closed().await)
+    }
+
+    /// Immediately closes the connection with application code zero.
+    ///
+    /// This drains first and marks the lifecycle closed, refusing later
+    /// admissions. Reason bytes are subject to QUIC packet capacity.
+    pub fn close(&self, reason: &[u8]) {
+        self.lifecycle.mark_closed();
+        self.connection.close(close_code(0), reason);
+    }
+
+    /// Immediately aborts the connection with application code one.
+    pub fn abort(&self, reason: &[u8]) {
+        self.lifecycle.mark_closed();
+        self.connection.close(close_code(1), reason);
+    }
+}
+
+impl AgentHandle {
+    /// Returns a cloneable control for draining, closing, or waiting for idleness.
+    #[must_use]
+    pub fn control(&self) -> AgentSessionControl {
+        AgentSessionControl::new(self.0.connection.clone(), self.0.lifecycle.clone())
+    }
 }
 
 /// An agent endpoint for establishing protocol sessions.

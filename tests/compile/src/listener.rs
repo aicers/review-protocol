@@ -64,7 +64,13 @@ pub async fn admit(
     let (handle, mut incoming): (ServerHandle, ServerIncoming) = owner.admit(context, policy);
     let list: &[NetworkListItem] = &[];
     handle.send_exclusion_list(list).await?;
+    let lifecycle = control.lifecycle();
+    let _shared = handle.lifecycle();
+    let _incoming_lifecycle = incoming.lifecycle();
     control.drain();
+    let _draining = lifecycle.is_draining();
+    let _active = lifecycle.active_work();
+    control.wait_idle().await;
     let _: Option<ServerStream> = incoming.accept_next().await?;
     control.close(b"drained");
     let _: ServerSessionClose = control.closed().await;

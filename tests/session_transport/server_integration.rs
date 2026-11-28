@@ -282,12 +282,18 @@ async fn integrated_server_path_reproduces_fixtures_and_shuts_down_cleanly() {
             .is_none()
     );
     let requests_outcome = timeout(TEST_TIMEOUT, request_runner).await.unwrap();
-    assert!(matches!(
-        requests_outcome,
-        Ok(Ok(ServerRequestOutcome::Finished))
-    ));
+    let requests_label = match &requests_outcome {
+        Ok(Ok(ServerRequestOutcome::Finished)) => "finished".to_owned(),
+        Ok(Ok(ServerRequestOutcome::Unhandled(_))) => "unhandled".to_owned(),
+        Ok(Err(error)) => format!("runner error: {error}"),
+        Err(error) => format!("join error: {error}"),
+    };
+    assert!(
+        matches!(requests_outcome, Ok(Ok(ServerRequestOutcome::Finished))),
+        "{requests_label}"
+    );
     let events_outcome = timeout(TEST_TIMEOUT, event_runner).await.unwrap();
-    assert!(matches!(events_outcome, Ok(Ok(()))));
+    assert!(matches!(events_outcome, Ok(Ok(()))), "{events_outcome:?}");
     // The request runner finished its response direction at the clean EOF.
     let mut rest = Vec::new();
     timeout(TEST_TIMEOUT, responses.read_to_end(&mut rest))
