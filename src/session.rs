@@ -252,6 +252,10 @@
 //! local closure, and `TransportCloseKind` (TLS alerts, idle timeout, reset,
 //! version mismatch, connection-ID exhaustion, or other). The connection's
 //! observed close state takes precedence over the individual stream error.
+//! A failure of an application-supplied source, such as the package reader
+//! passed to `node_package_install`, is neither a connection nor a stream
+//! failure: it is reported as `TransportFailure::Other` even after the
+//! connection has closed, and `close_reason` still reports the closure.
 //! `AgentHandle::close_reason` and `ServerHandle::close_reason` inspect that state
 //! without waiting; `closed` awaits the same owned reason type.
 //! If TLS establishment fails before a connection is available, only structured
