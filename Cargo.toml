@@ -19,6 +19,7 @@ client = [
   "semver",
   "thiserror",
   "tokio",
+  "tokio/macros",
   "tokio/io-util",
   "tokio/time",
 ]

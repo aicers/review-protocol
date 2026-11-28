@@ -3,3 +3,4 @@
 /target/
 /tests/compile/target/
 Cargo.lock
+!/Cargo.lock

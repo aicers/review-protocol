@@ -10,7 +10,7 @@ use tokio::{sync::watch, time::Instant};
 
 use super::{
     HandshakeMetadata, OutcomeCertainty, PeerCertificates, ServerHandle, ServerIncoming,
-    SessionError, SessionOptions, Shared,
+    SessionError, SessionLifecycle, SessionOptions, Shared,
     handshake::{server_handshake, server_shared},
 };
 use crate::{
@@ -421,13 +421,15 @@ impl PendingSession {
             // A refusal can immediately close the connection. Let the reply
             // reach the peer's transport before exposing that control.
             exchange.finish_and_wait().await?;
-            let control =
-                ServerSessionControl::new(connection.clone()).with_listener(self.listener.clone());
+            let lifecycle = SessionLifecycle::new();
+            let control = ServerSessionControl::new(connection.clone(), lifecycle.clone())
+                .with_listener(self.listener.clone());
             let shared = server_shared(
                 connection,
                 self.options.session.clone(),
                 claims,
                 Some(self.listener.clone()),
+                lifecycle,
             );
             guard.0 = None;
             Ok(UnadmittedSession {
@@ -547,15 +549,15 @@ pub enum ServerSessionClose {
 #[derive(Clone, Debug)]
 pub struct ServerSessionControl {
     connection: Connection,
-    draining: watch::Sender<bool>,
+    lifecycle: SessionLifecycle,
     listener: Option<ListenerClose>,
 }
 
 impl ServerSessionControl {
-    pub(super) fn new(connection: Connection) -> Self {
+    pub(super) fn new(connection: Connection, lifecycle: SessionLifecycle) -> Self {
         Self {
             connection,
-            draining: watch::Sender::new(false),
+            lifecycle,
             listener: None,
         }
     }
@@ -585,13 +587,31 @@ impl ServerSessionControl {
         }
     }
 
-    /// Stops incoming stream acceptance and wakes a blocked accept.
+    /// Returns the cloneable drain state shared with the session's owners.
+    #[must_use]
+    pub fn lifecycle(&self) -> SessionLifecycle {
+        self.lifecycle.clone()
+    }
+
+    /// Stops incoming stream acceptance and refuses new outgoing exchanges.
     ///
-    /// Accepted streams keep running, and outbound operations remain available.
-    /// Draining an unadmitted session also stops acceptance if it is later admitted.
-    /// After joining the supervised work, call [`Self::close`] to end the connection.
+    /// Work admitted before the drain keeps running; accepted streams finish
+    /// their current request or event frame, and owned outgoing exchanges may
+    /// complete. New outgoing exchanges fail with [`super::SessionError::Draining`]
+    /// and [`super::OutcomeCertainty::NotSent`]. Repeated calls are idempotent.
+    /// Draining an unadmitted session also stops acceptance if it is later
+    /// admitted. After joining the supervised work, call [`Self::close`] to end
+    /// the connection.
     pub fn drain(&self) {
-        self.draining.send_replace(true);
+        self.lifecycle.drain();
+    }
+
+    /// Waits until every admitted exchange of this connection completes.
+    ///
+    /// Drain first and apply the application's own deadline outside this future.
+    /// It neither aborts nor joins application tasks.
+    pub async fn wait_idle(&self) {
+        self.lifecycle.wait_idle().await;
     }
 
     /// Immediately closes the connection with application code zero and the given reason.
@@ -603,6 +623,7 @@ impl ServerSessionControl {
     /// listener's code and reason instead, so the peer observes the listener's.
     pub fn close(&self, reason: &[u8]) {
         self.drain();
+        self.lifecycle.mark_closed();
         close_connection(
             &self.connection,
             self.listener.as_ref(),
@@ -617,6 +638,7 @@ impl ServerSessionControl {
     /// as [`Self::close`] does.
     pub fn abort(&self, reason: &[u8]) {
         self.drain();
+        self.lifecycle.mark_closed();
         close_connection(
             &self.connection,
             self.listener.as_ref(),
@@ -626,11 +648,7 @@ impl ServerSessionControl {
     }
 
     pub(super) async fn drained(&self) {
-        let _ = self
-            .draining
-            .subscribe()
-            .wait_for(|draining| *draining)
-            .await;
+        self.lifecycle.wait_drained().await;
     }
 }
 

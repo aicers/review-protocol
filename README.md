@@ -100,10 +100,18 @@ maps the agent's `Err(text)` to `SessionError::RemoteRejection(text)`.
 handshake version is below `0.50.0`. There is no `send_ping`: transport
 keepalive and the idle timeout in `ServerTransportOptions` cover liveness.
 
-`ServerSessionControl` is a cloneable handle to the connection itself, without
-dispatch or commands: `closed` waits for closure and reports a
-`ServerSessionClose`, `drain` stops stream acceptance, `close` ends the session
-with code zero, and `abort` refuses or aborts it with code one.
+`ServerSessionControl` and, on the agent side, `AgentSessionControl` are
+cloneable handles to one connection without dispatch or commands. Both expose
+`lifecycle`, `drain`, `wait_idle`, `close`, and `abort`; the server control
+also reports `ServerSessionClose` from `closed`. `ServerHandle` and
+`AgentHandle` expose the same cloneable `SessionLifecycle`, and every accepted
+stream and owned outgoing exchange shares it. `drain` stops new incoming
+acceptance and locally refuses new outgoing exchanges with
+`SessionError::Draining` and `OutcomeCertainty::NotSent`. Each accepted or
+opened exchange is counted as active before its owner is returned; `active_work`
+observes the count and `wait_idle` resolves when admitted work reaches zero.
+Work admitted before drain may complete. Repeated `drain`, `close`, and `abort`
+calls are idempotent, and close and abort imply drain.
 
 ### Admission is not the handshake
 
@@ -175,9 +183,9 @@ Four controls end work, from the gentlest:
 
 - `ServerListener::shutdown` stops acceptance only. Accepted sessions keep
   running.
-- `ServerSessionControl::drain` then `ServerSessionControl::close` ends one
-  session in order: stop taking streams, let the accepted ones finish, then
-  close with code zero.
+- `ServerSessionControl::drain` or `AgentSessionControl::drain`, then `close`,
+  ends one session in order: stop acceptance and new outgoing exchanges, let
+  already admitted work finish, then close with code zero.
 - `ServerListener::close` closes the endpoint and every connection on it at
   once with code zero, the code of normal shutdown.
 - `ServerListener::abort` does the same with code one, the code of refusal.
@@ -186,15 +194,23 @@ For an orderly shutdown, use this order:
 
 1. `ServerListener::shutdown` stops acceptance and wakes a pending `accept`,
    which returns `None`. Join the handshake tasks.
-2. Call `drain` on each admitted session's `ServerSessionControl`.
-   `ServerIncoming::accept_next` returns `None`; streams already accepted keep
-   running and outbound commands stay available.
-3. Join the session's runner tasks. Both runners return at the peer's clean
-   end of stream, so bound the wait and abort what outlives it.
-4. `close` the session.
+2. Call `drain` on each admitted session's `ServerSessionControl` or
+   `AgentSessionControl`, and on both roles when the application runs both.
+   `accept_next` returns `None`, new outgoing exchanges fail locally, and
+   streams already accepted finish their current request or frame before
+   stopping. A request runner does not start a second invocation, even when a
+   second request is already buffered.
+3. Join the session's runner tasks. A request stream idle at a frame boundary
+   wakes; a partial request is reported as local drain rather than successful
+   completion. Bound the wait with the application's chosen deadline, then
+   abort and join whatever is left. Event reads and callbacks that are still in
+   the transport or a handler remain subject to that deadline.
+4. Wait for `active_work()` to reach zero or for the deadline, then `close` the
+   session.
 5. `ServerListener::wait_idle` waits until the endpoint's connections have
    finished closing. It does not return while an admitted session is still
-   open.
+   open. A queued FIN or transport acknowledgment is not application
+   processing, successful remote mutation, or an exactly-once guarantee.
 
 To close before draining instead, call `ServerListener::close` with a reason.
 It stops acceptance and closes every connection on the endpoint with code zero

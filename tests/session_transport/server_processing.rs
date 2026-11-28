@@ -531,7 +531,7 @@ fn delegated_requests(code: u8) -> Vec<u8> {
 
 pub(super) fn check_events(log: &EventLog) {
     let entries = log.entries.lock().unwrap();
-    assert_eq!(entries.len(), 4);
+    assert_eq!(entries.len(), 4, "{entries:?}");
     assert_eq!(entries[0], format!("{:?}", fixture_event(1, 1.0)));
     assert_eq!(
         entries[1],

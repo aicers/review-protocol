@@ -14,8 +14,10 @@ use tokio::io::AsyncWriteExt;
 use super::FrameLimit;
 #[cfg(feature = "server")]
 use super::ServerRunError;
+#[cfg(feature = "server")]
+use super::SessionLifecycle;
 use super::Shared;
-use super::{OutcomeCertainty, SessionError};
+use super::{OutcomeCertainty, SessionActivity, SessionError};
 
 fn abort_code() -> ApplicationCode {
     ApplicationCode::new(1).expect("exchange abort code fits 62 bits")
@@ -30,23 +32,43 @@ pub struct DetectionEventReceiver {
     header: [u8; 2],
     header_pos: usize,
     limit: FrameLimit,
+    /// Whether a frame read has started but not yet produced a complete frame.
+    ///
+    /// A drain stops only between frames: an already started read resumes and
+    /// its callback completes, while a buffered next frame is left unread.
+    in_frame: bool,
     /// The session this stream was accepted on. The stream can outlive every
     /// other session owner, so it keeps the session, which repeats a
     /// listener-wide close when it drops last.
     session: Arc<Shared>,
+    /// Keeps this accepted stream counted as active work until it drops.
+    _activity: SessionActivity,
 }
 
 #[cfg(feature = "server")]
 impl DetectionEventReceiver {
-    pub(super) fn new(recv: RecvStream, limit: FrameLimit, session: Arc<Shared>) -> Self {
+    pub(super) fn new(
+        recv: RecvStream,
+        limit: FrameLimit,
+        session: Arc<Shared>,
+        activity: SessionActivity,
+    ) -> Self {
         Self {
             raw: Some(recv),
             reader: None,
             header: [0; 2],
             header_pos: 0,
             limit,
+            in_frame: false,
             session,
+            _activity: activity,
         }
+    }
+
+    /// Returns the cloneable drain state shared with this connection's owners.
+    #[must_use]
+    pub fn lifecycle(&self) -> SessionLifecycle {
+        self.session.lifecycle.clone()
     }
     /// Processes this detection event stream with a server detection event
     /// handler.
@@ -61,6 +83,12 @@ impl DetectionEventReceiver {
     /// and cancels any active callback. Effects already performed may remain.
     /// To suspend and resume reads with the receiver retained, use [`Self::next`].
     ///
+    /// A session drain stops this future at the next frame boundary after the
+    /// active frame and callback complete. A frame read that already started
+    /// (including a retained partial read) finishes, but a buffered next frame
+    /// is not read. A stalled read or callback is not interrupted here; the
+    /// application's shutdown deadline must abort and join this future.
+    ///
     /// # Errors
     /// Returns classified framing, truncation, transport, or budget failures,
     /// or [`ServerRunError::DetectionEventHandler`] if a callback returns an I/O
@@ -70,7 +98,12 @@ impl DetectionEventReceiver {
         H: crate::server::DetectionEventStreamHandler + Send,
     {
         loop {
-            match self.read_next().await? {
+            let next = match self.read_next().await {
+                Ok(next) => next,
+                Err(SessionError::Draining) => return Ok(()),
+                Err(error) => return Err(error.into()),
+            };
+            match next {
                 Ok(Some(event)) => handler.handle_detection_event(event).await,
                 Ok(None) => {
                     return handler
@@ -78,6 +111,7 @@ impl DetectionEventReceiver {
                         .await
                         .map_err(ServerRunError::DetectionEventHandler);
                 }
+                Err(SessionError::Draining) => return Ok(()),
                 Err(SessionError::Malformed { source, .. }) => {
                     handler.on_error(&format!("decoding error: {source}")).await
                 }
@@ -98,7 +132,13 @@ impl DetectionEventReceiver {
     /// stream. A decoded event is returned as is, without
     /// [`DetectionEvent::validate`](crate::types::DetectionEvent::validate).
     /// # Errors
-    /// Returns typed transport, truncation, malformed data, or allocation/payload-limit errors.
+    /// Returns typed transport, truncation, malformed data,
+    /// allocation/payload-limit, or local drain errors.
+    ///
+    /// After a session drain, a call at a frame boundary returns
+    /// [`SessionError::Draining`] and stops the stream without reporting a
+    /// buffered frame. A partially read frame is resumed and returned so the
+    /// active invocation can finish; the following call then observes the drain.
     pub async fn next(&mut self) -> Result<Option<crate::types::DetectionEvent>, SessionError> {
         match self.read_next().await {
             Ok(Ok(event)) => Ok(event),
@@ -113,6 +153,19 @@ impl DetectionEventReceiver {
     /// Reads the next frame; the inner error is a decoding failure of a frame
     /// that was read completely and recycled, after which the stream is intact.
     async fn read_next(
+        &mut self,
+    ) -> Result<Result<Option<crate::types::DetectionEvent>, SessionError>, SessionError> {
+        // A drain stops at the next frame boundary. A frame read that already
+        // started is allowed to finish and dispatch its callback; a read that
+        // has not started is refused. A stalled in-progress read stays subject
+        // to the application's shutdown deadline.
+        if self.session.lifecycle.is_draining() && !self.in_frame {
+            return Err(SessionError::Draining);
+        }
+        self.read_next_inner().await
+    }
+
+    async fn read_next_inner(
         &mut self,
     ) -> Result<Result<Option<crate::types::DetectionEvent>, SessionError>, SessionError> {
         while self.header_pos < 2 {
@@ -138,10 +191,18 @@ impl DetectionEventReceiver {
         if let Some(recv) = self.raw.take() {
             self.reader = Some(FramedReader::new(recv, self.limit.wire()));
         }
+        // The reserved two-byte stream header is not a frame. A drain that
+        // lands while it is being read still stops before the first frame.
+        if self.session.lifecycle.is_draining() && !self.in_frame {
+            return Err(SessionError::Draining);
+        }
         let reader = self.reader.as_mut().ok_or_else(|| {
             SessionError::frame(oinq::frame::FrameError::Poisoned, OutcomeCertainty::Unknown)
         })?;
-        let Some(frame) = reader.read().await.map_err(|e| {
+        self.in_frame = true;
+        let read = reader.read().await;
+        self.in_frame = false;
+        let Some(frame) = read.map_err(|e| {
             SessionError::frame(e, OutcomeCertainty::Unknown)
                 .on_connection(&self.session.connection)
         })?
@@ -184,16 +245,24 @@ pub struct DetectionEventSender {
     writer: Option<FramedWriter<SendStream>>,
     header_pos: usize,
     limit: FrameLimit,
+    /// Keeps this opened stream counted as active work until it drops.
+    _activity: SessionActivity,
 }
 #[cfg(feature = "client")]
 impl DetectionEventSender {
-    pub(super) fn new(send: SendStream, limit: FrameLimit, session: Arc<Shared>) -> Self {
+    pub(super) fn new(
+        send: SendStream,
+        limit: FrameLimit,
+        session: Arc<Shared>,
+        activity: SessionActivity,
+    ) -> Self {
         Self {
             session,
             raw: Some(send),
             writer: None,
             header_pos: 0,
             limit,
+            _activity: activity,
         }
     }
     /// Prepares a detection event after the stream header has been flushed.
@@ -210,8 +279,12 @@ impl DetectionEventSender {
     /// fields and is not the same schema as [`DetectionEvent`](crate::types::DetectionEvent).
     ///
     /// # Errors
-    /// Returns a pending-header error, encoding error, or payload-limit error.
+    /// Returns [`SessionError::Draining`] after drain has started, a
+    /// pending-header error, an encoding error, or a payload-limit error.
     pub fn start_serialized<T: serde::Serialize>(&mut self, event: &T) -> Result<(), SessionError> {
+        if self.session.lifecycle.is_draining() {
+            return Err(SessionError::Draining);
+        }
         self.writer
             .as_mut()
             .ok_or_else(|| {
@@ -354,12 +427,17 @@ impl super::AgentHandle {
     /// Returns classified transport or deadline errors. Cancelling aborts an opened stream.
     pub async fn open_detection_event_stream(&self) -> Result<DetectionEventSender, SessionError> {
         let operation = async {
+            let activity = self.0.lifecycle.try_admit()?;
             let send = self.0.connection.open_uni().await.map_err(|e| {
                 SessionError::transport(e, OutcomeCertainty::NotSent)
                     .on_connection(&self.0.connection)
             })?;
-            let mut sender =
-                DetectionEventSender::new(send, self.0.options.detection_events, self.0.clone());
+            let mut sender = DetectionEventSender::new(
+                send,
+                self.0.options.detection_events,
+                self.0.clone(),
+                activity,
+            );
             sender.flush().await?;
             Ok(sender)
         };

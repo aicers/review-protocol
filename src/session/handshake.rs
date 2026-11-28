@@ -50,6 +50,7 @@ pub(super) fn server_shared(
     options: SessionOptions,
     agent: crate::AgentInfo,
     listener: Option<super::listener::ListenerClose>,
+    lifecycle: super::SessionLifecycle,
 ) -> std::sync::Arc<Shared> {
     let network_list_blocker =
         crate::network_list_blocker([agent.protocol_version.as_str()]).map(str::to_owned);
@@ -60,6 +61,7 @@ pub(super) fn server_shared(
         network_list_blocker,
     );
     shared.listener = listener;
+    shared.lifecycle = lifecycle;
     std::sync::Arc::new(shared)
 }
 

@@ -25,6 +25,14 @@ pub async fn agent(
     let _identity = handle.id();
     let _close = handle.close_reason();
     let _chain = handle.peer_certificates();
+    let control: review_protocol::session::AgentSessionControl = incoming.control();
+    let lifecycle: review_protocol::session::SessionLifecycle = control.lifecycle();
+    let _shared: review_protocol::session::SessionLifecycle = handle.lifecycle();
+    control.drain();
+    let _draining = lifecycle.is_draining();
+    let _active = lifecycle.active_work();
+    let _accept = incoming.accept_next().await?;
+    control.wait_idle().await;
     let _config: String = handle.get_config().await?;
     let mut stream = incoming.accept().await?;
     if let Some(AgentRequest::Hostname { reply, .. }) = stream.next().await? {
@@ -319,7 +327,8 @@ pub fn exhaustive_session_error(error: review_protocol::session::SessionError) {
     match error {
         SessionError::StreamStopped { .. } | SessionError::Transport { .. } | SessionError::Malformed { .. }
         | SessionError::IncompatibleProtocol { .. } | SessionError::RemoteRejection(_)
-        | SessionError::LimitExceeded { .. } | SessionError::Deadline { .. } => {}
+        | SessionError::LimitExceeded { .. } | SessionError::Deadline { .. }
+        | SessionError::Draining => {}
     }
 }
 

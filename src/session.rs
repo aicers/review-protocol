@@ -62,8 +62,26 @@
 //!
 //! To shut down, call `ServerListener::shutdown` to end listener acceptance.
 //! Already accepted work retains its endpoint resources even after listener drop.
-//! Use `ServerSessionControl::drain` to stop receiving new streams while accepted
-//! work completes, then close each connection after joining the work.
+//! Each admitted server session and each connected agent session exposes a
+//! cloneable `SessionLifecycle` through the handle, incoming owner, and control.
+//! `ServerSessionControl` and `AgentSessionControl` add connection close, abort,
+//! and close observation without exposing Quinn or oinq types. Every clone of a
+//! handle or control, every accepted stream, and every owned outgoing exchange
+//! for one connection shares that drain state.
+//!
+//! `drain` is the single admission ordering point. It stops incoming stream
+//! acceptance, wakes a blocked accept, and refuses new outgoing exchanges with
+//! `SessionError::Draining` and `OutcomeCertainty::NotSent`. An accept or outgoing
+//! open that wins the race is registered as active before its owner is returned;
+//! one that loses is dropped and cannot escape untracked. Work admitted before
+//! drain may complete under its existing request, frame, package, or power
+//! contract. `active_work` observes the admitted count and `wait_idle` resolves
+//! when it reaches zero. Neither future stops tasks or applies a deadline:
+//! applications drain, join their own runners, abort and join leftovers at their
+//! selected deadline, close, and then await endpoint transport idleness. Repeated
+//! `drain`, `close`, and `abort` calls are idempotent; close and abort also mark
+//! the lifecycle closed.
+//!
 //! `ServerListener::close` instead closes every connection on the endpoint at once
 //! with application code zero, the code of normal shutdown, and
 //! `ServerListener::abort` with code one, the code of refusal; whichever runs first
@@ -108,10 +126,22 @@
 //! Keep request stream owners alive until clean EOF, or call `finish` at a request
 //! boundary when intentionally stopping dispatch. Dropping an owner resets/stops
 //! its streams; dropping an unfinished response also aborts the borrowed stream.
-//! On shutdown, stop acceptance, finish the active invocation, then call `finish`
-//! before reading another request. Applications supervise, cancel, and join tasks;
-//! these objects do not spawn background runners or join application tasks.
-//! FIN and transport acknowledgment do not prove application processing.
+//! A request invocation begins with a complete request frame and ends when its
+//! response is flushed. After drain, the runner finishes the current invocation
+//! and its response, then stops before starting another, even if another request
+//! is already buffered. A stream still idle at the frame boundary stops cleanly;
+//! drain racing a partially read header or payload finishes the response direction
+//! and reports the local drain rather than treating truncation as success.
+//! Authorization still runs before every executed invocation.
+//!
+//! Event senders finish a prepared frame and its flush, then refuse preparation
+//! of another frame with `SessionError::Draining`. Event receivers keep draining
+//! transport frames and callbacks that were already submitted; a stalled read or
+//! callback remains subject to the application's shutdown deadline. Applications
+//! supervise, cancel, and join tasks; these objects do not spawn background
+//! runners or join application tasks. Queued FIN or transport acknowledgment does
+//! not prove application processing, a successful remote mutation, or an
+//! exactly-once outcome.
 //!
 //! Package installs use `preflight`; terminal verdicts complete the invocation,
 //! while `Proceed` returns the borrowed exchange for bounded chunk reads and a
@@ -414,6 +444,7 @@ mod events;
 mod pem;
 
 mod exchange;
+mod lifecycle;
 #[cfg(feature = "server")]
 pub use events::DetectionEventReceiver;
 #[cfg(feature = "client")]
@@ -434,7 +465,8 @@ use std::{
 };
 
 #[cfg(feature = "client")]
-pub use connector::{AgentConnector, AgentTransportOptions};
+pub use connector::{AgentConnector, AgentSessionControl, AgentTransportOptions};
+pub use lifecycle::{SessionActivity, SessionLifecycle};
 #[cfg(feature = "server")]
 pub use listener::{
     PendingSession, ProtocolWindow, ServerListener, ServerListenerOptions, ServerSessionClose,
@@ -525,6 +557,12 @@ pub enum SessionError {
         #[source]
         source: Option<tokio::time::error::Elapsed>,
     },
+    /// The connection has started draining, so the exchange was not submitted.
+    ///
+    /// The operation was refused locally before any request bytes reached the
+    /// transport, so its outcome certainty is [`OutcomeCertainty::NotSent`].
+    #[error("session is draining")]
+    Draining,
 }
 
 /// A failure while running server request or event processing.
@@ -584,6 +622,7 @@ impl SessionError {
             Self::RemoteRejection(_) | Self::IncompatibleProtocol { .. } => {
                 Some(OutcomeCertainty::Rejected)
             }
+            Self::Draining => Some(OutcomeCertainty::NotSent),
         }
     }
 
@@ -686,6 +725,8 @@ struct Shared {
     /// The handshake version that keeps this session off the exclusion-list and
     /// watchlist exchanges, or `None` when both sides speak the item lists.
     network_list_blocker: Option<String>,
+    /// Shared drain and active-work state for every owner of this connection.
+    lifecycle: lifecycle::SessionLifecycle,
     /// The close of the listener that accepted this session, which dropping
     /// the session repeats.
     #[cfg(feature = "server")]
@@ -710,6 +751,7 @@ impl Shared {
             id: SessionId(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
             metadata,
             network_list_blocker,
+            lifecycle: lifecycle::SessionLifecycle::new(),
             #[cfg(feature = "server")]
             listener: None,
         }
@@ -782,8 +824,28 @@ macro_rules! handle_metadata {
             pub fn close_reason(&self) -> Option<CloseReason> {
                 transport::close_reason(&self.0.connection)
             }
+            /// Returns the cloneable drain state shared by every connection owner.
+            #[must_use]
+            pub fn lifecycle(&self) -> SessionLifecycle {
+                self.0.lifecycle.clone()
+            }
+            /// Stops incoming acceptance and refuses new outgoing exchanges.
+            ///
+            /// Admitted work keeps running until it completes or the application
+            /// aborts it. Repeated calls are idempotent.
+            pub fn drain(&self) {
+                self.0.lifecycle.drain();
+            }
+            /// Waits until every admitted exchange belonging to this connection completes.
+            ///
+            /// Drain first; otherwise concurrent producers can keep the count above
+            /// zero. This applies no deadline and does not abort or join tasks.
+            pub async fn wait_idle(&self) {
+                self.0.lifecycle.wait_idle().await;
+            }
             /// Immediately closes the shared connection with a checked code and uninterpreted reason.
             pub fn close(&self, code: ApplicationCode, reason: &[u8]) {
+                self.0.lifecycle.mark_closed();
                 self.0.connection.close(code.wire(), reason);
             }
         }

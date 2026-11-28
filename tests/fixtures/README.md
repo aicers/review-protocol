@@ -255,3 +255,17 @@ reports as server requests 53 through 55. Their request bodies and shared
 types have fixed wire snapshots in `src/types/endpoint_tests.rs`, and their
 transport tests cover routing and authorization. The existing binary
 fixtures remain unchanged.
+
+## Node package lifecycle fixtures for 0.37.0
+
+`current/package-request.bin`, `current/package-proceed.bin`,
+`current/package-chunks.bin`, `current/package-terminal-preflight.bin` and
+`current/package-final.bin` pin the complete server-issued node package
+exchange. Each file begins with the four-byte big-endian frame length and
+contains only one frame unless noted. The request body was composed from the
+wire declaration with bincode 2 standard serde encoding and a literal
+little-endian request code. The chunk fixture contains two frames split at the
+literal source boundaries `[1, 2]` and `[3, 4, 5]`. The terminal responses are
+the literal frame bodies for Proceed, terminal preflight and final success.
+These expected bytes were written from those declarations, not produced by the
+session encoder under test, and the existing fixtures are unchanged.
