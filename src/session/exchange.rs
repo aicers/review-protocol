@@ -1,13 +1,14 @@
 //! Stream ownership and the single bounded request/exchange path.
 use oinq::{
     ApplicationCode, Connection, RecvStream, SendStream,
-    frame::{Frame, FrameLimit, FramedReader, FramedWriter},
+    frame::{Frame, FramedReader, FramedWriter},
 };
 use serde::{Serialize, de::DeserializeOwned};
 
-use super::{OutcomeCertainty, SessionError, SessionOptions};
+use super::{FrameLimit, OutcomeCertainty, SessionError, SessionOptions};
 
-pub(super) struct Exchange {
+pub(crate) struct Exchange {
+    connection: Connection,
     reader: Option<FramedReader<RecvStream>>,
     writer: Option<FramedWriter<SendStream>>,
     finishing: Option<SendStream>,
@@ -17,15 +18,37 @@ pub(super) struct Exchange {
 }
 
 impl Exchange {
-    pub(super) fn new(send: SendStream, recv: RecvStream, limit: FrameLimit) -> Self {
+    pub(super) fn new(
+        send: SendStream,
+        recv: RecvStream,
+        limit: FrameLimit,
+        connection: &Connection,
+    ) -> Self {
         Self {
+            connection: connection.clone(),
             finishing: None,
             limit,
             read_ended: false,
-            reader: Some(FramedReader::new(recv, limit)),
-            writer: Some(FramedWriter::new(send, limit)),
+            reader: Some(FramedReader::new(recv, limit.wire())),
+            writer: Some(FramedWriter::new(send, limit.wire())),
             certainty: OutcomeCertainty::NotSent,
         }
+    }
+
+    fn frame_error(
+        &self,
+        error: oinq::frame::FrameError,
+        certainty: OutcomeCertainty,
+    ) -> SessionError {
+        SessionError::frame(error, certainty).on_connection(&self.connection)
+    }
+
+    fn transport_error(
+        &self,
+        error: impl std::error::Error + Send + Sync + 'static,
+        certainty: OutcomeCertainty,
+    ) -> SessionError {
+        SessionError::transport(error, certainty).on_connection(&self.connection)
     }
 
     pub(super) fn start<T: Serialize>(&mut self, value: T) -> Result<(), SessionError> {
@@ -33,7 +56,7 @@ impl Exchange {
             .as_mut()
             .ok_or_else(|| SessionError::frame(oinq::frame::FrameError::Poisoned, self.certainty))?
             .start(value)
-            .map_err(|e| SessionError::frame(e, self.certainty))
+            .map_err(|e| self.frame_error(e, self.certainty))
     }
 
     pub(super) fn start_request<T: Serialize>(
@@ -56,7 +79,7 @@ impl Exchange {
             .await;
         if let Err(e) = result {
             self.abort();
-            return Err(SessionError::frame(e, self.certainty));
+            return Err(self.frame_error(e, self.certainty));
         }
         Ok(())
     }
@@ -64,7 +87,7 @@ impl Exchange {
     pub(super) async fn frame(&mut self) -> Result<Frame, SessionError> {
         self.next_frame().await?.ok_or_else(|| {
             self.abort();
-            SessionError::transport(
+            self.transport_error(
                 std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
                 self.certainty,
             )
@@ -78,7 +101,7 @@ impl Exchange {
         } else {
             self.read_ended = true;
             self.stop_reader();
-            Err(SessionError::transport(
+            Err(self.transport_error(
                 std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
                 self.certainty,
             ))
@@ -98,7 +121,7 @@ impl Exchange {
             Err(error) => {
                 self.read_ended = true;
                 self.stop_reader();
-                Err(SessionError::frame(error, self.certainty))
+                Err(self.frame_error(error, self.certainty))
             }
         }
     }
@@ -124,7 +147,7 @@ impl Exchange {
             Ok(frame) => Ok(frame),
             Err(e) => {
                 self.abort();
-                Err(SessionError::frame(e, self.certainty))
+                Err(self.frame_error(e, self.certainty))
             }
         }
     }
@@ -139,7 +162,7 @@ impl Exchange {
             .as_mut()
             .ok_or_else(|| SessionError::frame(oinq::frame::FrameError::Poisoned, self.certainty))?
             .start_raw(bytes)
-            .map_err(|e| SessionError::frame(e, self.certainty))
+            .map_err(|e| self.frame_error(e, self.certainty))
     }
 
     #[cfg(feature = "client")]
@@ -148,7 +171,7 @@ impl Exchange {
             .as_mut()
             .ok_or_else(|| SessionError::frame(oinq::frame::FrameError::Poisoned, self.certainty))?
             .recycle(bytes)
-            .map_err(|e| SessionError::frame(e, self.certainty))
+            .map_err(|e| self.frame_error(e, self.certainty))
     }
 
     pub(super) fn recycle(&mut self, frame: Frame) -> Result<(), SessionError> {
@@ -156,7 +179,7 @@ impl Exchange {
             .as_mut()
             .ok_or_else(|| SessionError::frame(oinq::frame::FrameError::Poisoned, self.certainty))?
             .recycle(frame.into_bytes())
-            .map_err(|e| SessionError::frame(e, self.certainty))
+            .map_err(|e| self.frame_error(e, self.certainty))
     }
 
     pub(super) async fn receive<T: DeserializeOwned>(&mut self) -> Result<T, SessionError> {
@@ -194,11 +217,12 @@ impl Exchange {
             self.finishing = Some(writer.into_inner());
         }
         if let Some(send) = self.finishing.as_mut() {
-            send.finish()
-                .map_err(|e| SessionError::transport(e, self.certainty))?;
-            send.stopped()
-                .await
-                .map_err(|e| SessionError::transport(e, self.certainty))?;
+            send.finish().map_err(|e| {
+                SessionError::transport(e, self.certainty).on_connection(&self.connection)
+            })?;
+            send.stopped().await.map_err(|e| {
+                SessionError::transport(e, self.certainty).on_connection(&self.connection)
+            })?;
         }
         self.finishing.take();
         self.finish()
@@ -216,7 +240,9 @@ impl Exchange {
             if let Err(e) = send.finish() {
                 let _ = send.reset(abort_code());
                 self.abort();
-                return Err(SessionError::transport(e, self.certainty));
+                return Err(
+                    SessionError::transport(e, self.certainty).on_connection(&self.connection)
+                );
             }
         }
         if let Some(reader) = self.reader.take() {
@@ -230,10 +256,10 @@ impl Exchange {
         // Called only at known frame boundaries, never across a suspended read.
         self.limit = read_limit;
         if let Some(reader) = self.reader.take() {
-            self.reader = Some(FramedReader::new(reader.into_inner(), read_limit));
+            self.reader = Some(FramedReader::new(reader.into_inner(), read_limit.wire()));
         }
         if let Some(writer) = self.writer.take() {
-            self.writer = Some(FramedWriter::new(writer.into_inner(), write_limit));
+            self.writer = Some(FramedWriter::new(writer.into_inner(), write_limit.wire()));
         }
     }
 
@@ -295,8 +321,8 @@ pub(super) async fn unary_as<I: Serialize, O: DeserializeOwned>(
         let (send, recv) = connection
             .open_bi()
             .await
-            .map_err(|e| SessionError::transport(e, certainty))?;
-        let mut exchange = Exchange::new(send, recv, options.unary);
+            .map_err(|e| SessionError::transport(e, certainty).on_connection(connection))?;
+        let mut exchange = Exchange::new(send, recv, options.unary, connection);
         exchange.start_request(code, input)?;
         certainty = OutcomeCertainty::Unknown;
         exchange.flush().await?;
@@ -329,8 +355,8 @@ pub(super) async fn send_only<I: Serialize>(
         let (send, recv) = connection
             .open_bi()
             .await
-            .map_err(|e| SessionError::transport(e, certainty))?;
-        let mut exchange = Exchange::new(send, recv, options.unary);
+            .map_err(|e| SessionError::transport(e, certainty).on_connection(connection))?;
+        let mut exchange = Exchange::new(send, recv, options.unary, connection);
         exchange.start_request(code, input)?;
         certainty = OutcomeCertainty::Unknown;
         exchange.flush().await?;

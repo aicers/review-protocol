@@ -587,15 +587,15 @@ mod server {
     }
 }
 
-/// The in-process peer. Only this half touches the transport re-exports.
+/// The in-process peer, using the public agent connector.
 mod agent {
     use std::{collections::BTreeSet, net::SocketAddr};
 
     use review_protocol::{
         AgentInfo, PROTOCOL_VERSION,
         session::{
-            AgentHandle, AgentIncoming, AgentRequest, CloseReason, Endpoint, SessionError,
-            SessionOptions, TransportOptions,
+            AgentConnector, AgentHandle, AgentIncoming, AgentRequest, AgentTransportOptions,
+            CloseReason, SessionError, SessionOptions,
         },
         types::{
             Detail, DetectionEvent, DetectionModel, PortScanDetail, PrimarySubject, RawEventKind,
@@ -622,13 +622,17 @@ mod agent {
             trusted_server: &pki::Credential,
         ) -> Result<Self, BoxError> {
             let tls = pki::client_config(credential, trusted_server)?;
-            let endpoint = Endpoint::client(tls, LOOPBACK, TransportOptions::default())?;
-            let connection = endpoint.connect(address, "localhost").await?;
+            let connector = AgentConnector::bind(
+                LOOPBACK,
+                tls,
+                AgentTransportOptions::default(),
+                SessionOptions::legacy_compatible(),
+            )?;
             let claims = AgentInfo {
                 agent_name: name.into(),
                 agent_version: env!("CARGO_PKG_VERSION").into(),
                 protocol_version: PROTOCOL_VERSION.into(),
-                addr: endpoint.local_addr()?,
+                addr: connector.local_addr()?,
                 status: Status::Ready,
                 capabilities: BTreeSet::new(),
                 active_trust_epoch: None,
@@ -636,12 +640,7 @@ mod agent {
                 provisioning_fingerprint: None,
                 audit_health: None,
             };
-            let (handle, incoming) = AgentHandle::from_transport(
-                connection,
-                SessionOptions::legacy_compatible(),
-                &claims,
-            )
-            .await?;
+            let (handle, incoming) = connector.connect(address, "localhost", &claims).await?;
             println!("[agent {name}] handshake accepted");
             let commands = tokio::spawn(answer_commands(name, incoming));
             Ok(Self {

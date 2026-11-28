@@ -4,12 +4,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use oinq::Connection;
 use review_protocol::{
     auth::{AuthorizationContext, AuthorizationError, AuthorizerV2, PeerContext},
     server::{DetectionEventStreamHandler, Handler},
     service_id::{self, ServiceId},
     session::{
-        Connection, FrameLimit, OutcomeCertainty, ServerRequestOutcome, ServerRunError,
+        FrameLimit as SessionFrameLimit, OutcomeCertainty, ServerRequestOutcome, ServerRunError,
         SessionError, SessionOptions,
     },
     types::{
@@ -762,24 +763,29 @@ async fn runner_reevaluates_policy_for_the_same_service() {
 }
 
 #[tokio::test]
-async fn runner_unknown_code_is_terminal_and_unbound_runner_fails_closed() {
+async fn runner_unknown_code_is_terminal_and_admission_binds_policy() {
     let (mut incoming, _, _, node) = raw_sessions(SessionOptions::legacy_compatible()).await;
     let handler = Arc::new(FixtureHandler::default());
     let policy = Arc::new(Policy::default());
 
-    let (send, mut recv) = open_requests(&node, GET_CONFIG).await;
+    // Listener admission binds the policy before exposing incoming streams.
+    let (mut send, mut recv) = open_requests(&node, GET_CONFIG).await;
+    send.finish().unwrap();
     assert!(matches!(
         request_stream(&mut incoming)
             .await
             .run(handler.clone())
             .await,
-        Err(ServerRunError::MissingAuthorization),
+        Ok(ServerRequestOutcome::Finished)
     ));
-    assert_eq!(send.stopped().await.unwrap().unwrap().get(), 1);
+    let mut replies = Vec::new();
+    recv.read_to_end(&mut replies).await.unwrap();
+    assert_eq!(replies, b"\x00\x00\x00\x0f\x00\x0dconfiguration");
     assert_eq!(
-        recv.read_u8().await.unwrap_err().kind(),
-        io::ErrorKind::ConnectionReset
+        *handler.0.lock().unwrap(),
+        [Observation::Handler(service_id::SERVER_CONFIG_GET)]
     );
+    handler.0.lock().unwrap().clear();
 
     let mut incoming = incoming.with_authorization(context(), policy.clone());
     let (mut send, mut recv) = open_requests(&node, UNKNOWN_REQUESTS).await;
@@ -807,7 +813,7 @@ async fn runner_unknown_code_is_terminal_and_unbound_runner_fails_closed() {
 async fn runner_preserves_local_rejections_when_the_reply_exceeds_the_budget() {
     let mut options = SessionOptions::legacy_compatible();
     // A GetConfig request and its successful reply fit this limit.
-    options.unary = FrameLimit::new(16).unwrap();
+    options.unary = SessionFrameLimit::new(16).unwrap();
     let (incoming, _, _, node) = raw_sessions(options).await;
     let policy = Arc::new(Policy {
         deny: Some(service_id::SERVER_CONFIG_GET),
@@ -1081,7 +1087,7 @@ async fn event_runner_distinguishes_clean_end_truncation_and_callback_failures()
         if expected_header_error {
             assert!(
                 matches!(error, ServerRunError::Session(SessionError::Transport { source, .. }) if
-                source.downcast_ref::<io::Error>().is_some_and(|e| e.kind() == io::ErrorKind::UnexpectedEof))
+                matches!(&source, review_protocol::session::TransportFailure::StreamFailed(error) if error.downcast_ref::<io::Error>().is_some_and(|e| e.kind() == io::ErrorKind::UnexpectedEof)))
             );
         } else {
             assert!(
@@ -1135,8 +1141,8 @@ async fn processing_enforces_explicit_frame_limits() {
         assert_eq!(limit.get(), u32::MAX as usize);
     }
     assert!(options.operation_timeout.is_none());
-    options.unary = FrameLimit::new(32).unwrap();
-    options.detection_events = FrameLimit::new(4).unwrap();
+    options.unary = SessionFrameLimit::new(32).unwrap();
+    options.detection_events = SessionFrameLimit::new(4).unwrap();
     let (incoming, _, _, node) = raw_sessions(options).await;
     let policy = Arc::new(Policy::default());
     let handler = Arc::new(FixtureHandler::default());
@@ -1188,7 +1194,7 @@ async fn low_level_first_response_limit_after_request_is_unknown() {
     use review_protocol::session::{FrameError, ServerRequest};
 
     let mut options = SessionOptions::legacy_compatible();
-    options.unary = FrameLimit::new(32).unwrap();
+    options.unary = SessionFrameLimit::new(32).unwrap();
     let (mut incoming, _, _, node) = raw_sessions(options).await;
     let (_send, _recv) = open_requests(&node, GET_CONFIG).await;
     let mut stream = request_stream(&mut incoming).await;
@@ -1245,7 +1251,7 @@ async fn label_lookup_uses_the_borrowed_argument_budget() {
 
     for limit in [budget, budget - 1] {
         let mut options = SessionOptions::legacy_compatible();
-        options.unary = FrameLimit::new(limit).unwrap();
+        options.unary = SessionFrameLimit::new(limit).unwrap();
         let (incoming, _, _, node) = raw_sessions(options).await;
         let mut incoming = incoming.with_authorization(context(), Arc::new(Policy::default()));
         let handler = Arc::new(LabelLookup::default());

@@ -49,7 +49,7 @@ pub(super) fn decode<'de, T: serde::Deserialize<'de>>(
     )
     .map_err(|error| {
         if budget.exceeded.get() || matches!(error, bincode::error::DecodeError::LimitExceeded) {
-            super::SessionError::limit(oinq::frame::FrameError::Decode(error))
+            super::SessionError::limit(super::FrameError::Decode(error))
         } else {
             super::SessionError::malformed(error)
         }

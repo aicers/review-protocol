@@ -7,12 +7,13 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use oinq::{Connection, Endpoint, TransportOptions};
 use review_protocol::{
     MIN_PROTOCOL_VERSION_REQ, PROTOCOL_VERSION,
     session::{
-        AgentHandle, AgentIncoming, AgentRequest, Connection, Endpoint, ProtocolWindow,
-        ServerHandle, ServerIncoming, ServerListener, ServerListenerOptions, ServerRequestOutcome,
-        ServerSessionControl, ServerTransportOptions, SessionOptions, TransportOptions,
+        AgentConnector, AgentHandle, AgentTransportOptions, ProtocolWindow, ServerHandle,
+        ServerIncoming, ServerListener, ServerListenerOptions, ServerRequestOutcome,
+        ServerSessionControl, ServerTransportOptions, SessionOptions,
     },
 };
 use rustls::{
@@ -74,7 +75,7 @@ fn server_tls(certificate: &Certificate, client: &Certificate) -> Arc<rustls::Se
     )
 }
 
-fn agent_endpoint(server: &Certificate, client: &Certificate) -> Endpoint {
+fn agent_tls(server: &Certificate, client: &Certificate) -> Arc<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -85,7 +86,7 @@ fn agent_endpoint(server: &Certificate, client: &Certificate) -> Endpoint {
             PrivatePkcs8KeyDer::from(client.key.clone()).into(),
         )
         .unwrap();
-    Endpoint::client(Arc::new(config), LOOPBACK, TransportOptions::default()).unwrap()
+    Arc::new(config)
 }
 
 /// Connects an agent advertising the current protocol and admits it with the
@@ -96,23 +97,18 @@ async fn admitted(
     policy: Policy,
 ) -> (
     (ServerHandle, ServerIncoming, ServerSessionControl),
-    (Connection, AgentHandle, AgentIncoming),
+    Connection,
 ) {
     let mut claims = super::claims();
     claims.protocol_version = PROTOCOL_VERSION.into();
     let address = listener.local_addr().unwrap();
-    let (unadmitted, (node, agent)) = timeout(TEST_TIMEOUT, async {
+    let (unadmitted, node) = timeout(TEST_TIMEOUT, async {
         tokio::join!(
             async { listener.accept().await.unwrap().unwrap().handshake().await },
             async {
                 let node = endpoint.connect(address, "localhost").await.unwrap();
-                let agent = AgentHandle::from_transport(
-                    node.clone(),
-                    SessionOptions::legacy_compatible(),
-                    &claims,
-                )
-                .await;
-                (node, agent)
+                super::raw_agent_handshake(&node, &claims).await;
+                node
             },
         )
     })
@@ -123,21 +119,24 @@ async fn admitted(
     assert_eq!(unadmitted.peer_certificates().unwrap().chain().len(), 1);
     let control = unadmitted.control();
     let (handle, incoming) = unadmitted.admit(context(), Arc::new(policy));
-    let (agent, agent_incoming) = agent.unwrap();
-    ((handle, incoming, control), (node, agent, agent_incoming))
+    ((handle, incoming, control), node)
 }
 
 /// Answers one `RunDetectorOnce` command on the agent's incoming owner.
-async fn answer_detector_command(incoming: &mut AgentIncoming) -> i32 {
-    let mut stream = incoming.accept().await.unwrap();
-    let AgentRequest::RunDetectorOnce { request, reply } = stream.next().await.unwrap().unwrap()
-    else {
-        panic!("expected the RunDetectorOnce command");
-    };
-    reply.respond(Ok(())).await.unwrap();
-    assert!(stream.next().await.unwrap().is_none());
-    stream.finish().unwrap();
-    request
+async fn answer_detector_command(peer: &Connection) -> i32 {
+    let (send, recv) = peer.accept_bi().await.unwrap();
+    let limit = oinq::frame::FrameLimit::new(4096).unwrap();
+    let mut reader = oinq::frame::FramedReader::new(recv, limit);
+    let frame = reader.read().await.unwrap().unwrap();
+    // The current command fixture is a fixed little-endian code and bincode i32.
+    let (_, payload) = frame.as_bytes().split_at(4);
+    let (detector, _) =
+        bincode::serde::decode_from_slice(payload, bincode::config::standard()).unwrap();
+    let mut writer = oinq::frame::FramedWriter::new(send, limit);
+    writer.start(Ok::<(), String>(())).unwrap();
+    writer.flush().await.unwrap();
+    writer.into_inner().finish().unwrap();
+    detector
 }
 
 /// Binds a listener accepting the crate's protocol window.
@@ -161,13 +160,34 @@ async fn reload_and_admit(
     listener
         .reload_tls(server_tls(&replacement, client))
         .unwrap();
-    let endpoint = agent_endpoint(&replacement, client);
-    // The control retains the connection after the other owners drop.
-    let ((_, _, control), (node, agent, _)) =
-        admitted(listener, &endpoint, Policy::default()).await;
+    let connector = AgentConnector::bind(
+        LOOPBACK,
+        agent_tls(&replacement, client),
+        AgentTransportOptions::default(),
+        SessionOptions::legacy_compatible(),
+    )
+    .unwrap();
+    let mut claims = super::claims();
+    claims.protocol_version = PROTOCOL_VERSION.into();
+    let (unadmitted, agent) = tokio::join!(
+        async {
+            listener
+                .accept()
+                .await
+                .unwrap()
+                .unwrap()
+                .handshake()
+                .await
+                .unwrap()
+        },
+        connector.connect(listener.local_addr().unwrap(), "localhost", &claims),
+    );
+    let control = unadmitted.control();
+    let (_handle, _incoming) = unadmitted.admit(context(), Arc::new(Policy::default()));
+    let (agent, _incoming) = agent.unwrap();
     assert_eq!(
-        node.peer_certificates().unwrap(),
-        std::slice::from_ref(&replacement.der)
+        agent.peer_certificates().unwrap().chain(),
+        &[replacement.der.as_ref().to_vec()]
     );
     (control, agent)
 }
@@ -177,7 +197,12 @@ async fn integrated_server_path_reproduces_fixtures_and_shuts_down_cleanly() {
     let server_certificate = Certificate::generate();
     let client_certificate = Certificate::generate();
     let listener = listen(&server_certificate, &client_certificate);
-    let endpoint = agent_endpoint(&server_certificate, &client_certificate);
+    let endpoint = Endpoint::client(
+        agent_tls(&server_certificate, &client_certificate),
+        LOOPBACK,
+        TransportOptions::default(),
+    )
+    .unwrap();
 
     let handler = Arc::new(FixtureHandler::default());
     let trace = handler.0.clone();
@@ -185,8 +210,7 @@ async fn integrated_server_path_reproduces_fixtures_and_shuts_down_cleanly() {
         trace: trace.clone(),
         deny: None,
     };
-    let ((manager, mut incoming, control), (node, agent, mut agent_incoming)) =
-        admitted(&listener, &endpoint, policy).await;
+    let ((manager, mut incoming, control), node) = admitted(&listener, &endpoint, policy).await;
 
     // Accept each stream before the agent opens the next one: `accept` selects
     // both stream directions without bias.
@@ -222,7 +246,7 @@ async fn integrated_server_path_reproduces_fixtures_and_shuts_down_cleanly() {
     let (command, detector) = timeout(TEST_TIMEOUT, async {
         tokio::join!(
             manager.send_run_detector_once(DETECTOR_ID),
-            answer_detector_command(&mut agent_incoming),
+            answer_detector_command(&node),
         )
     })
     .await
@@ -282,11 +306,16 @@ async fn integrated_server_path_reproduces_fixtures_and_shuts_down_cleanly() {
 
     check_dispatch_trace(&trace);
     check_events(&log);
-    for agent in [agent, reloaded_agent] {
-        assert!(matches!(
-            timeout(TEST_TIMEOUT, agent.closed()).await.unwrap(),
-            review_protocol::session::CloseReason::Application { reason, .. }
-                if reason == SHUTDOWN_REASON
-        ));
-    }
+    check_shutdown(&node, &reloaded_agent).await;
+}
+
+async fn check_shutdown(node: &Connection, reloaded_agent: &AgentHandle) {
+    assert!(matches!(
+        timeout(TEST_TIMEOUT, node.closed()).await.unwrap(),
+        oinq::CloseInfo::Application { reason, .. } if reason == SHUTDOWN_REASON
+    ));
+    assert!(matches!(
+        timeout(TEST_TIMEOUT, reloaded_agent.closed()).await.unwrap(),
+        review_protocol::session::CloseReason::Application { reason, .. } if reason == SHUTDOWN_REASON
+    ));
 }

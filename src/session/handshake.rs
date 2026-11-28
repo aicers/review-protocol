@@ -11,72 +11,38 @@ use super::{
 
 #[cfg(feature = "server")]
 impl super::ServerHandle {
-    /// Accepts an application handshake with a caller-selected version window and limits.
-    ///
-    /// Dropping this future aborts an accepted exchange. The returned incoming
-    /// owner is unique; handle clones do not create additional acceptors.
-    /// # Errors
-    /// Returns classified transport, framing, limit, version, or deadline errors.
-    pub async fn from_transport(
-        connection: Connection,
-        options: SessionOptions,
-        version_req: &str,
-        highest_protocol_version: &str,
-    ) -> Result<(Self, super::ServerIncoming), SessionError> {
-        let window = super::ProtocolWindow::new(version_req, highest_protocol_version)?;
-        let operation = async {
-            let (agent, mut exchange) = server_handshake(&connection, &options, &window).await?;
-            exchange.finish()?;
-            Ok::<_, SessionError>(agent)
-        };
-        let agent = if let Some(timeout) = options.operation_timeout {
-            tokio::time::timeout(timeout, operation)
-                .await
-                .map_err(|source| SessionError::Deadline {
-                    certainty: OutcomeCertainty::Unknown,
-                    source: Some(source),
-                })??
+    pub(crate) async fn from_transport(
+        connection: &Connection,
+        options: &SessionOptions,
+        window: &super::ProtocolWindow,
+    ) -> Result<(crate::AgentInfo, Exchange), SessionError> {
+        let (send, recv) = connection.accept_bi().await.map_err(|e| {
+            SessionError::transport(e, OutcomeCertainty::NotSent).on_connection(connection)
+        })?;
+        let mut exchange = Exchange::new(send, recv, options.handshake, connection);
+        let frame = exchange.frame().await?;
+        let mut agent = decode_agent(frame.as_bytes(), options.handshake.get())?;
+        exchange.recycle(frame)?;
+        agent.addr = connection.remote_addr();
+        if window.accepts(&agent.protocol_version) {
+            exchange.start(Ok::<_, &str>(window.advertised_version()))?;
+            exchange.flush().await?;
+            Ok((agent, exchange))
         } else {
-            operation.await?
-        };
-        let shared = server_shared(connection, options, agent, None);
-        Ok((Self(shared.clone()), super::ServerIncoming::new(shared)))
-    }
-}
-
-#[cfg(feature = "server")]
-pub(super) async fn server_handshake(
-    connection: &Connection,
-    options: &SessionOptions,
-    window: &super::ProtocolWindow,
-) -> Result<(crate::AgentInfo, Exchange), SessionError> {
-    let (send, recv) = connection
-        .accept_bi()
-        .await
-        .map_err(|e| SessionError::transport(e, OutcomeCertainty::NotSent))?;
-    let mut exchange = Exchange::new(send, recv, options.handshake);
-    let frame = exchange.frame().await?;
-    let mut agent = decode_agent(frame.as_bytes(), options.handshake.get())?;
-    exchange.recycle(frame)?;
-    agent.addr = connection.remote_addr();
-    if window.accepts(&agent.protocol_version) {
-        exchange.start(Ok::<_, &str>(window.advertised_version()))?;
-        exchange.flush().await?;
-        Ok((agent, exchange))
-    } else {
-        let required = window.accepted_range();
-        exchange.start(Err::<&str, _>(&required))?;
-        exchange.flush().await?;
-        // Retain endpoint resources until the rejection bytes/FIN are
-        // acknowledged; this constructor returns no handle on failure.
-        // A rejected agent may close the connection as soon as it reads
-        // the rejection, so a failure here must not replace the version
-        // error, as the legacy handshake ignores it too.
-        let _ = exchange.finish_and_wait().await;
-        Err(SessionError::IncompatibleProtocol {
-            version: agent.protocol_version,
-            required,
-        })
+            let required = window.accepted_range();
+            exchange.start(Err::<&str, _>(&required))?;
+            exchange.flush().await?;
+            // Retain endpoint resources until the rejection bytes/FIN are
+            // acknowledged; this constructor returns no handle on failure.
+            // A rejected agent may close the connection as soon as it reads
+            // the rejection, so a failure here must not replace the version
+            // error, as the legacy handshake ignores it too.
+            let _ = exchange.finish_and_wait().await;
+            Err(SessionError::IncompatibleProtocol {
+                version: agent.protocol_version,
+                required,
+            })
+        }
     }
 }
 
@@ -101,34 +67,7 @@ pub(super) fn server_shared(
 
 #[cfg(feature = "client")]
 impl super::AgentHandle {
-    /// Sends the complete caller-supplied agent claims using explicitly selected limits.
-    ///
-    /// The supplied protocol version is preserved. TLS policy belongs to the
-    /// endpoint configuration, and peer claims never authorize operations.
-    /// # Errors
-    /// Returns classified transport, framing, limit, version, or deadline errors.
-    pub async fn from_transport(
-        connection: Connection,
-        options: SessionOptions,
-        agent: &crate::AgentInfo,
-    ) -> Result<(Self, super::AgentIncoming), SessionError> {
-        let timeout = options.operation_timeout;
-        let mut certainty = OutcomeCertainty::NotSent;
-        let operation = Self::from_transport_inner(connection, options, agent, &mut certainty);
-        if let Some(timeout) = timeout {
-            match tokio::time::timeout(timeout, operation).await {
-                Ok(result) => result,
-                Err(source) => Err(SessionError::Deadline {
-                    certainty,
-                    source: Some(source),
-                }),
-            }
-        } else {
-            operation.await
-        }
-    }
-
-    pub(super) async fn from_transport_inner(
+    pub(crate) async fn from_transport(
         connection: Connection,
         options: SessionOptions,
         agent: &crate::AgentInfo,
@@ -137,8 +76,8 @@ impl super::AgentHandle {
         let (send, recv) = connection
             .open_bi()
             .await
-            .map_err(|e| SessionError::transport(e, *certainty))?;
-        let mut exchange = Exchange::new(send, recv, options.handshake);
+            .map_err(|e| SessionError::transport(e, *certainty).on_connection(&connection))?;
+        let mut exchange = Exchange::new(send, recv, options.handshake, &connection);
         exchange.start(agent)?;
         *certainty = OutcomeCertainty::Unknown;
         exchange.flush().await?;

@@ -113,13 +113,8 @@ impl AgentConnector {
                 .connect(remote, server_name)
                 .await
                 .map_err(|error| SessionError::transport(error, certainty))?;
-            AgentHandle::from_transport_inner(
-                connection,
-                self.session.clone(),
-                agent,
-                &mut certainty,
-            )
-            .await
+            AgentHandle::from_transport(connection, self.session.clone(), agent, &mut certainty)
+                .await
         };
         if let Some(timeout) = timeout {
             tokio::time::timeout(timeout, operation)
