@@ -5,6 +5,18 @@ file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.0](https://github.com/aicers/review-protocol/compare/0.36.0...0.37.0) - 2026-11-28
+
+### Added
+
+- *(session)* [**breaking**] default agent transport to legacy keepalive and add PEM, receipt and runner-phase helpers ([#398](https://github.com/aicers/review-protocol/pull/398))
+- *(session)* [**breaking**] hide oinq from the session API, classify transport errors and add close_reason ([#397](https://github.com/aicers/review-protocol/pull/397))
+- *(session)* complete the agent-side protocol session API ([#381](https://github.com/aicers/review-protocol/pull/381))
+
+### Other
+
+- *(dependabot)* exclude git-tag dependencies from the cooldown ([#392](https://github.com/aicers/review-protocol/pull/392))
+
 ## [0.36.0](https://github.com/aicers/review-protocol/compare/0.35.0...0.36.0) - 2026-11-27
 
 ### Added
